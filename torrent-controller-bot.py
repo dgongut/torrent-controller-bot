@@ -1,0 +1,1311 @@
+import html
+import json
+import math
+import re
+import sys
+import telebot
+import threading
+import time
+import uuid
+from config import *
+from datetime import datetime
+from telebot.types import ForceReply
+from telebot.types import InlineKeyboardButton
+from telebot.types import InlineKeyboardMarkup
+from logger import debug, error, warning
+from message_queue import MessageQueue
+from smart_rename import parse_name
+from torrent_clients import TorrentClientError, TorrentStatus, create_client
+import config as _config_module
+
+VERSION = "0.9.0"
+
+if LANGUAGE.lower() not in ("es", "en"):
+	error("LANGUAGE only can be ES/EN")
+	sys.exit(1)
+
+# MODULO DE TRADUCCIONES
+_locale_cache = {}
+
+def load_locale(locale):
+	"""Load locale with caching to avoid repeated file I/O"""
+	if locale not in _locale_cache:
+		with open(f"{LOCALE_PATH}/{locale}.json", "r", encoding="utf-8") as file:
+			_locale_cache[locale] = json.load(file)
+	return _locale_cache[locale]
+
+def get_text(key, *args):
+	"""Get translated text with caching"""
+	messages = load_locale(LANGUAGE.lower())
+	if key in messages:
+		translated_text = messages[key]
+	else:
+		messages_en = load_locale("en")
+		if key in messages_en:
+			warning(f"key ['{key}'] is not in locale {LANGUAGE}")
+			translated_text = messages_en[key]
+		else:
+			error(f"key ['{key}'] is not in locale {LANGUAGE} or EN")
+			return f"key ['{key}'] is not in locale {LANGUAGE} or EN"
+
+	if args:
+		for i, arg in enumerate(args, start=1):
+			translated_text = translated_text.replace(f"${i}", str(arg))
+
+	return translated_text
+
+
+# Initial variable validation
+if TELEGRAM_TOKEN is None or TELEGRAM_TOKEN == '':
+	error("You need to configure the bot token with the TELEGRAM_TOKEN variable")
+	sys.exit(1)
+if TELEGRAM_ADMIN is None or TELEGRAM_ADMIN == '':
+	error("You need to configure the chatId of the user who will interact with the bot with the TELEGRAM_ADMIN variable")
+	sys.exit(1)
+if str(ANONYMOUS_USER_ID) in str(TELEGRAM_ADMIN).split(','):
+	error("You cannot be anonymous to control the bot. In the variable TELEGRAM_ADMIN you have to put your user id.")
+	sys.exit(1)
+if TELEGRAM_GROUP is None or TELEGRAM_GROUP == '':
+	if len(str(TELEGRAM_ADMIN).split(',')) > 1:
+		error("Multiple administrators can only be specified if used in a group (using the TELEGRAM_GROUP variable)")
+		sys.exit(1)
+
+try:
+	TELEGRAM_THREAD = int(TELEGRAM_THREAD)
+except:
+	error(f"The variable TELEGRAM_THREAD is the thread within a supergroup, it is a numeric value. It has been set to {TELEGRAM_THREAD}.")
+	sys.exit(1)
+
+ADMIN_IDS = [x.strip() for x in str(TELEGRAM_ADMIN).split(',')]
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+message_queue = MessageQueue(delay_between_messages=0.3)
+
+try:
+	client = create_client(_config_module)
+	client_version = client.test_connection()
+	debug(f"Connected to {client_version}")
+except TorrentClientError as e:
+	error(str(e))
+	sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# GENERIC HELPERS
+# ---------------------------------------------------------------------------
+
+STATUS_EMOJI = {
+	TorrentStatus.DOWNLOADING: "📥",
+	TorrentStatus.SEEDING: "🌱",
+	TorrentStatus.PAUSED: "⏸️",
+	TorrentStatus.QUEUED: "⏳",
+	TorrentStatus.CHECKING: "🔍",
+	TorrentStatus.ERROR: "❌",
+}
+
+STATUS_TEXT_KEY = {
+	TorrentStatus.DOWNLOADING: "STATUS_DOWNLOADING",
+	TorrentStatus.SEEDING: "STATUS_SEEDING",
+	TorrentStatus.PAUSED: "STATUS_PAUSED",
+	TorrentStatus.QUEUED: "STATUS_QUEUED",
+	TorrentStatus.CHECKING: "STATUS_CHECKING",
+	TorrentStatus.ERROR: "STATUS_ERROR",
+}
+
+FILTER_TO_STATUS = {
+	FILTER_DOWNLOADING: TorrentStatus.DOWNLOADING,
+	FILTER_SEEDING: TorrentStatus.SEEDING,
+	FILTER_PAUSED: TorrentStatus.PAUSED,
+	FILTER_QUEUED: TorrentStatus.QUEUED,
+	FILTER_CHECKING: TorrentStatus.CHECKING,
+	FILTER_ERROR: TorrentStatus.ERROR,
+}
+
+
+def sizeof_fmt(num, suffix="B"):
+	if num is None or num < 0:
+		return "?"
+	for unit in ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"):
+		if abs(num) < 1024.0:
+			return f"{num:3.1f}{unit}{suffix}"
+		num /= 1024.0
+	return f"{num:.1f}Yi{suffix}"
+
+
+def format_eta(seconds):
+	if seconds is None or seconds < 0:
+		return "-"
+	if seconds < 60:
+		return f"{seconds}s"
+	minutes, _ = divmod(seconds, 60)
+	hours, minutes = divmod(minutes, 60)
+	days, hours = divmod(hours, 24)
+	if days > 0:
+		return f"{days}d {hours}h"
+	if hours > 0:
+		return f"{hours}h {minutes}m"
+	return f"{minutes}m"
+
+
+def truncate(text, length=MAX_NAME_LENGTH_IN_BUTTON):
+	return text if len(text) <= length else text[:length - 1] + "…"
+
+
+def truncate_dir(path, length=30):
+	return path if len(path) <= length else "…" + path[-(length - 1):]
+
+
+def build_call(command, *args):
+	return "|".join([command] + [str(a) for a in args])
+
+
+def is_authorized(user_id, chat_id):
+	if str(user_id) not in ADMIN_IDS:
+		return False
+	if TELEGRAM_GROUP and str(chat_id) != str(TELEGRAM_GROUP) and str(chat_id) not in ADMIN_IDS:
+		return False
+	return True
+
+
+def send_message(chat_id, text, reply_markup=None, thread_id=None):
+	kwargs = {"parse_mode": "HTML", "reply_markup": reply_markup, "disable_web_page_preview": True}
+	if thread_id and thread_id != 1:
+		kwargs["message_thread_id"] = thread_id
+	return message_queue.enqueue_and_wait(bot.send_message, chat_id, text, **kwargs)
+
+
+def edit_message(chat_id, message_id, text, reply_markup=None):
+	try:
+		return bot.edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
+	except Exception as e:
+		if "message is not modified" not in str(e):
+			warning(f"Cannot edit message {message_id}: {e}")
+		return None
+
+
+def delete_message(chat_id, message_id):
+	try:
+		bot.delete_message(chat_id, message_id)
+	except Exception:
+		pass
+
+
+# ---------------------------------------------------------------------------
+# IN-MEMORY CONTEXTS
+# ---------------------------------------------------------------------------
+
+_contexts_lock = threading.Lock()
+
+# Search contexts: short id -> {"query": str, "ts": float}
+search_contexts = {}
+
+# Pending torrents waiting for a download dir: id -> {"magnet"/"data", "name", "ts"}
+pending_torrents = {}
+
+# Pending text inputs: (chat_id, user_id) -> {"action": str, ...}
+pending_inputs = {}
+
+# Short ids for directories (stable during runtime)
+_dir_by_id = {}
+_dir_ids = {}
+
+# Active dashboards: chat_id -> {"message_id": int, "generation": int}
+dashboards = {}
+_dashboards_lock = threading.Lock()
+
+
+def get_dir_id(path):
+	with _contexts_lock:
+		if path not in _dir_ids:
+			new_id = str(len(_dir_ids))
+			_dir_ids[path] = new_id
+			_dir_by_id[new_id] = path
+		return _dir_ids[path]
+
+
+def get_dir_by_id(dir_id):
+	with _contexts_lock:
+		return _dir_by_id.get(dir_id)
+
+
+def new_search_context(query):
+	with _contexts_lock:
+		now = time.time()
+		for key in [k for k, v in search_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del search_contexts[key]
+		ctx_id = uuid.uuid4().hex[:6]
+		search_contexts[ctx_id] = {"query": query, "ts": now}
+		return ctx_id
+
+
+def get_search_query(ctx_id):
+	with _contexts_lock:
+		ctx = search_contexts.get(ctx_id)
+		if ctx:
+			ctx["ts"] = time.time()
+			return ctx["query"]
+		return None
+
+
+def new_pending_torrent(name, magnet=None, data=None):
+	with _contexts_lock:
+		now = time.time()
+		for key in [k for k, v in pending_torrents.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del pending_torrents[key]
+		pending_id = uuid.uuid4().hex[:8]
+		pending_torrents[pending_id] = {"name": name, "magnet": magnet, "data": data, "ts": now}
+		return pending_id
+
+
+def get_pending_torrent(pending_id):
+	with _contexts_lock:
+		return pending_torrents.get(pending_id)
+
+
+def pop_pending_torrent(pending_id):
+	with _contexts_lock:
+		return pending_torrents.pop(pending_id, None)
+
+
+# ---------------------------------------------------------------------------
+# FILTER RESOLUTION
+# ---------------------------------------------------------------------------
+
+class ExpiredContext(Exception):
+	pass
+
+
+def get_filter_label(filter_key):
+	if filter_key.startswith("q"):
+		query = get_search_query(filter_key[1:])
+		if query is None:
+			raise ExpiredContext()
+		return get_text("SEARCH_RESULTS_TITLE", html.escape(query))
+	if filter_key == FILTER_ALL:
+		return get_text("STATUS_ALL")
+	if filter_key == FILTER_COMPLETED:
+		return get_text("STATUS_COMPLETED")
+	status = FILTER_TO_STATUS.get(filter_key)
+	emoji = STATUS_EMOJI.get(status, "")
+	return f"{emoji} {get_text(STATUS_TEXT_KEY[status])}" if status else get_text("STATUS_ALL")
+
+
+def get_filtered_torrents(filter_key):
+	"""Returns the list of TorrentInfo matching a filter key.
+	Raises ExpiredContext if it points to an expired search"""
+	if filter_key.startswith("q"):
+		query = get_search_query(filter_key[1:])
+		if query is None:
+			raise ExpiredContext()
+		return client.get_torrents(query=query)
+	if filter_key == FILTER_ALL:
+		return client.get_torrents()
+	if filter_key == FILTER_COMPLETED:
+		return [t for t in client.get_torrents() if t.is_finished]
+	status = FILTER_TO_STATUS.get(filter_key)
+	if status is None:
+		return client.get_torrents()
+	return client.get_torrents(status=status)
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD
+# ---------------------------------------------------------------------------
+
+def build_dashboard(refreshing):
+	summary = client.get_summary()
+	counts = summary.counts
+
+	lines = [get_text("DASHBOARD_TITLE", summary.total), ""]
+	for status in (TorrentStatus.DOWNLOADING, TorrentStatus.SEEDING, TorrentStatus.PAUSED,
+			TorrentStatus.QUEUED, TorrentStatus.CHECKING, TorrentStatus.ERROR):
+		lines.append(f"{STATUS_EMOJI[status]} {get_text(STATUS_TEXT_KEY[status])}: <b>{counts.get(status, 0)}</b>")
+	lines.append(f"✅ {get_text('STATUS_COMPLETED')}: <b>{summary.completed}</b>")
+	lines.append("")
+	lines.append(get_text("DASHBOARD_SPEEDS", sizeof_fmt(summary.download_rate), sizeof_fmt(summary.upload_rate)))
+	if summary.free_space >= 0:
+		lines.append(get_text("DASHBOARD_FREE_SPACE", sizeof_fmt(summary.free_space)))
+	if summary.alt_speed_enabled:
+		lines.append(get_text("DASHBOARD_TURTLE_ON"))
+	lines.append("")
+	if refreshing:
+		lines.append(get_text("DASHBOARD_AUTOUPDATING"))
+	else:
+		lines.append(get_text("DASHBOARD_LAST_UPDATE", datetime.now().strftime("%H:%M:%S")))
+
+	markup = InlineKeyboardMarkup(row_width=2)
+	filter_buttons = [
+		InlineKeyboardButton(f"📋 {get_text('STATUS_ALL')} ({summary.total})", callback_data=build_call("list", FILTER_ALL, 0)),
+		InlineKeyboardButton(f"📥 {get_text('STATUS_DOWNLOADING')} ({counts.get(TorrentStatus.DOWNLOADING, 0)})", callback_data=build_call("list", FILTER_DOWNLOADING, 0)),
+		InlineKeyboardButton(f"🌱 {get_text('STATUS_SEEDING')} ({counts.get(TorrentStatus.SEEDING, 0)})", callback_data=build_call("list", FILTER_SEEDING, 0)),
+		InlineKeyboardButton(f"⏸️ {get_text('STATUS_PAUSED')} ({counts.get(TorrentStatus.PAUSED, 0)})", callback_data=build_call("list", FILTER_PAUSED, 0)),
+		InlineKeyboardButton(f"⏳ {get_text('STATUS_QUEUED')} ({counts.get(TorrentStatus.QUEUED, 0)})", callback_data=build_call("list", FILTER_QUEUED, 0)),
+		InlineKeyboardButton(f"🔍 {get_text('STATUS_CHECKING')} ({counts.get(TorrentStatus.CHECKING, 0)})", callback_data=build_call("list", FILTER_CHECKING, 0)),
+		InlineKeyboardButton(f"❌ {get_text('STATUS_ERROR')} ({counts.get(TorrentStatus.ERROR, 0)})", callback_data=build_call("list", FILTER_ERROR, 0)),
+		InlineKeyboardButton(f"✅ {get_text('STATUS_COMPLETED')} ({summary.completed})", callback_data=build_call("list", FILTER_COMPLETED, 0)),
+	]
+	markup.add(*filter_buttons)
+	markup.add(
+		InlineKeyboardButton(get_text("BUTTON_SEARCH"), callback_data=build_call("search")),
+		InlineKeyboardButton(get_text("BUTTON_SETTINGS"), callback_data=build_call("settings")),
+	)
+	bottom = []
+	if not refreshing:
+		bottom.append(InlineKeyboardButton(get_text("BUTTON_UPDATE"), callback_data=build_call("refreshDashboard")))
+	bottom.append(InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")))
+	markup.add(*bottom)
+
+	return "\n".join(lines), markup
+
+
+def _dashboard_refresher(chat_id, message_id, generation):
+	iterations = max(1, DASHBOARD_REFRESH_DURATION // DASHBOARD_REFRESH_SECONDS)
+	for _ in range(iterations):
+		time.sleep(DASHBOARD_REFRESH_SECONDS)
+		with _dashboards_lock:
+			state = dashboards.get(chat_id)
+			if not state or state["message_id"] != message_id or state["generation"] != generation:
+				return
+		try:
+			text, markup = build_dashboard(refreshing=True)
+			edit_message(chat_id, message_id, text, markup)
+		except TorrentClientError as e:
+			warning(f"Dashboard refresh failed: {e}")
+	with _dashboards_lock:
+		state = dashboards.get(chat_id)
+		if not state or state["message_id"] != message_id or state["generation"] != generation:
+			return
+	try:
+		text, markup = build_dashboard(refreshing=False)
+		edit_message(chat_id, message_id, text, markup)
+	except TorrentClientError as e:
+		warning(f"Dashboard final refresh failed: {e}")
+
+
+def show_dashboard(chat_id, message_id=None, thread_id=None):
+	"""Sends (or edits) the dashboard and starts the auto-refresh cycle"""
+	try:
+		text, markup = build_dashboard(refreshing=True)
+	except TorrentClientError as e:
+		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		if message_id:
+			edit_message(chat_id, message_id, text)
+		else:
+			send_message(chat_id, text, thread_id=thread_id)
+		return
+
+	if message_id:
+		edit_message(chat_id, message_id, text, markup)
+	else:
+		sent = send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+		if not sent:
+			return
+		message_id = sent.message_id
+
+	with _dashboards_lock:
+		state = dashboards.get(chat_id, {"generation": 0})
+		generation = state["generation"] + 1
+		dashboards[chat_id] = {"message_id": message_id, "generation": generation}
+	threading.Thread(target=_dashboard_refresher, args=(chat_id, message_id, generation), daemon=True).start()
+
+
+def stop_dashboard(chat_id, message_id):
+	with _dashboards_lock:
+		state = dashboards.get(chat_id)
+		if state and state["message_id"] == message_id:
+			state["generation"] += 1
+
+
+# ---------------------------------------------------------------------------
+# TORRENT LIST
+# ---------------------------------------------------------------------------
+
+def build_list(filter_key, page):
+	torrents = get_filtered_torrents(filter_key)
+	total = len(torrents)
+	pages = max(1, math.ceil(total / TORRENTS_PER_PAGE))
+	page = max(0, min(int(page), pages - 1))
+	label = get_filter_label(filter_key)
+
+	text = get_text("LIST_TITLE", label, total, page + 1, pages)
+	if total == 0:
+		text += f"\n\n{get_text('LIST_EMPTY')}"
+
+	markup = InlineKeyboardMarkup(row_width=1)
+	start = page * TORRENTS_PER_PAGE
+	for torrent in torrents[start:start + TORRENTS_PER_PAGE]:
+		emoji = STATUS_EMOJI.get(torrent.status, "")
+		progress = "" if torrent.is_finished else f" {torrent.progress:.0f}%"
+		markup.add(InlineKeyboardButton(
+			f"{emoji}{progress} {truncate(torrent.name)}",
+			callback_data=build_call("info", torrent.id, filter_key, page)))
+
+	if pages > 1:
+		prev_call = build_call("list", filter_key, page - 1) if page > 0 else build_call("noop")
+		next_call = build_call("list", filter_key, page + 1) if page < pages - 1 else build_call("noop")
+		markup.row(
+			InlineKeyboardButton("⬅️", callback_data=prev_call),
+			InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=build_call("noop")),
+			InlineKeyboardButton("➡️", callback_data=next_call),
+		)
+
+	if total > 0:
+		markup.row(
+			InlineKeyboardButton(get_text("BUTTON_MASS_RESUME"), callback_data=build_call("mass", "resume", filter_key)),
+			InlineKeyboardButton(get_text("BUTTON_MASS_PAUSE"), callback_data=build_call("mass", "pause", filter_key)),
+		)
+		markup.row(
+			InlineKeyboardButton(get_text("BUTTON_MASS_DELETE"), callback_data=build_call("mass", "delete", filter_key)),
+			InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key)),
+		)
+
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return text, markup
+
+
+def render_list(chat_id, message_id, filter_key, page, thread_id=None):
+	try:
+		text, markup = build_list(filter_key, page)
+	except ExpiredContext:
+		text = get_text("SEARCH_EXPIRED")
+		markup = back_close_markup()
+	except TorrentClientError as e:
+		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		markup = back_close_markup()
+	if message_id:
+		edit_message(chat_id, message_id, text, markup)
+	else:
+		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+
+
+def back_close_markup(back_call=None):
+	markup = InlineKeyboardMarkup()
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=back_call or build_call("dashboard")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return markup
+
+
+# ---------------------------------------------------------------------------
+# TORRENT DETAIL
+# ---------------------------------------------------------------------------
+
+def build_detail(torrent_id, filter_key, page):
+	torrent = client.get_torrent(torrent_id)
+	if torrent is None:
+		return get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page))
+
+	emoji = STATUS_EMOJI.get(torrent.status, "")
+	status_label = get_text(STATUS_TEXT_KEY.get(torrent.status, "STATUS_ALL"))
+	lines = [f"<b>{html.escape(torrent.name)}</b>", ""]
+	lines.append(f"{get_text('INFO_STATUS')}: {emoji} {status_label}")
+	lines.append(f"{get_text('INFO_PROGRESS')}: {torrent.progress:.1f}%")
+	lines.append(f"{get_text('INFO_SIZE')}: {sizeof_fmt(torrent.total_size)}")
+	lines.append(f"{get_text('INFO_DOWNLOADED')}: {sizeof_fmt(torrent.downloaded)} (🔽 {sizeof_fmt(torrent.download_rate)}/s)")
+	lines.append(f"{get_text('INFO_UPLOADED')}: {sizeof_fmt(torrent.uploaded)} (🔼 {sizeof_fmt(torrent.upload_rate)}/s)")
+	lines.append(f"{get_text('INFO_RATIO')}: {torrent.ratio}")
+	if torrent.status == TorrentStatus.DOWNLOADING:
+		lines.append(f"{get_text('INFO_ETA')}: {format_eta(torrent.eta)}")
+	lines.append(f"{get_text('INFO_PEERS')}: {torrent.peers}")
+	lines.append(f"{get_text('INFO_DIR')}: <code>{html.escape(torrent.download_dir)}</code>")
+	if torrent.added_date:
+		added = datetime.fromtimestamp(torrent.added_date).strftime("%Y-%m-%d %H:%M")
+		lines.append(f"{get_text('INFO_ADDED')}: {added}")
+	if torrent.error_message:
+		lines.append(f"{get_text('INFO_ERROR')}: <code>{html.escape(torrent.error_message)}</code>")
+	if torrent.files:
+		lines.append("")
+		lines.append(f"<b>{get_text('INFO_FILES')} ({len(torrent.files)}):</b>")
+		for path, size, _ in torrent.files[:10]:
+			lines.append(f"• <code>{html.escape(path)}</code> ({sizeof_fmt(size)})")
+		if len(torrent.files) > 10:
+			lines.append(get_text("INFO_AND_MORE_FILES", len(torrent.files) - 10))
+
+	markup = InlineKeyboardMarkup()
+	if torrent.status == TorrentStatus.PAUSED:
+		toggle = InlineKeyboardButton(get_text("BUTTON_RESUME"), callback_data=build_call("resume", torrent.id, filter_key, page))
+	else:
+		toggle = InlineKeyboardButton(get_text("BUTTON_PAUSE"), callback_data=build_call("pause", torrent.id, filter_key, page))
+	markup.row(toggle, InlineKeyboardButton(get_text("BUTTON_VERIFY"), callback_data=build_call("verify", torrent.id, filter_key, page)))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_RENAME"), callback_data=build_call("rename", torrent.id, filter_key, page)),
+		InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)),
+	)
+	markup.row(InlineKeyboardButton(get_text("BUTTON_DELETE"), callback_data=build_call("delete", torrent.id, filter_key, page)))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, page)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
+
+
+def render_detail(chat_id, message_id, torrent_id, filter_key, page):
+	try:
+		text, markup = build_detail(torrent_id, filter_key, page)
+	except TorrentClientError as e:
+		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		markup = back_close_markup(build_call("list", filter_key, page))
+	edit_message(chat_id, message_id, text, markup)
+
+
+# ---------------------------------------------------------------------------
+# DIRECTORIES
+# ---------------------------------------------------------------------------
+
+def get_known_dirs():
+	"""Known directories: in use by the client + extras from DOWNLOAD_DIRS"""
+	dirs = []
+	try:
+		dirs.extend(client.get_download_dirs())
+	except TorrentClientError as e:
+		warning(f"Cannot get download dirs: {e}")
+	for extra in DOWNLOAD_DIRS.split(","):
+		extra = extra.strip().rstrip("/")
+		if extra and extra not in dirs:
+			dirs.append(extra)
+	return dirs
+
+
+def build_dir_markup(dir_call, write_call, cancel_call, page_call=None, page=0):
+	"""Keyboard with one button per known dir (paginated) + write path + cancel.
+	dir_call receives the dir_id and must return the callback_data.
+	page_call receives the page number and must return the callback_data"""
+	markup = InlineKeyboardMarkup(row_width=1)
+	dirs = get_known_dirs()
+	pages = max(1, math.ceil(len(dirs) / MAX_DIR_BUTTONS))
+	page = max(0, min(int(page), pages - 1))
+	start = page * MAX_DIR_BUTTONS
+	for directory in dirs[start:start + MAX_DIR_BUTTONS]:
+		markup.add(InlineKeyboardButton(f"📂 {truncate_dir(directory)}", callback_data=dir_call(get_dir_id(directory))))
+	if pages > 1 and page_call:
+		prev_call = page_call(page - 1) if page > 0 else build_call("noop")
+		next_call = page_call(page + 1) if page < pages - 1 else build_call("noop")
+		markup.row(
+			InlineKeyboardButton("⬅️", callback_data=prev_call),
+			InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=build_call("noop")),
+			InlineKeyboardButton("➡️", callback_data=next_call),
+		)
+	markup.add(InlineKeyboardButton(get_text("BUTTON_WRITE_DIR"), callback_data=write_call))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=cancel_call))
+	return markup
+
+
+# ---------------------------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------------------------
+
+def build_settings():
+	settings = client.get_settings()
+
+	def limit_text(value, enabled):
+		return f"{value} KB/s" if enabled else get_text("NO_LIMIT")
+
+	lines = [get_text("SETTINGS_TITLE", settings["version"]), ""]
+	alt_state = get_text("ENABLED") if settings["alt_speed_enabled"] else get_text("DISABLED")
+	lines.append(get_text("SETTINGS_ALT_SPEED", alt_state, settings["alt_speed_down"], settings["alt_speed_up"]))
+	lines.append(get_text("SETTINGS_DOWN_LIMIT", limit_text(settings["speed_limit_down"], settings["speed_limit_down_enabled"])))
+	lines.append(get_text("SETTINGS_UP_LIMIT", limit_text(settings["speed_limit_up"], settings["speed_limit_up_enabled"])))
+	lines.append(get_text("SETTINGS_DEFAULT_DIR", html.escape(settings["download_dir"])))
+
+	markup = InlineKeyboardMarkup(row_width=1)
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_ALT_SPEED"), callback_data=build_call("toggleAltSpeed")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_DOWN_LIMIT"), callback_data=build_call("toggleDownLimit")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_UP_LIMIT"), callback_data=build_call("toggleUpLimit")))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_SET_DOWN_LIMIT"), callback_data=build_call("setDownLimit")),
+		InlineKeyboardButton(get_text("BUTTON_SET_UP_LIMIT"), callback_data=build_call("setUpLimit")),
+	)
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
+
+
+def render_settings(chat_id, message_id):
+	try:
+		text, markup = build_settings()
+	except TorrentClientError as e:
+		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		markup = back_close_markup()
+	edit_message(chat_id, message_id, text, markup)
+
+
+# ---------------------------------------------------------------------------
+# ADD TORRENT
+# ---------------------------------------------------------------------------
+
+def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None, dir_page=0):
+	markup = build_dir_markup(
+		dir_call=lambda dir_id: build_call("addTo", pending_id, dir_id),
+		write_call=build_call("addNewDir", pending_id),
+		cancel_call=build_call("cancelAdd", pending_id),
+		page_call=lambda p: build_call("addDirPage", pending_id, p),
+		page=dir_page,
+	)
+	text = get_text("ADD_ASK_DIR", html.escape(name))
+	if message_id:
+		edit_message(chat_id, message_id, text, markup)
+	else:
+		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+
+
+def do_add_torrent(chat_id, message_id, pending_id, download_dir):
+	pending = pop_pending_torrent(pending_id)
+	if pending is None:
+		edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
+		return
+	try:
+		torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"], download_dir=download_dir)
+		edit_message(chat_id, message_id, get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir)))
+	except TorrentClientError as e:
+		edit_message(chat_id, message_id, get_text("ADD_ERROR", html.escape(str(e))))
+
+
+def extract_magnet_name(magnet):
+	match = re.search(r"dn=([^&]+)", magnet)
+	if match:
+		try:
+			from urllib.parse import unquote_plus
+			return unquote_plus(match.group(1))
+		except Exception:
+			pass
+	return "magnet"
+
+
+# ---------------------------------------------------------------------------
+# MASS ACTIONS
+# ---------------------------------------------------------------------------
+
+def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
+	try:
+		torrents = get_filtered_torrents(filter_key)
+	except ExpiredContext:
+		edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
+		return
+	except TorrentClientError as e:
+		edit_message(chat_id, message_id, get_text("CONNECTION_ERROR", html.escape(str(e))), back_close_markup())
+		return
+
+	count = len(torrents)
+	back_call = build_call("list", filter_key, 0)
+	if count == 0:
+		edit_message(chat_id, message_id, get_text("LIST_EMPTY"), back_close_markup(back_call))
+		return
+
+	markup = InlineKeyboardMarkup(row_width=1)
+	if action == "resume":
+		text = get_text("MASS_CONFIRM_RESUME", count)
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "resume", filter_key, "-")))
+	elif action == "pause":
+		text = get_text("MASS_CONFIRM_PAUSE", count)
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "pause", filter_key, "-")))
+	elif action == "delete":
+		text = get_text("MASS_CONFIRM_DELETE", count)
+		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "0")))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "1")))
+	elif action == "move":
+		text = get_text("MASS_MOVE_ASK_DIR", count)
+		markup = build_dir_markup(
+			dir_call=lambda dir_id: build_call("massMoveDir", filter_key, dir_id),
+			write_call=build_call("massMoveNew", filter_key),
+			cancel_call=back_call,
+			page_call=lambda p: build_call("mass", "move", filter_key, p),
+			page=dir_page,
+		)
+	else:
+		return
+	if action != "move":
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=back_call))
+	edit_message(chat_id, message_id, text, markup)
+
+
+def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
+	try:
+		torrents = get_filtered_torrents(filter_key)
+	except ExpiredContext:
+		edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
+		return
+	except TorrentClientError as e:
+		edit_message(chat_id, message_id, get_text("CONNECTION_ERROR", html.escape(str(e))), back_close_markup())
+		return
+
+	ids = [t.id for t in torrents]
+	count = len(ids)
+	back_call = build_call("list", filter_key, 0)
+	try:
+		if action == "resume":
+			client.resume_torrents(ids)
+			text = get_text("MASS_DONE_RESUME", count)
+		elif action == "pause":
+			client.pause_torrents(ids)
+			text = get_text("MASS_DONE_PAUSE", count)
+		elif action == "delete":
+			client.remove_torrents(ids, delete_data=extra == "1")
+			text = get_text("MASS_DONE_DELETE", count)
+			back_call = build_call("dashboard")
+		elif action == "move":
+			progress_text = get_text("MASS_MOVING", count, html.escape(extra))
+			success_text = get_text("MASS_DONE_MOVE", count, html.escape(extra))
+			deliver_move_order(chat_id, ids, extra, progress_text, success_text, message_id=message_id, reply_markup=back_close_markup(back_call))
+			return
+		else:
+			return
+	except TorrentClientError as e:
+		text = get_text("ERROR_GENERIC", html.escape(str(e)))
+	edit_message(chat_id, message_id, text, back_close_markup(back_call))
+
+
+# ---------------------------------------------------------------------------
+# PENDING TEXT INPUTS
+# ---------------------------------------------------------------------------
+
+def set_pending_input(chat_id, user_id, action, **extra):
+	with _contexts_lock:
+		pending_inputs[(chat_id, user_id)] = {"action": action, **extra}
+
+
+def pop_pending_input(chat_id, user_id):
+	with _contexts_lock:
+		return pending_inputs.pop((chat_id, user_id), None)
+
+
+def handle_pending_input(message, pending):
+	chat_id = message.chat.id
+	thread_id = message.message_thread_id
+	text = message.text.strip()
+	action = pending["action"]
+
+	prompt_message_id = pending.get("prompt_message_id")
+	if prompt_message_id:
+		delete_message(chat_id, prompt_message_id)
+	delete_message(chat_id, message.message_id)
+
+	if text.lower() in ("/cancel", "cancel", "cancelar"):
+		show_dashboard(chat_id, thread_id=thread_id)
+		return
+
+	if action == "search":
+		ctx_id = new_search_context(text)
+		render_list(chat_id, None, f"q{ctx_id}", 0, thread_id=thread_id)
+	elif action == "rename":
+		try:
+			client.rename_torrent(pending["torrent_id"], text)
+			send_message(chat_id, get_text("RENAME_OK", html.escape(text)), thread_id=thread_id)
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
+	elif action == "move":
+		name = html.escape(pending.get("name", ""))
+		dest = html.escape(text)
+		progress_text = get_text("MOVING", name, dest)
+		success_text = get_text("MOVE_OK", name, dest)
+		deliver_move_order(chat_id, [pending["torrent_id"]], text, progress_text, success_text, thread_id=thread_id, reply_markup=back_close_markup())
+	elif action == "addDir":
+		pending_id = pending["pending_id"]
+		pending_torrent = get_pending_torrent(pending_id)
+		if pending_torrent is None:
+			send_message(chat_id, get_text("ADD_EXPIRED"), thread_id=thread_id)
+			return
+		pop_pending_torrent(pending_id)
+		try:
+			torrent = client.add_torrent(magnet=pending_torrent["magnet"], torrent_data=pending_torrent["data"], download_dir=text)
+			send_message(chat_id, get_text("ADD_OK", html.escape(torrent.name), html.escape(text)), thread_id=thread_id)
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ADD_ERROR", html.escape(str(e))), thread_id=thread_id)
+	elif action == "massMove":
+		do_mass_move_to(chat_id, pending["filter_key"], text, thread_id=thread_id)
+	elif action in ("downLimit", "upLimit"):
+		try:
+			kbps = int(text)
+			if kbps < 0:
+				raise ValueError()
+		except ValueError:
+			send_message(chat_id, get_text("INVALID_NUMBER"), thread_id=thread_id)
+			return
+		direction = "down" if action == "downLimit" else "up"
+		try:
+			if kbps == 0:
+				client.set_speed_limit(direction, None, enabled=False)
+			else:
+				client.set_speed_limit(direction, kbps, enabled=True)
+			send_message(chat_id, get_text("SETTINGS_UPDATED"), thread_id=thread_id)
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
+
+
+def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None):
+	"""Show a progress message and deliver the move order in a background thread
+	(the RPC blocks until the physical move is finished). The message is updated
+	with the final result. If the daemon does not answer (e.g. busy relocating
+	large amounts of data), keep retrying until it is delivered."""
+	if message_id is not None:
+		edit_message(chat_id, message_id, progress_text)
+	else:
+		msg = send_message(chat_id, progress_text, thread_id=thread_id)
+		message_id = msg.message_id if msg else None
+
+	def finish(text):
+		if message_id is not None:
+			edit_message(chat_id, message_id, text, reply_markup)
+		else:
+			send_message(chat_id, text, reply_markup=reply_markup, thread_id=thread_id)
+
+	def worker():
+		try:
+			client.move_torrents(ids, new_dir)
+			finish(success_text)
+			return
+		except TorrentClientError as e:
+			err = str(e)
+		warning(f"Move order not delivered, will retry in background: {err}")
+		if message_id is not None:
+			edit_message(chat_id, message_id, get_text("MOVE_RETRYING"))
+		for _ in range(MOVE_RETRY_ATTEMPTS):
+			time.sleep(MOVE_RETRY_DELAY)
+			try:
+				client.move_torrents(ids, new_dir)
+				debug(f"Move order delivered after retrying: {len(ids)} torrents -> {new_dir}")
+				finish(success_text)
+				return
+			except TorrentClientError as e:
+				err = str(e)
+		error(f"Move order gave up after {MOVE_RETRY_ATTEMPTS} attempts: {err}")
+		finish(get_text("MOVE_GIVE_UP", html.escape(err)))
+
+	threading.Thread(target=worker, daemon=True).start()
+
+
+def do_mass_move_to(chat_id, filter_key, new_dir, thread_id=None, message_id=None):
+	back_markup = back_close_markup(build_call("list", filter_key, 0))
+	try:
+		torrents = get_filtered_torrents(filter_key)
+	except ExpiredContext:
+		text = get_text("MASS_EXPIRED")
+		if message_id:
+			edit_message(chat_id, message_id, text, back_markup)
+		else:
+			send_message(chat_id, text, reply_markup=back_markup, thread_id=thread_id)
+		return
+	ids = [t.id for t in torrents]
+	progress_text = get_text("MASS_MOVING", len(ids), html.escape(new_dir))
+	success_text = get_text("MASS_DONE_MOVE", len(ids), html.escape(new_dir))
+	deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=message_id, thread_id=thread_id, reply_markup=back_markup)
+
+
+# ---------------------------------------------------------------------------
+# COMMAND HANDLERS
+# ---------------------------------------------------------------------------
+
+def check_auth(message):
+	if not is_authorized(message.from_user.id, message.chat.id):
+		warning(f"Unauthorized access attempt: user {message.from_user.id} in chat {message.chat.id}")
+		send_message(message.chat.id, get_text("USER_NOT_ALLOWED", message.from_user.id), thread_id=message.message_thread_id)
+		return False
+	return True
+
+
+@bot.message_handler(commands=["start"])
+def command_start(message):
+	if not check_auth(message):
+		return
+	delete_message(message.chat.id, message.message_id)
+	show_dashboard(message.chat.id, thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["help"])
+def command_help(message):
+	if not check_auth(message):
+		return
+	send_message(message.chat.id, get_text("START_MESSAGE"), thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["list"])
+def command_list(message):
+	if not check_auth(message):
+		return
+	render_list(message.chat.id, None, FILTER_ALL, 0, thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["find"])
+def command_find(message):
+	if not check_auth(message):
+		return
+	parts = message.text.split(maxsplit=1)
+	if len(parts) > 1 and parts[1].strip():
+		ctx_id = new_search_context(parts[1].strip())
+		render_list(message.chat.id, None, f"q{ctx_id}", 0, thread_id=message.message_thread_id)
+	else:
+		ask_for_input(message.chat.id, message.from_user.id, "search", get_text("SEARCH_ASK"), thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["add"])
+def command_add(message):
+	if not check_auth(message):
+		return
+	send_message(message.chat.id, get_text("ADD_USAGE"), thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["settings"])
+def command_settings(message):
+	if not check_auth(message):
+		return
+	try:
+		text, markup = build_settings()
+	except TorrentClientError as e:
+		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		markup = back_close_markup()
+	send_message(message.chat.id, text, reply_markup=markup, thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["version"])
+def command_version(message):
+	if not check_auth(message):
+		return
+	try:
+		connected_to = client.test_connection()
+	except TorrentClientError as e:
+		connected_to = f"❌ {e}"
+	send_message(message.chat.id, get_text("VERSION_TEXT", VERSION, connected_to), thread_id=message.message_thread_id)
+
+
+def current_dirs_text(dirs):
+	dirs = sorted(set(d.rstrip("/") or "/" for d in dirs if d))
+	if not dirs:
+		return ""
+	if len(dirs) == 1:
+		return get_text("CURRENT_DIR", html.escape(dirs[0]))
+	shown = "\n".join(f"• <code>{html.escape(d)}</code>" for d in dirs[:5])
+	if len(dirs) > 5:
+		shown += "\n" + get_text("INFO_AND_MORE_FILES", len(dirs) - 5)
+	return get_text("CURRENT_DIRS", shown)
+
+
+def ask_for_input(chat_id, user_id, action, prompt, thread_id=None, message_id=None, **extra):
+	if message_id:
+		delete_message(chat_id, message_id)
+	text = f"{prompt}\n\n{get_text('INPUT_CANCEL_HINT')}"
+	sent = send_message(chat_id, text, reply_markup=ForceReply(), thread_id=thread_id)
+	prompt_message_id = sent.message_id if sent else None
+	set_pending_input(chat_id, user_id, action, prompt_message_id=prompt_message_id, **extra)
+
+
+@bot.message_handler(content_types=["document"])
+def handle_document(message):
+	if not check_auth(message):
+		return
+	document = message.document
+	if not document.file_name or not document.file_name.lower().endswith(".torrent"):
+		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message.message_thread_id)
+		return
+	if document.file_size and document.file_size > 20 * 1024 * 1024:
+		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message.message_thread_id)
+		return
+	try:
+		file_info = bot.get_file(document.file_id)
+		data = bot.download_file(file_info.file_path)
+	except Exception as e:
+		send_message(message.chat.id, get_text("ADD_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
+		return
+	name = document.file_name[:-len(".torrent")]
+	pending_id = new_pending_torrent(name, data=data)
+	ask_download_dir(message.chat.id, pending_id, name, thread_id=message.message_thread_id)
+
+
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+	if not message.text:
+		return
+	if not is_authorized(message.from_user.id, message.chat.id):
+		return
+
+	pending = pop_pending_input(message.chat.id, message.from_user.id)
+	if pending:
+		handle_pending_input(message, pending)
+		return
+
+	text = message.text.strip()
+	if text.lower().startswith("magnet:"):
+		name = extract_magnet_name(text)
+		pending_id = new_pending_torrent(name, magnet=text)
+		ask_download_dir(message.chat.id, pending_id, name, thread_id=message.message_thread_id)
+
+
+# ---------------------------------------------------------------------------
+# CALLBACK HANDLER
+# ---------------------------------------------------------------------------
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+	if not is_authorized(call.from_user.id, call.message.chat.id):
+		bot.answer_callback_query(call.id, get_text("USER_NOT_ALLOWED", call.from_user.id).replace("<code>", "").replace("</code>", ""))
+		return
+
+	chat_id = call.message.chat.id
+	message_id = call.message.message_id
+	user_id = call.from_user.id
+	parts = call.data.split("|")
+	command = parts[0]
+	args = parts[1:]
+
+	tooltip = None
+	if command == "cancelInput":
+		tooltip = get_text("INPUT_CANCELLED")
+	elif command == "cancelAdd":
+		tooltip = get_text("ADD_CANCELLED")
+	try:
+		bot.answer_callback_query(call.id, tooltip)
+	except Exception:
+		pass
+
+	stop_dashboard(chat_id, message_id)
+
+	try:
+		if command == "noop":
+			pass
+
+		elif command == "cerrar":
+			delete_message(chat_id, message_id)
+
+		elif command == "dashboard" or command == "refreshDashboard":
+			show_dashboard(chat_id, message_id=message_id)
+
+		elif command == "list":
+			filter_key, page = args[0], args[1]
+			render_list(chat_id, message_id, filter_key, page)
+
+		elif command == "info":
+			torrent_id, filter_key, page = args[0], args[1], args[2]
+			render_detail(chat_id, message_id, torrent_id, filter_key, page)
+
+		elif command in ("pause", "resume", "verify"):
+			torrent_id, filter_key, page = args[0], args[1], args[2]
+			if command == "pause":
+				client.pause_torrents([torrent_id])
+			elif command == "resume":
+				client.resume_torrents([torrent_id])
+			else:
+				client.verify_torrent(torrent_id)
+			time.sleep(0.5)
+			render_detail(chat_id, message_id, torrent_id, filter_key, page)
+
+		elif command == "delete":
+			torrent_id, filter_key, page = args[0], args[1], args[2]
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			else:
+				markup = InlineKeyboardMarkup(row_width=1)
+				markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmDelete", torrent_id, "0", filter_key, page)))
+				markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmDelete", torrent_id, "1", filter_key, page)))
+				markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("info", torrent_id, filter_key, page)))
+				edit_message(chat_id, message_id, get_text("DELETE_CONFIRM", html.escape(torrent.name)), markup)
+
+		elif command == "confirmDelete":
+			torrent_id, with_data, filter_key, page = args[0], args[1], args[2], args[3]
+			torrent = client.get_torrent(torrent_id)
+			name = torrent.name if torrent else torrent_id
+			client.remove_torrents([torrent_id], delete_data=with_data == "1")
+			edit_message(chat_id, message_id, get_text("DELETED", html.escape(name)), back_close_markup(build_call("list", filter_key, page)))
+
+		elif command == "rename":
+			torrent_id, filter_key, page = args[0], args[1], args[2]
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			else:
+				suggested = parse_name(torrent.name)
+				if suggested and suggested != torrent.name:
+					markup = InlineKeyboardMarkup(row_width=1)
+					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_AUTO"), callback_data=build_call("renameAuto", torrent_id, filter_key, page)))
+					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_MANUAL"), callback_data=build_call("renameManual", torrent_id, filter_key, page)))
+					markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("info", torrent_id, filter_key, page)))
+					edit_message(chat_id, message_id, get_text("RENAME_SUGGEST", html.escape(torrent.name), html.escape(suggested)), markup)
+				else:
+					ask_for_input(chat_id, user_id, "rename", get_text("RENAME_ASK", html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
+
+		elif command == "renameAuto":
+			torrent_id, filter_key, page = args[0], args[1], args[2]
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			else:
+				suggested = parse_name(torrent.name)
+				if not suggested or suggested == torrent.name:
+					edit_message(chat_id, message_id, get_text("RENAME_NO_SUGGESTION"), back_close_markup(build_call("info", torrent_id, filter_key, page)))
+				else:
+					client.rename_torrent(torrent_id, suggested)
+					edit_message(chat_id, message_id, get_text("RENAME_OK", html.escape(suggested)), back_close_markup(build_call("list", filter_key, page)))
+
+		elif command == "renameManual":
+			torrent_id, filter_key, page = args[0], args[1], args[2]
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			else:
+				ask_for_input(chat_id, user_id, "rename", get_text("RENAME_ASK", html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
+
+		elif command == "move":
+			torrent_id, filter_key, page = args[0], args[1], args[2]
+			dir_page = int(args[3]) if len(args) > 3 else 0
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			else:
+				markup = build_dir_markup(
+					dir_call=lambda dir_id: build_call("moveToDir", torrent_id, dir_id),
+					write_call=build_call("moveNewDir", torrent_id),
+					cancel_call=build_call("info", torrent_id, filter_key, page),
+					page_call=lambda p: build_call("move", torrent_id, filter_key, page, p),
+					page=dir_page,
+				)
+				edit_message(chat_id, message_id, get_text("MOVE_ASK_DIR", html.escape(torrent.name)), markup)
+
+		elif command == "moveToDir":
+			torrent_id, dir_id = args[0], args[1]
+			new_dir = get_dir_by_id(dir_id)
+			torrent = client.get_torrent(torrent_id)
+			name = torrent.name if torrent else torrent_id
+			if new_dir is None:
+				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"), back_close_markup())
+			else:
+				progress_text = get_text("MOVING", html.escape(name), html.escape(new_dir))
+				success_text = get_text("MOVE_OK", html.escape(name), html.escape(new_dir))
+				deliver_move_order(chat_id, [torrent_id], new_dir, progress_text, success_text, message_id=message_id, reply_markup=back_close_markup())
+
+		elif command == "moveNewDir":
+			torrent_id = args[0]
+			torrent = client.get_torrent(torrent_id)
+			name = torrent.name if torrent else ""
+			prompt = get_text("MOVE_NEW_DIR_ASK")
+			if torrent and torrent.download_dir:
+				prompt = f"{current_dirs_text([torrent.download_dir])}\n{prompt}"
+			ask_for_input(chat_id, user_id, "move", prompt, message_id=message_id, torrent_id=torrent_id, name=name)
+
+		elif command == "search":
+			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), message_id=message_id)
+
+		elif command == "addTo":
+			pending_id, dir_id = args[0], args[1]
+			download_dir = get_dir_by_id(dir_id)
+			if download_dir is None:
+				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
+			else:
+				do_add_torrent(chat_id, message_id, pending_id, download_dir)
+
+		elif command == "addNewDir":
+			pending_id = args[0]
+			if get_pending_torrent(pending_id) is None:
+				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
+			else:
+				ask_for_input(chat_id, user_id, "addDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id, pending_id=pending_id)
+
+		elif command == "cancelAdd":
+			pop_pending_torrent(args[0])
+			show_dashboard(chat_id, message_id=message_id)
+
+		elif command == "addDirPage":
+			pending_id, dir_page = args[0], int(args[1])
+			pending = get_pending_torrent(pending_id)
+			if pending is None:
+				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
+			else:
+				ask_download_dir(chat_id, pending_id, pending["name"], message_id=message_id, dir_page=dir_page)
+
+		elif command == "mass":
+			action, filter_key = args[0], args[1]
+			dir_page = int(args[2]) if len(args) > 2 else 0
+			render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=dir_page)
+
+		elif command == "confirmMass":
+			action, filter_key, extra = args[0], args[1], args[2]
+			do_mass_action(chat_id, message_id, action, filter_key, extra)
+
+		elif command == "massMoveDir":
+			filter_key, dir_id = args[0], args[1]
+			new_dir = get_dir_by_id(dir_id)
+			if new_dir is None:
+				edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
+			else:
+				do_mass_move_to(chat_id, filter_key, new_dir, message_id=message_id)
+
+		elif command == "massMoveNew":
+			filter_key = args[0]
+			prompt = get_text("MOVE_NEW_DIR_ASK")
+			try:
+				dirs = [t.download_dir for t in get_filtered_torrents(filter_key)]
+				dirs_text = current_dirs_text(dirs)
+				if dirs_text:
+					prompt = f"{dirs_text}\n{prompt}"
+			except (ExpiredContext, TorrentClientError):
+				pass
+			ask_for_input(chat_id, user_id, "massMove", prompt, message_id=message_id, filter_key=filter_key)
+
+		elif command == "settings":
+			render_settings(chat_id, message_id)
+
+		elif command == "toggleAltSpeed":
+			settings = client.get_settings()
+			client.set_alt_speed(not settings["alt_speed_enabled"])
+			render_settings(chat_id, message_id)
+
+		elif command in ("toggleDownLimit", "toggleUpLimit"):
+			settings = client.get_settings()
+			if command == "toggleDownLimit":
+				client.set_speed_limit("down", None, enabled=not settings["speed_limit_down_enabled"])
+			else:
+				client.set_speed_limit("up", None, enabled=not settings["speed_limit_up_enabled"])
+			render_settings(chat_id, message_id)
+
+		elif command == "setDownLimit":
+			ask_for_input(chat_id, user_id, "downLimit", get_text("SETTINGS_ASK_DOWN_LIMIT"), message_id=message_id)
+
+		elif command == "setUpLimit":
+			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), message_id=message_id)
+
+		elif command == "cancelInput":
+			pop_pending_input(chat_id, user_id)
+			show_dashboard(chat_id, message_id=message_id)
+
+		else:
+			debug(f"Unknown callback: {call.data}")
+
+	except TorrentClientError as e:
+		edit_message(chat_id, message_id, get_text("CONNECTION_ERROR", html.escape(str(e))), back_close_markup())
+	except ExpiredContext:
+		edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
+	except Exception as e:
+		error(f"Error handling callback {call.data}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+def send_startup_message():
+	try:
+		torrent_count = len(client.get_torrents())
+		default_dir = client.get_default_download_dir()
+		text = get_text("STARTUP_MESSAGE", VERSION, client_version, torrent_count, html.escape(default_dir))
+	except TorrentClientError as e:
+		text = get_text("STARTUP_MESSAGE_ERROR", VERSION, html.escape(str(e)))
+	startup_chat = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
+	send_message(startup_chat, text, thread_id=TELEGRAM_THREAD)
+
+
+if __name__ == "__main__":
+	debug(f"torrent-controller-bot {VERSION} started. Connected to {client_version}")
+	send_startup_message()
+	bot.set_my_commands([
+		telebot.types.BotCommand("/start", get_text("MENU_START")),
+		telebot.types.BotCommand("/list", get_text("MENU_LIST")),
+		telebot.types.BotCommand("/find", get_text("MENU_FIND")),
+		telebot.types.BotCommand("/add", get_text("MENU_ADD")),
+		telebot.types.BotCommand("/settings", get_text("MENU_SETTINGS")),
+		telebot.types.BotCommand("/version", get_text("MENU_VERSION")),
+		telebot.types.BotCommand("/help", get_text("MENU_HELP")),
+	])
+	bot.infinity_polling(timeout=60)

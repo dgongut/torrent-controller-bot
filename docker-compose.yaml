@@ -1,0 +1,19 @@
+services:
+    torrent-controller-bot:
+        environment:
+            - TELEGRAM_TOKEN=
+            - TELEGRAM_ADMIN=
+            - TELEGRAM_GROUP=
+            - TELEGRAM_THREAD=1
+            - LANGUAGE=ES
+            - TZ=Europe/Madrid
+            - TORRENT_CLIENT=transmission # De momento solo transmission
+            - TORRENT_CLIENT_HOST=
+            - TORRENT_CLIENT_PORT=9091
+            - TORRENT_CLIENT_USER=
+            - TORRENT_CLIENT_PASSWORD=
+            #- DOWNLOAD_DIRS=/downloads/peliculas,/downloads/series # Directorios extra separados por comas
+        image: dgongut/torrent-controller-bot:latest
+        container_name: torrent-controller-bot
+        restart: always
+        tty: true
