@@ -64,6 +64,7 @@
 	"DELETED": "🗑️ Borrado <b>$1</b>",
 	"RENAME_ASK": "✏️ <b>Renombrar torrent</b>\n📝 <b>$1</b>\n✍️ Escribe el nuevo nombre:",
 	"RENAME_OK": "✏️ Renombrado a <b>$1</b>",
+	"RENAME_DUPLICATE": "❌ Ya existe un torrent llamado <b>$1</b>, no se ha renombrado para evitar duplicados",
 	"RENAME_SUGGEST": "✏️ <b>Renombrar torrent</b>\n📝 <b>$1</b>\n\n🪄 Sugerencia automática:\n✨ <b>$2</b>",
 	"BUTTON_RENAME_AUTO": "🪄 Usar sugerencia",
 	"BUTTON_RENAME_MANUAL": "✍️ Escribir nombre",

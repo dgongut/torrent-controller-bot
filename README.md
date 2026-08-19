@@ -1,4 +1,7 @@
 # Torrent-Controller-Bot
+
+**VERSIÓN EN ESPAÑOL** | [ENGLISH VERSION](README.en.md)
+
 [![](https://badgen.net/badge/icon/github?icon=github&label)](https://github.com/dgongut/torrent-controller-bot)
 [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/torrent-controller-bot)
 [![Docker Pulls](https://badgen.net/docker/pulls/dgongut/torrent-controller-bot?icon=docker&label=pulls)](https://hub.docker.com/r/dgongut/torrent-controller-bot/)
@@ -42,6 +45,10 @@ Actualmente soporta **Transmission**, **qBittorrent** y **Deluge** como gestores
 Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu identificador de usuario.
 
 1. Abre [@BotFather](https://t.me/BotFather) en Telegram y envía `/newbot`. Sigue las instrucciones (un nombre y un username acabado en `bot`).
+
+> [!WARNING]
+> No le pongas al bot el nombre **TCB** ni un username que lo contenga: Telegram lo asocia con términos relacionados con drogas y puede banear el bot automáticamente. Usa un nombre más descriptivo, como por ejemplo `TorrentControllerBot`.
+
 2. BotFather te devolverá el token del bot. Guárdalo: irá en la variable `TELEGRAM_TOKEN`.
 3. Para conocer tu propio chat ID (lo necesitas para `TELEGRAM_ADMIN`), habla con [@MissRose_bot](https://t.me/MissRose_bot) y envíale `/id`. Te responderá con un número, ese es tu ID.
 4. *(Opcional)* Si vas a usar el bot dentro de un grupo, añádelo, hazlo administrador y obtén el chat ID del grupo de la misma forma; ese valor irá en `TELEGRAM_GROUP`.
@@ -142,7 +149,7 @@ torrent-controller-bot/
     ├── config.py
     ├── logger.py
     ├── message_queue.py
-    ├── smart_rename.py
+    ├── name_parser.py
     ├── torrent-controller-bot.py
     ├── Dockerfile_local
     ├── docker-compose.yaml

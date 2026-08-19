@@ -64,6 +64,7 @@
 	"DELETED": "🗑️ Deleted <b>$1</b>",
 	"RENAME_ASK": "✏️ <b>Rename torrent</b>\n📝 <b>$1</b>\n✍️ Type the new name:",
 	"RENAME_OK": "✏️ Renamed to <b>$1</b>",
+	"RENAME_DUPLICATE": "❌ A torrent named <b>$1</b> already exists, rename skipped to avoid duplicates",
 	"RENAME_SUGGEST": "✏️ <b>Rename torrent</b>\n📝 <b>$1</b>\n\n🪄 Automatic suggestion:\n✨ <b>$2</b>",
 	"BUTTON_RENAME_AUTO": "🪄 Use suggestion",
 	"BUTTON_RENAME_MANUAL": "✍️ Type a name",

@@ -428,7 +428,7 @@ def render_template(template, fields):
 # ---------------------------------------------------------------------------
 
 DEFAULT_MOVIE_TEMPLATE = "{title} ({year}) - {resolution}[ {hdr}][.{extension}]"
-DEFAULT_SERIES_TEMPLATE = "{chapter} - {title}[ - {resolution}][ {hdr}][.{extension}]"
+DEFAULT_SERIES_TEMPLATE = "{temporada}x{episodio} - {title}[ - {resolution}][ {hdr}][.{extension}]"
 
 
 def suggest_name(filename, template_movie=None, template_series=None, season_prefix="T"):

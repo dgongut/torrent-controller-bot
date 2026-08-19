@@ -21,7 +21,7 @@ from torrent_clients import TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -427,7 +427,7 @@ def _dashboard_refresher(chat_id, message_id, generation):
 		try:
 			text, markup = build_dashboard(refreshing=True)
 			edit_message(chat_id, message_id, text, markup)
-		except TorrentClientError as e:
+		except Exception as e:
 			warning(f"Dashboard refresh failed: {e}")
 	with _dashboards_lock:
 		state = dashboards.get(chat_id)
@@ -436,7 +436,7 @@ def _dashboard_refresher(chat_id, message_id, generation):
 	try:
 		text, markup = build_dashboard(refreshing=False)
 		edit_message(chat_id, message_id, text, markup)
-	except TorrentClientError as e:
+	except Exception as e:
 		warning(f"Dashboard final refresh failed: {e}")
 
 
@@ -743,7 +743,19 @@ def render_settings(chat_id, message_id):
 	edit_message(chat_id, message_id, text, markup)
 
 
-def render_favorite_dirs_menu(chat_id, message_id):
+def send_settings_menu(chat_id, thread_id=None, prefix=None):
+	"""Sends the settings menu as a new message, optionally preceded by a confirmation"""
+	try:
+		text, markup = build_settings()
+	except TorrentClientError as e:
+		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		markup = back_close_markup()
+	if prefix:
+		text = f"{prefix}\n\n{text}"
+	send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+
+
+def build_favorite_dirs_menu():
 	favorites = bot_settings.get("favorite_dirs") or []
 	lines = [get_text("FAV_DIRS_TITLE"), ""]
 	if favorites:
@@ -759,7 +771,12 @@ def render_favorite_dirs_menu(chat_id, message_id):
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("settings")),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
 	)
-	edit_message(chat_id, message_id, "\n".join(lines), markup)
+	return "\n".join(lines), markup
+
+
+def render_favorite_dirs_menu(chat_id, message_id):
+	text, markup = build_favorite_dirs_menu()
+	edit_message(chat_id, message_id, text, markup)
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +831,17 @@ def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None,
 		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 
 
+def name_already_exists(name, exclude_id=None):
+	"""True when another torrent already has exactly that name"""
+	try:
+		for t in client.get_torrents():
+			if t.name == name and str(t.id) != str(exclude_id):
+				return True
+	except TorrentClientError:
+		pass
+	return False
+
+
 def perform_add_torrent(pending, download_dir):
 	"""Adds the torrent and returns the result text
 	(add + optional auto-rename + optional low space warning)"""
@@ -822,11 +850,14 @@ def perform_add_torrent(pending, download_dir):
 	if bot_settings.get("auto_rename"):
 		suggested = parse_name(torrent.name)
 		if suggested and suggested != torrent.name:
-			try:
-				client.rename_torrent(torrent.id, suggested)
-				lines.append(get_text("ADD_AUTO_RENAMED", html.escape(suggested)))
-			except TorrentClientError as e:
-				warning(f"Auto-rename failed for {torrent.name}: {e}")
+			if name_already_exists(suggested, exclude_id=torrent.id):
+				warning(f"Auto-rename skipped for {torrent.name}: a torrent named '{suggested}' already exists")
+			else:
+				try:
+					client.rename_torrent(torrent.id, suggested)
+					lines.append(get_text("ADD_AUTO_RENAMED", html.escape(suggested)))
+				except TorrentClientError as e:
+					warning(f"Auto-rename failed for {torrent.name}: {e}")
 	if bot_settings.get("low_space_warning"):
 		space_warning = build_low_space_warning(torrent.total_size, download_dir)
 		if space_warning:
@@ -1025,7 +1056,7 @@ def handle_pending_input(message, pending):
 		delete_message(chat_id, prompt_message_id)
 	delete_message(chat_id, message.message_id)
 
-	if text.lower() in ("/cancel", "cancel", "cancelar"):
+	if not text or text.lower() in ("/cancel", "cancel", "cancelar"):
 		show_dashboard(chat_id, thread_id=thread_id)
 		return
 
@@ -1033,6 +1064,9 @@ def handle_pending_input(message, pending):
 		ctx_id = new_search_context(text)
 		render_list(chat_id, None, f"q{ctx_id}", 0, thread_id=thread_id)
 	elif action == "rename":
+		if name_already_exists(text, exclude_id=pending["torrent_id"]):
+			send_message(chat_id, get_text("RENAME_DUPLICATE", html.escape(text)), thread_id=thread_id)
+			return
 		try:
 			client.rename_torrent(pending["torrent_id"], text)
 			send_message(chat_id, get_text("RENAME_OK", html.escape(text)), thread_id=thread_id)
@@ -1056,15 +1090,16 @@ def handle_pending_input(message, pending):
 			result = get_text("ADD_ERROR", html.escape(str(e)))
 		send_message(chat_id, result, thread_id=thread_id)
 	elif action == "autoDir":
-		bot_settings.set("auto_download_dir", text)
-		send_message(chat_id, get_text("SETTINGS_UPDATED"), thread_id=thread_id)
+		bot_settings.set("auto_download_dir", text.rstrip("/") or "/")
+		send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"))
 	elif action == "favDir":
 		directory = text.rstrip("/") or "/"
 		favorites = bot_settings.get("favorite_dirs") or []
 		if directory not in favorites:
 			favorites.append(directory)
 			bot_settings.set("favorite_dirs", favorites)
-		send_message(chat_id, get_text("SETTINGS_UPDATED"), thread_id=thread_id)
+		fav_text, fav_markup = build_favorite_dirs_menu()
+		send_message(chat_id, f"{get_text('SETTINGS_UPDATED')}\n\n{fav_text}", reply_markup=fav_markup, thread_id=thread_id)
 	elif action == "template":
 		kind = pending["kind"]
 		try:
@@ -1096,7 +1131,7 @@ def handle_pending_input(message, pending):
 				client.set_speed_limit(direction, None, enabled=False)
 			else:
 				client.set_speed_limit(direction, kbps, enabled=True)
-			send_message(chat_id, get_text("SETTINGS_UPDATED"), thread_id=thread_id)
+			send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"))
 		except TorrentClientError as e:
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
 
@@ -1125,6 +1160,10 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 			return
 		except TorrentClientError as e:
 			err = str(e)
+		except Exception as e:
+			error(f"Unexpected error delivering move order: {e}")
+			finish(get_text("MOVE_GIVE_UP", html.escape(str(e))))
+			return
 		warning(f"Move order not delivered, will retry in background: {err}")
 		if message_id is not None:
 			edit_message(chat_id, message_id, get_text("MOVE_RETRYING"))
@@ -1147,8 +1186,8 @@ def do_mass_move_to(chat_id, filter_key, new_dir, thread_id=None, message_id=Non
 	back_markup = back_close_markup(build_call("list", filter_key, 0))
 	try:
 		torrents = get_filtered_torrents(filter_key)
-	except ExpiredContext:
-		text = get_text("MASS_EXPIRED")
+	except (ExpiredContext, TorrentClientError) as e:
+		text = get_text("MASS_EXPIRED") if isinstance(e, ExpiredContext) else get_text("CONNECTION_ERROR", html.escape(str(e)))
 		if message_id:
 			edit_message(chat_id, message_id, text, back_markup)
 		else:
@@ -1421,6 +1460,8 @@ def handle_callback(call):
 				suggested = parse_name(torrent.name)
 				if not suggested or suggested == torrent.name:
 					edit_message(chat_id, message_id, get_text("RENAME_NO_SUGGESTION"), back_close_markup(build_call("info", torrent_id, filter_key, page)))
+				elif name_already_exists(suggested, exclude_id=torrent_id):
+					edit_message(chat_id, message_id, get_text("RENAME_DUPLICATE", html.escape(suggested)), back_close_markup(build_call("info", torrent_id, filter_key, page)))
 				else:
 					client.rename_torrent(torrent_id, suggested)
 					edit_message(chat_id, message_id, get_text("RENAME_OK", html.escape(suggested)), back_close_markup(build_call("list", filter_key, page)))
@@ -1624,6 +1665,7 @@ def handle_callback(call):
 		edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
 	except Exception as e:
 		error(f"Error handling callback {call.data}: {e}")
+		edit_message(chat_id, message_id, get_text("ERROR_GENERIC", html.escape(str(e))), back_close_markup())
 
 
 # ---------------------------------------------------------------------------
@@ -1648,22 +1690,20 @@ def torrent_monitor():
 	while True:
 		try:
 			torrents = client.get_torrents()
-		except TorrentClientError as e:
+			new_known = {}
+			for torrent in torrents:
+				state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
+				prev = known.get(torrent.id)
+				if not first_run:
+					if state["finished"] and prev is not None and not prev["finished"] and bot_settings.get("notify_completed"):
+						notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
+					if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
+						notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
+				new_known[torrent.id] = state
+			known = new_known
+			first_run = False
+		except Exception as e:
 			warning(f"Torrent monitor: {e}")
-			time.sleep(MONITOR_INTERVAL_SECONDS)
-			continue
-		new_known = {}
-		for torrent in torrents:
-			state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
-			prev = known.get(torrent.id)
-			if not first_run:
-				if state["finished"] and prev is not None and not prev["finished"] and bot_settings.get("notify_completed"):
-					notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
-				if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
-					notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
-			new_known[torrent.id] = state
-		known = new_known
-		first_run = False
 		time.sleep(MONITOR_INTERVAL_SECONDS)
 
 
@@ -1671,13 +1711,16 @@ if __name__ == "__main__":
 	debug(f"torrent-controller-bot {VERSION} started. Connected to {client_version}")
 	send_startup_message()
 	threading.Thread(target=torrent_monitor, daemon=True).start()
-	bot.set_my_commands([
-		telebot.types.BotCommand("/start", get_text("MENU_START")),
-		telebot.types.BotCommand("/list", get_text("MENU_LIST")),
-		telebot.types.BotCommand("/find", get_text("MENU_FIND")),
-		telebot.types.BotCommand("/add", get_text("MENU_ADD")),
-		telebot.types.BotCommand("/settings", get_text("MENU_SETTINGS")),
-		telebot.types.BotCommand("/version", get_text("MENU_VERSION")),
-		telebot.types.BotCommand("/help", get_text("MENU_HELP")),
-	])
+	try:
+		bot.set_my_commands([
+			telebot.types.BotCommand("/start", get_text("MENU_START")),
+			telebot.types.BotCommand("/list", get_text("MENU_LIST")),
+			telebot.types.BotCommand("/find", get_text("MENU_FIND")),
+			telebot.types.BotCommand("/add", get_text("MENU_ADD")),
+			telebot.types.BotCommand("/settings", get_text("MENU_SETTINGS")),
+			telebot.types.BotCommand("/version", get_text("MENU_VERSION")),
+			telebot.types.BotCommand("/help", get_text("MENU_HELP")),
+		])
+	except Exception as e:
+		warning(f"Cannot set bot commands: {e}")
 	bot.infinity_polling(timeout=60)
