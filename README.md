@@ -9,6 +9,8 @@
 ![Github last-commit](https://img.shields.io/github/last-commit/dgongut/torrent-controller-bot)
 ![Github last-commit](https://badgen.net/github/license/dgongut/torrent-controller-bot)
 
+<img src="https://raw.githubusercontent.com/dgongut/pictures/main/torrent-controller-bot/torrent-controller-bot.png" width="150">
+
 Lleva el control de tu gestor de torrents desde un único lugar.
 
 - ✅ Panel de control con estado general: velocidades, espacio libre y torrents agrupados por estado
@@ -43,6 +45,7 @@ Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu
 2. BotFather te devolverá el token del bot. Guárdalo: irá en la variable `TELEGRAM_TOKEN`.
 3. Para conocer tu propio chat ID (lo necesitas para `TELEGRAM_ADMIN`), habla con [@MissRose_bot](https://t.me/MissRose_bot) y envíale `/id`. Te responderá con un número, ese es tu ID.
 4. *(Opcional)* Si vas a usar el bot dentro de un grupo, añádelo, hazlo administrador y obtén el chat ID del grupo de la misma forma; ese valor irá en `TELEGRAM_GROUP`.
+5. *(Opcional)* Si quieres ponerle el icono oficial al bot, descarga la imagen en alta resolución [aquí](https://raw.githubusercontent.com/dgongut/pictures/main/torrent-controller-bot/torrent-controller-bot.png) y envíasela a [@BotFather](https://t.me/BotFather) usando la opción `/setuserpic`.
 
 ## Comandos disponibles
 
