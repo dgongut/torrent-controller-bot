@@ -16,12 +16,12 @@ from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue
-from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, TemplateError, suggest_name, validate_template
+from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, TemplateError, suggest_name, validate_template
 from torrent_clients import TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -65,6 +65,7 @@ def parse_name(filename):
 		filename,
 		template_movie=bot_settings.get("template_movie") or None,
 		template_series=bot_settings.get("template_series") or None,
+		template_season=bot_settings.get("template_season") or None,
 		season_prefix="T" if LANGUAGE.lower() == "es" else "S",
 	)
 
@@ -783,13 +784,16 @@ def render_favorite_dirs_menu(chat_id, message_id):
 # RENAME TEMPLATES
 # ---------------------------------------------------------------------------
 
-TEMPLATE_EXAMPLE_MOVIE = "Minions.and.Monsters.2026.1080p.AMZN.WEB-DL.AAC2.0.H.264-HDZ.mkv"
-TEMPLATE_EXAMPLE_SERIES = "Breaking.Bad.S01E03.720p.HDTV.x264.mkv"
+# Example names contain every detectable field so any template can be previewed
+TEMPLATE_EXAMPLE_MOVIE = "Minions.and.Monsters.2026.1080p.HDR.Castellano.WEB-DL.AAC.2.0.H.264-HDZ.mkv"
+TEMPLATE_EXAMPLE_SERIES = "Breaking.Bad.2008.S01E03.720p.HDR.Castellano.HDTV.DD+5.1.x264-NTb.mkv"
+TEMPLATE_EXAMPLE_SEASON = "Breaking.Bad.2008.S02.1080p.HDR.Castellano.WEB-DL.DD+5.1.H.264-NTb.mkv"
 
 
 def render_templates_menu(chat_id, message_id):
 	template_movie = bot_settings.get("template_movie") or DEFAULT_MOVIE_TEMPLATE
 	template_series = bot_settings.get("template_series") or DEFAULT_SERIES_TEMPLATE
+	template_season = bot_settings.get("template_season") or DEFAULT_SEASON_PACK_TEMPLATE
 	lines = [
 		get_text("TPL_TITLE"),
 		"",
@@ -799,11 +803,15 @@ def render_templates_menu(chat_id, message_id):
 		get_text("TPL_CURRENT_SERIES", html.escape(template_series)),
 		get_text("TPL_PREVIEW", html.escape(parse_name(TEMPLATE_EXAMPLE_SERIES) or "-")),
 		"",
+		get_text("TPL_CURRENT_SEASON", html.escape(template_season)),
+		get_text("TPL_PREVIEW", html.escape(parse_name(TEMPLATE_EXAMPLE_SEASON) or "-")),
+		"",
 		get_text("TPL_FIELDS_HELP"),
 	]
 	markup = InlineKeyboardMarkup(row_width=1)
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_EDIT_MOVIE"), callback_data=build_call("tplEdit", "movie")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_EDIT_SERIES"), callback_data=build_call("tplEdit", "series")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_EDIT_SEASON"), callback_data=build_call("tplEdit", "season")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_RESET"), callback_data=build_call("tplReset")))
 	markup.row(
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("settings")),
@@ -1111,8 +1119,8 @@ def handle_pending_input(message, pending):
 				error_text = get_text("TPL_ERROR_INVALID")
 			send_message(chat_id, f"{error_text}\n\n{get_text('TPL_FIELDS_HELP')}", thread_id=thread_id)
 			return
-		bot_settings.set("template_movie" if kind == "movie" else "template_series", text)
-		example = TEMPLATE_EXAMPLE_MOVIE if kind == "movie" else TEMPLATE_EXAMPLE_SERIES
+		bot_settings.set(f"template_{kind}", text)
+		example = {"movie": TEMPLATE_EXAMPLE_MOVIE, "series": TEMPLATE_EXAMPLE_SERIES, "season": TEMPLATE_EXAMPLE_SEASON}[kind]
 		preview = parse_name(example) or "-"
 		send_message(chat_id, get_text("TPL_SAVED", html.escape(text), html.escape(example), html.escape(preview)), thread_id=thread_id)
 	elif action == "massMove":
@@ -1644,12 +1652,18 @@ def handle_callback(call):
 
 		elif command == "tplEdit":
 			kind = args[0]
-			prompt = get_text("TPL_ASK_MOVIE" if kind == "movie" else "TPL_ASK_SERIES", get_text("TPL_FIELDS_HELP"))
+			current = bot_settings.get(f"template_{kind}") or {
+				"movie": DEFAULT_MOVIE_TEMPLATE, "series": DEFAULT_SERIES_TEMPLATE, "season": DEFAULT_SEASON_PACK_TEMPLATE}[kind]
+			example = {"movie": TEMPLATE_EXAMPLE_MOVIE, "series": TEMPLATE_EXAMPLE_SERIES, "season": TEMPLATE_EXAMPLE_SEASON}[kind]
+			current_block = get_text("TPL_ASK_CURRENT", html.escape(current), html.escape(parse_name(example) or "-"))
+			prompt_key = {"movie": "TPL_ASK_MOVIE", "series": "TPL_ASK_SERIES", "season": "TPL_ASK_SEASON"}[kind]
+			prompt = get_text(prompt_key, f"{current_block}\n\n{get_text('TPL_FIELDS_HELP')}")
 			ask_for_input(chat_id, user_id, "template", prompt, message_id=message_id, kind=kind)
 
 		elif command == "tplReset":
 			bot_settings.set("template_movie", "")
 			bot_settings.set("template_series", "")
+			bot_settings.set("template_season", "")
 			render_templates_menu(chat_id, message_id)
 
 		elif command == "cancelInput":

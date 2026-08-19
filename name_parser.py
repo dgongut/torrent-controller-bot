@@ -428,17 +428,22 @@ def render_template(template, fields):
 # ---------------------------------------------------------------------------
 
 DEFAULT_MOVIE_TEMPLATE = "{title} ({year}) - {resolution}[ {hdr}][.{extension}]"
-DEFAULT_SERIES_TEMPLATE = "{temporada}x{episodio} - {title}[ - {resolution}][ {hdr}][.{extension}]"
+DEFAULT_SERIES_TEMPLATE = "{season}x{episode} - {title}[ - {resolution}][ {hdr}][.{extension}]"
+DEFAULT_SEASON_PACK_TEMPLATE = "{chapter} - {title}[ - {resolution}][ {hdr}][.{extension}]"
 
 
-def suggest_name(filename, template_movie=None, template_series=None, season_prefix="T"):
-	"""Parses the name and renders the matching template (series when an
-	episode/season marker is found, movie otherwise). Returns the suggested
-	name or None when a required field is missing or the result equals the
-	original name"""
+def suggest_name(filename, template_movie=None, template_series=None, template_season=None, season_prefix="T"):
+	"""Parses the name and renders the matching template: season pack when a
+	season without episode is found, series when an episode marker is found,
+	movie otherwise. Returns the suggested name or None when a required field
+	is missing or the result equals the original name"""
 	fields = parse_metadata(filename, season_prefix=season_prefix)
-	template = (template_series if fields["is_series"] else template_movie) or (
-		DEFAULT_SERIES_TEMPLATE if fields["is_series"] else DEFAULT_MOVIE_TEMPLATE)
+	if fields["is_series"] and fields["season"] and not fields["episode_number"]:
+		template = template_season or DEFAULT_SEASON_PACK_TEMPLATE
+	elif fields["is_series"]:
+		template = template_series or DEFAULT_SERIES_TEMPLATE
+	else:
+		template = template_movie or DEFAULT_MOVIE_TEMPLATE
 	try:
 		suggested = render_template(template, fields)
 	except Exception:

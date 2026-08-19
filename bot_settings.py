@@ -22,6 +22,7 @@ DEFAULTS = {
 	"favorite_dirs": [],  # Extra dirs offered as buttons when adding/moving torrents
 	"template_movie": "",  # "" = built-in default template
 	"template_series": "",
+	"template_season": "",  # Season packs (series without episode)
 }
 
 _lock = threading.Lock()
