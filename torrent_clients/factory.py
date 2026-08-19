@@ -19,4 +19,23 @@ def create_client(config):
 			rpc_path=config.TORRENT_CLIENT_RPC_PATH or "/transmission/rpc",
 		)
 
+	if client_name == "qbittorrent":
+		from torrent_clients.qbittorrent_client import QBittorrentClient
+		return QBittorrentClient(
+			host=config.TORRENT_CLIENT_HOST,
+			port=int(config.TORRENT_CLIENT_PORT or 8080),
+			username=config.TORRENT_CLIENT_USER,
+			password=config.TORRENT_CLIENT_PASSWORD,
+			protocol=config.TORRENT_CLIENT_PROTOCOL,
+		)
+
+	if client_name == "deluge":
+		from torrent_clients.deluge_client import DelugeClient
+		return DelugeClient(
+			host=config.TORRENT_CLIENT_HOST,
+			port=int(config.TORRENT_CLIENT_PORT or 8112),
+			password=config.TORRENT_CLIENT_PASSWORD,
+			protocol=config.TORRENT_CLIENT_PROTOCOL,
+		)
+
 	raise TorrentClientError(f"Unsupported torrent client: {client_name}")

@@ -1,0 +1,22 @@
+# Compose de desarrollo: construye la imagen desde Dockerfile_local y usa el .env
+# Levantar con: docker compose -f docker-compose.local.yaml up -d --build --force-recreate
+services:
+    torrent-controller-bot:
+        build:
+            context: .
+            dockerfile: Dockerfile_local
+        container_name: torrent-controller-bot-dev
+        restart: unless-stopped
+        tty: true
+        env_file:
+            - .env
+        volumes:
+            - ./config:/config # Ajustes persistentes del bot
+            - ./torrent-controller-bot.py:/app/torrent-controller-bot.py # Recarga automática con watchmedo
+            - ./bot_settings.py:/app/bot_settings.py
+            - ./config.py:/app/config.py
+            - ./logger.py:/app/logger.py
+            - ./message_queue.py:/app/message_queue.py
+            - ./name_parser.py:/app/name_parser.py
+            - ./torrent_clients:/app/torrent_clients
+            - ./locale:/app/locale

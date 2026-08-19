@@ -1,6 +1,7 @@
 """Transmission implementation of the TorrentClient interface"""
 
 from collections import Counter
+from urllib.parse import urlparse
 
 import transmission_rpc
 
@@ -16,6 +17,7 @@ from torrent_clients.base import (
 LIGHT_FIELDS = [
 	"id", "name", "status", "error", "errorString", "percentDone",
 	"sizeWhenDone", "rateDownload", "rateUpload", "downloadDir", "addedDate",
+	"trackers",
 ]
 
 FULL_FIELDS = LIGHT_FIELDS + [
@@ -75,6 +77,14 @@ class TransmissionClient(TorrentClient):
 					files.append((f.name, f.size, f.completed))
 			except Exception:
 				files = []
+		trackers = []
+		for tracker in self._raw(torrent, "trackers", []) or []:
+			try:
+				host = urlparse(tracker.get("announce", "")).hostname
+			except Exception:
+				host = None
+			if host and host not in trackers:
+				trackers.append(host)
 		eta = self._raw(torrent, "eta", -1)
 		info = TorrentInfo(
 			id=str(torrent.id),
@@ -93,13 +103,18 @@ class TransmissionClient(TorrentClient):
 			error_message=self._raw(torrent, "errorString", "") or "",
 			added_date=self._raw(torrent, "addedDate", None),
 			files=files,
+			trackers=trackers,
 		)
 		return info
+
+	def _version(self, session):
+		# Transmission reports "4.1.3 (838877323f)": drop the commit hash
+		return f"Transmission {session.version.split(' (')[0]}"
 
 	def test_connection(self):
 		try:
 			session = self.client.get_session()
-			return f"Transmission {session.version}"
+			return self._version(session)
 		except Exception as e:
 			raise TorrentClientError(f"Cannot connect to Transmission: {e}")
 
@@ -247,7 +262,7 @@ class TransmissionClient(TorrentClient):
 		try:
 			session = self.client.get_session()
 			return {
-				"version": f"Transmission {session.version}",
+				"version": self._version(session),
 				"alt_speed_enabled": bool(session.alt_speed_enabled),
 				"alt_speed_down": session.alt_speed_down,
 				"alt_speed_up": session.alt_speed_up,

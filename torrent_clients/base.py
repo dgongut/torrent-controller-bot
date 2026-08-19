@@ -43,6 +43,7 @@ class TorrentInfo:
 	error_message: str = ""
 	added_date: object = None  # datetime
 	files: list = field(default_factory=list)  # list of (path, size, completed)
+	trackers: list = field(default_factory=list)  # list of tracker hostnames
 
 	@property
 	def is_finished(self):
@@ -62,6 +63,8 @@ class SessionSummary:
 
 class TorrentClient(ABC):
 	"""Interface that every torrent manager implementation must fulfill"""
+
+	supports_alt_speed = True  # Clients without a turtle mode set this to False
 
 	@abstractmethod
 	def test_connection(self):

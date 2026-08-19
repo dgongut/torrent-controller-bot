@@ -1,0 +1,448 @@
+"""Torrent name metadata parser and rename template engine.
+
+Extracts as much metadata as possible from a release name (title, year,
+season/episode, resolution, HDR, extension, language, codecs, source and
+release group) and renders user-defined templates with two constructs:
+  {field}   required field: if missing, no suggestion is produced
+  [ ... ]   optional block: dropped entirely (literals included) when any
+            field inside it has no value
+Field names are accepted both in Spanish and English."""
+
+import re
+
+# Valid video extensions
+VALID_EXTENSIONS = {"mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "mpg", "mpeg", "m4v", "ts", "m2ts"}
+
+# Episode patterns: S01E03, 1x03, Cap.103 / Capitulo 103
+EPISODE_PATTERNS = [
+	re.compile(r'[Ss](\d{1,2})[\s._-]?[Ee](\d{1,3})'),
+	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})(?!\d)'),
+	re.compile(r'[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})'),
+]
+
+# Season-only patterns (packs): S02, Temporada 2, Season 2, T2
+SEASON_ONLY_PATTERNS = [
+	re.compile(r'\b[Ss](\d{1,2})\b(?![\s._-]?[Ee]\d)'),
+	re.compile(r'[Tt]emporada[\s._-]+(\d{1,2})'),
+	re.compile(r'[Ss]eason[\s._-]+(\d{1,2})'),
+	re.compile(r'\bT(\d{1,2})\b(?![\s._-]?[Ee]\d)'),
+]
+
+# Multi-episode/multi-season packs: S04E01-E08, S01-S08
+_EPISODE_RANGE_PATTERN = re.compile(r'[Ss](\d{1,2})[\s._-]?[Ee](\d{1,3})[\s._-]?-[\s._-]?[Ee]?(\d{1,3})(?![\dpP])')
+_SEASON_RANGE_PATTERN = re.compile(r'\b[Ss](\d{1,2})[\s._-]?-[\s._-]?[Ss](\d{1,2})\b')
+
+# Year ranges for collections/trilogies: 1977-2019, 2006.-.2016
+_YEAR_RANGE = re.compile(r'(?<!\d)((19|20)\d{2})[\s._]*-[\s._]*((19|20)\d{2})(?!\d)')
+_YEAR_PLAIN = re.compile(r'[\s._-]((19|20)\d{2})(?=[\s._-]|$)')
+
+_REMUX_PATTERNS = [
+	(re.compile(r'UHD[\s._-]?remux', re.IGNORECASE), "UHDRemux"),
+	(re.compile(r'BD[\s._-]?remux', re.IGNORECASE), "BDRemux"),
+	(re.compile(r'remux', re.IGNORECASE), "Remux"),
+]
+
+_RESOLUTION_PATTERNS = [
+	(re.compile(r'2160p|\b4K\b|\bUHD\b', re.IGNORECASE), "4K"),
+	(re.compile(r'1080([pi])', re.IGNORECASE), "1080{0}"),
+	(re.compile(r'720([pi])', re.IGNORECASE), "720{0}"),
+	(re.compile(r'480([pi])', re.IGNORECASE), "480{0}"),
+	(re.compile(r'\bmHD\b', re.IGNORECASE), "mHD"),
+]
+
+_HDR_PATTERN = re.compile(r'\bHDR10\+?|\bHDR\b|Dolby[\s._-]?Vision\b|\bDoVi\b|\bDV\b')
+
+_VIDEO_CODECS = [
+	(re.compile(r'[HXhx][\s._-]?264\b|\bAVC\b', re.IGNORECASE), "H.264"),
+	(re.compile(r'[HXhx][\s._-]?265\b|\bHEVC\b', re.IGNORECASE), "H.265"),
+	(re.compile(r'\bAV1\b', re.IGNORECASE), "AV1"),
+	(re.compile(r'\bXviD\b', re.IGNORECASE), "XviD"),
+	(re.compile(r'\bDivX\b', re.IGNORECASE), "DivX"),
+	(re.compile(r'\bVP9\b', re.IGNORECASE), "VP9"),
+]
+
+# Order matters: more specific codecs first
+_AUDIO_CODECS = [
+	(re.compile(r'DTS[\s._-]?HD(?:[\s._-]?MA)?(?![A-Za-z])', re.IGNORECASE), "DTS-HD"),
+	(re.compile(r'DTS[\s._-]?X(?![A-Za-z0-9])', re.IGNORECASE), "DTS-X"),
+	(re.compile(r'\bDTS(?![A-Za-z])', re.IGNORECASE), "DTS"),
+	(re.compile(r'True[\s._-]?HD(?![A-Za-z])', re.IGNORECASE), "TrueHD"),
+	(re.compile(r'\bE[\s._-]?AC[\s._-]?3(?![A-Za-z])|\bDDP(?![A-Za-z])|\bDD\+', re.IGNORECASE), "EAC3"),
+	(re.compile(r'\bAC[\s._-]?3(?![A-Za-z])|\bDD(?![A-Za-z+])', re.IGNORECASE), "AC3"),
+	(re.compile(r'\bAAC(?![A-Za-z])', re.IGNORECASE), "AAC"),
+	(re.compile(r'\bFLAC(?![A-Za-z])', re.IGNORECASE), "FLAC"),
+	(re.compile(r'\bMP3(?![A-Za-z])', re.IGNORECASE), "MP3"),
+	(re.compile(r'\bOPUS(?![A-Za-z])', re.IGNORECASE), "OPUS"),
+]
+
+# Atmos is a complement to the base codec (TrueHD Atmos, EAC3 5.1 Atmos...)
+_ATMOS_PATTERN = re.compile(r'\bAtmos(?![A-Za-z])', re.IGNORECASE)
+
+_AUDIO_CHANNELS = re.compile(r'^[\s._-]{0,2}(\d[.,]\d)')
+
+_SOURCES = [
+	(re.compile(r'WEB[\s._-]?DL', re.IGNORECASE), "WEB-DL"),
+	(re.compile(r'WEB[\s._-]?Rip', re.IGNORECASE), "WEBRip"),
+	(re.compile(r'Blu[\s._-]?Ray', re.IGNORECASE), "BluRay"),
+	(re.compile(r'\bBDRip\b', re.IGNORECASE), "BDRip"),
+	(re.compile(r'\bBRRip\b', re.IGNORECASE), "BRRip"),
+	(re.compile(r'\bHDTV\b', re.IGNORECASE), "HDTV"),
+	(re.compile(r'\bDVDRip\b', re.IGNORECASE), "DVDRip"),
+	(re.compile(r'\bHDRip\b', re.IGNORECASE), "HDRip"),
+	(re.compile(r'\bWEB\b', re.IGNORECASE), "WEB-DL"),
+]
+
+_LANGUAGES = [
+	(re.compile(r'\bCastellano\b|\bSpanish\b|\bEspañol\b|\bESP\b', re.IGNORECASE), "Castellano"),
+	(re.compile(r'\bLatino\b', re.IGNORECASE), "Latino"),
+	(re.compile(r'\bVOSE\b', re.IGNORECASE), "VOSE"),
+	(re.compile(r'\bDUAL\b', re.IGNORECASE), "Dual"),
+	(re.compile(r'\bMULTI\b', re.IGNORECASE), "Multi"),
+	(re.compile(r'\bVOSTFR\b|\bFrench\b', re.IGNORECASE), "French"),
+	(re.compile(r'\bEnglish\b|\bENG\b', re.IGNORECASE), "English"),
+	(re.compile(r'\bGerman\b', re.IGNORECASE), "German"),
+	(re.compile(r'\bItalian\b', re.IGNORECASE), "Italian"),
+]
+
+_GROUP_PATTERN = re.compile(r'-([A-Za-z0-9]{2,20})\s*$')
+_GROUP_BLACKLIST = {"dl", "hd", "ma", "rip", "x264", "x265", "264", "265"}
+
+CANONICAL_FIELDS = {
+	"title", "year", "chapter", "season", "episode_number", "resolution",
+	"hdr", "extension", "language", "video_codec", "audio_codec", "source", "group",
+}
+
+# Template field names accepted in both languages (Spanish and English)
+FIELD_ALIASES = {
+	# Spanish
+	"titulo": "title", "título": "title",
+	"año": "year", "anio": "year",
+	"capitulo": "chapter", "capítulo": "chapter",
+	"temporada": "season",
+	"episodio": "episode_number",
+	"resolucion": "resolution", "resolución": "resolution",
+	"extension": "extension", "extensión": "extension",
+	"idioma": "language",
+	"codec_video": "video_codec", "códec_video": "video_codec",
+	"codec_audio": "audio_codec", "códec_audio": "audio_codec",
+	"fuente": "source",
+	"grupo": "group",
+	# English
+	"title": "title",
+	"year": "year",
+	"chapter": "chapter",
+	"season": "season",
+	"episode": "episode_number",
+	"episode_number": "episode_number",
+	"resolution": "resolution",
+	"language": "language",
+	"video_codec": "video_codec",
+	"audio_codec": "audio_codec",
+	"source": "source",
+	"group": "group",
+	# Both
+	"hdr": "hdr",
+}
+
+
+class TemplateError(Exception):
+	def __init__(self, code, detail=""):
+		super().__init__(code)
+		self.code = code
+		self.detail = detail
+
+
+# ---------------------------------------------------------------------------
+# METADATA EXTRACTION
+# ---------------------------------------------------------------------------
+
+def _split_extension(filename):
+	if "." in filename:
+		potential_name, potential_ext = filename.rsplit(".", 1)
+		if potential_ext.lower() in VALID_EXTENSIONS:
+			return potential_name, potential_ext
+	return filename, ""
+
+
+def _find_episode(name):
+	"""Returns (season, episode, match_start) or None"""
+	for i, pattern in enumerate(EPISODE_PATTERNS):
+		match = pattern.search(name)
+		if match:
+			if i == 2:  # Cap.NNN(N): last two digits are the episode
+				digits = match.group(1)
+				season = int(digits[:-2]) if len(digits) > 2 else 1
+				episode = int(digits[-2:])
+			else:
+				season = int(match.group(1))
+				episode = int(match.group(2))
+			return season, episode, match.start()
+	return None
+
+
+def _find_season_only(name):
+	"""Returns (season, match_start) or None"""
+	for pattern in SEASON_ONLY_PATTERNS:
+		match = pattern.search(name)
+		if match:
+			return int(match.group(1)), match.start()
+	return None
+
+
+def _clean_title(title_part):
+	# Remove bracketed tags ([HDTV 1080p], trailing unclosed bracket, etc.)
+	title = re.sub(r'\[[^\]]*\]?', ' ', title_part)
+
+	# Replace underscores with spaces
+	title = re.sub(r'_', ' ', title)
+
+	# Preserve dots in acronyms (J.F.K.) and numbers (20.000)
+	title = re.sub(r'([A-Z])\.(?=[A-Z])', r'\1§PUNTO§', title)
+	title = re.sub(r'(\d)\.(?=\d)', r'\1§PUNTO§', title)
+
+	# Replace remaining dots (word separators) with spaces
+	title = re.sub(r'\.', ' ', title)
+
+	# Restore protected dots
+	title = re.sub(r'§PUNTO§', '.', title)
+
+	# Collapse multiple spaces
+	title = re.sub(r'\s+', ' ', title).strip()
+
+	# Remove trailing opening parenthesis and leftover separators
+	title = re.sub(r'\s*\(\s*$', '', title).strip()
+	title = re.sub(r'[\s\-–_.]+$', '', title).strip()
+	return title
+
+
+def _detect_resolution(name):
+	# REMUX takes priority and shares the field with the resolution
+	for pattern, value in _REMUX_PATTERNS:
+		if pattern.search(name):
+			return value
+	for pattern, value in _RESOLUTION_PATTERNS:
+		match = pattern.search(name)
+		if match:
+			return value.format(match.group(1).lower()) if "{0}" in value else value
+	return ""
+
+
+def _detect_from_list(name, patterns):
+	for pattern, value in patterns:
+		if pattern.search(name):
+			return value
+	return ""
+
+
+def _detect_audio(name):
+	base = ""
+	for pattern, value in _AUDIO_CODECS:
+		match = pattern.search(name)
+		if match:
+			channels = _AUDIO_CHANNELS.match(name[match.end():])
+			if channels:
+				base = f"{value} {channels.group(1).replace(',', '.')}"
+			else:
+				base = value
+			break
+	if _ATMOS_PATTERN.search(name):
+		return f"{base} Atmos".strip()
+	return base
+
+
+def _detect_group(name):
+	match = _GROUP_PATTERN.search(name)
+	if match and match.group(1).lower() not in _GROUP_BLACKLIST:
+		return match.group(1)
+	return ""
+
+
+def parse_metadata(filename, season_prefix="T"):
+	"""Extracts all detectable metadata from a release name.
+	Returns a dict with all CANONICAL_FIELDS (empty string when missing)
+	plus 'is_series' (bool). season_prefix is used for the 'chapter' field
+	on season-only packs (T2 in Spanish, S2 in English)"""
+	name, ext = _split_extension(filename)
+
+	fields = {key: "" for key in CANONICAL_FIELDS}
+	fields["extension"] = ext
+	fields["is_series"] = False
+
+	# Episode/season detection determines the title boundary
+	title_end = len(name)
+	episode_range = _EPISODE_RANGE_PATTERN.search(name)
+	episode_info = _find_episode(name)
+	season_range = _SEASON_RANGE_PATTERN.search(name)
+	if episode_range:
+		season, ep1, ep2 = int(episode_range.group(1)), int(episode_range.group(2)), int(episode_range.group(3))
+		fields["is_series"] = True
+		fields["season"] = str(season)
+		fields["episode_number"] = f"{ep1:02d}-{ep2:02d}"
+		fields["chapter"] = f"{season}x{ep1:02d}-{ep2:02d}"
+		title_end = episode_range.start()
+	elif episode_info:
+		season, episode, start = episode_info
+		fields["is_series"] = True
+		fields["season"] = str(season)
+		fields["episode_number"] = f"{episode:02d}"
+		fields["chapter"] = f"{season}x{episode:02d}"
+		title_end = start
+	elif season_range:
+		s1, s2 = int(season_range.group(1)), int(season_range.group(2))
+		fields["is_series"] = True
+		fields["season"] = f"{s1}-{s2}"
+		fields["chapter"] = f"{season_prefix}{s1}-{season_prefix}{s2}"
+		title_end = season_range.start()
+	else:
+		season_info = _find_season_only(name)
+		if season_info:
+			season, start = season_info
+			fields["is_series"] = True
+			fields["season"] = str(season)
+			fields["chapter"] = f"{season_prefix}{season}"
+			title_end = start
+
+	# The title also ends at the first metadata token (resolution, source...)
+	meta_start = len(name)
+	for patterns in ([p for p, _ in _REMUX_PATTERNS], [p for p, _ in _RESOLUTION_PATTERNS],
+						[p for p, _ in _SOURCES], [p for p, _ in _VIDEO_CODECS], [_HDR_PATTERN]):
+		for pattern in patterns:
+			match = pattern.search(name)
+			if match and match.start() < meta_start:
+				meta_start = match.start()
+	if meta_start < title_end:
+		title_end = meta_start
+
+	# Year: range (collections) > parentheses > last plain year before the
+	# metadata tags (in "Blade Runner 2049 2017" the release year is 2017)
+	year_range = _YEAR_RANGE.search(name)
+	if year_range:
+		fields["year"] = f"{year_range.group(1)}-{year_range.group(3)}"
+		if year_range.start() < title_end:
+			title_end = year_range.start()
+	else:
+		year_match = re.search(r'\((19|20)\d{2}', name)
+		if not year_match:
+			plain_years = [m for m in _YEAR_PLAIN.finditer(name)]
+			before_meta = [m for m in plain_years if m.start() <= meta_start]
+			year_match = before_meta[-1] if before_meta else (plain_years[0] if plain_years else None)
+		if year_match:
+			fields["year"] = re.search(r'(19|20)\d{2}', year_match.group()).group()
+			if year_match.start() < title_end:
+				title_end = year_match.start()
+
+	fields["title"] = _clean_title(name[:title_end])
+	fields["resolution"] = _detect_resolution(name)
+	fields["hdr"] = "HDR" if _HDR_PATTERN.search(name) else ""
+	fields["language"] = _detect_from_list(name, _LANGUAGES)
+	fields["video_codec"] = _detect_from_list(name, _VIDEO_CODECS)
+	fields["audio_codec"] = _detect_audio(name)
+	fields["source"] = _detect_from_list(name, _SOURCES)
+	fields["group"] = _detect_group(name)
+	return fields
+
+
+# ---------------------------------------------------------------------------
+# TEMPLATE ENGINE
+# ---------------------------------------------------------------------------
+
+_TOKEN_PATTERN = re.compile(r'\{([^{}\[\]]+)\}')
+
+
+def _resolve_field(raw_name):
+	return FIELD_ALIASES.get(raw_name.strip().lower())
+
+
+def validate_template(template):
+	"""Raises TemplateError if the template is malformed. Returns the list of
+	canonical fields used"""
+	if not template.strip():
+		raise TemplateError("empty")
+	depth = 0
+	for char in template:
+		if char == "[":
+			depth += 1
+			if depth > 1:
+				raise TemplateError("nested_brackets")
+		elif char == "]":
+			depth -= 1
+			if depth < 0:
+				raise TemplateError("unbalanced_brackets")
+	if depth != 0:
+		raise TemplateError("unbalanced_brackets")
+	if "{" in _TOKEN_PATTERN.sub("", template) or "}" in _TOKEN_PATTERN.sub("", template):
+		raise TemplateError("unbalanced_braces")
+	used = []
+	for raw_name in _TOKEN_PATTERN.findall(template):
+		field = _resolve_field(raw_name)
+		if field is None:
+			raise TemplateError("unknown_field", raw_name.strip())
+		used.append(field)
+	if not used:
+		raise TemplateError("empty")
+	return used
+
+
+def _render_fragment(fragment, fields):
+	"""Renders a fragment without brackets. Returns the text, or None when
+	any field inside it has no value"""
+	result = ""
+	last = 0
+	for match in _TOKEN_PATTERN.finditer(fragment):
+		field = _resolve_field(match.group(1))
+		value = fields.get(field, "")
+		if not value:
+			return None
+		result += fragment[last:match.start()] + value
+		last = match.end()
+	return result + fragment[last:]
+
+
+def render_template(template, fields):
+	"""Renders the template with the given metadata. Returns the resulting
+	name, or None when a required field (outside brackets) is missing"""
+	result = ""
+	pos = 0
+	while pos < len(template):
+		open_bracket = template.find("[", pos)
+		if open_bracket == -1:
+			fragment = _render_fragment(template[pos:], fields)
+			if fragment is None:
+				return None
+			result += fragment
+			break
+		fragment = _render_fragment(template[pos:open_bracket], fields)
+		if fragment is None:
+			return None
+		result += fragment
+		close_bracket = template.find("]", open_bracket)
+		optional_text = _render_fragment(template[open_bracket + 1:close_bracket], fields)
+		if optional_text is not None:
+			result += optional_text
+		pos = close_bracket + 1
+	return result.strip() or None
+
+
+# ---------------------------------------------------------------------------
+# HIGH-LEVEL API
+# ---------------------------------------------------------------------------
+
+DEFAULT_MOVIE_TEMPLATE = "{title} ({year}) - {resolution}[ {hdr}][.{extension}]"
+DEFAULT_SERIES_TEMPLATE = "{chapter} - {title}[ - {resolution}][ {hdr}][.{extension}]"
+
+
+def suggest_name(filename, template_movie=None, template_series=None, season_prefix="T"):
+	"""Parses the name and renders the matching template (series when an
+	episode/season marker is found, movie otherwise). Returns the suggested
+	name or None when a required field is missing or the result equals the
+	original name"""
+	fields = parse_metadata(filename, season_prefix=season_prefix)
+	template = (template_series if fields["is_series"] else template_movie) or (
+		DEFAULT_SERIES_TEMPLATE if fields["is_series"] else DEFAULT_MOVIE_TEMPLATE)
+	try:
+		suggested = render_template(template, fields)
+	except Exception:
+		return None
+	if not suggested or suggested == filename:
+		return None
+	return suggested

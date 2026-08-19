@@ -14,18 +14,24 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Panel de control con estado general: velocidades, espacio libre y torrents agrupados por estado
 - ✅ Listado de torrents con filtros (descargando, compartiendo, pausados, completados, con error...) y paginación
 - ✅ Búsqueda de torrents por nombre o por ruta
-- ✅ Añadir torrents enviando un fichero `.torrent` o un enlace magnet, eligiendo el directorio de descarga
+- ✅ Añadir torrents enviando un fichero `.torrent`, un enlace magnet o una URL a un fichero `.torrent`, eligiendo el directorio de descarga
 - ✅ Pausar, reanudar, verificar y borrar torrents (con o sin sus datos)
 - ✅ Mover torrents de directorio con aviso al terminar el movimiento
 - ✅ Renombrado con sugerencia automática para películas y series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
 - ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar o mover todos
+- ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
+- ✅ Notificaciones de descarga completada y de errores en torrents (activables desde los ajustes)
+- ✅ Descarga automática sin preguntar la ruta, con directorio configurable
+- ✅ Renombrado automático al añadir un torrent (activable desde los ajustes)
+- ✅ Aviso si el torrent que añades puede no caber en el disco
+- ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
 - ✅ Notificación al administrador al arrancar el bot
 - ✅ Diseñado para bibliotecas grandes (probado con más de 10.000 torrents)
 - ✅ Imagen multiarquitectura (amd64, arm64, armv7…) compatible con Raspberry Pi, NAS y servidores estándar
 - ✅ Soporte de idiomas (Spanish, English)
 
-Actualmente soporta **Transmission** como gestor de torrents. La arquitectura interna es agnóstica al cliente, por lo que en el futuro podrán añadirse otros gestores (qBittorrent, Deluge...).
+Actualmente soporta **Transmission**, **qBittorrent** y **Deluge** como gestores de torrents. La arquitectura interna es agnóstica al cliente, por lo que en el futuro podrán añadirse otros gestores.
 
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/torrent-controller-bot)?
 
@@ -69,14 +75,13 @@ Si no puede generar sugerencia, siempre puedes escribir el nombre manualmente.
 |TELEGRAM_THREAD |❌| Thread del tema dentro de un supergrupo; valor numérico (2,3,4..). Por defecto 1. Se utiliza en conjunción con la variable TELEGRAM_GROUP |
 |TZ |✅| Timezone (Por ejemplo Europe/Madrid) |
 |LANGUAGE |❌| Idioma, puede ser ES / EN. Por defecto ES (Spanish) |
-|TORRENT_CLIENT |❌| Gestor de torrents. De momento solo `transmission`. Por defecto transmission |
+|TORRENT_CLIENT |❌| Gestor de torrents: `transmission`, `qbittorrent` o `deluge`. Por defecto transmission |
 |TORRENT_CLIENT_HOST |✅| Host o IP donde está el gestor de torrents |
-|TORRENT_CLIENT_PORT |❌| Puerto del gestor de torrents. Por defecto 9091 (Transmission) |
+|TORRENT_CLIENT_PORT |❌| Puerto del gestor de torrents. Por defecto 9091 (Transmission), 8080 (qBittorrent) u 8112 (Deluge Web UI) |
 |TORRENT_CLIENT_USER |❌| Usuario del gestor de torrents, si tiene autenticación |
 |TORRENT_CLIENT_PASSWORD |❌| Contraseña del gestor de torrents, si tiene autenticación |
 |TORRENT_CLIENT_PROTOCOL |❌| Protocolo de conexión, http o https. Por defecto http |
 |TORRENT_CLIENT_RPC_PATH |❌| Ruta del RPC. Por defecto /transmission/rpc (Transmission) |
-|DOWNLOAD_DIRS |❌| Directorios de descarga favoritos separados por comas. Aparecen como botones al añadir o mover torrents. Por ejemplo /downloads/peliculas,/downloads/series |
 |TORRENTS_PER_PAGE |❌| Número de torrents por página en los listados. Por defecto 10 |
 |DASHBOARD_REFRESH_SECONDS |❌| Segundos entre refrescos automáticos del panel de control. Por defecto 2 |
 |DASHBOARD_REFRESH_DURATION |❌| Segundos que dura el refresco automático del panel de control. Por defecto 60 |
@@ -98,16 +103,17 @@ services:
             #- TORRENT_CLIENT_PORT=9091
             #- TORRENT_CLIENT_USER=
             #- TORRENT_CLIENT_PASSWORD=
-            #- DOWNLOAD_DIRS=/downloads/peliculas,/downloads/series
         image: dgongut/torrent-controller-bot:latest
         container_name: torrent-controller-bot
         restart: always
         tty: true
+        volumes:
+            - /ruta/de/tu/eleccion:/config # Ajustes persistentes del bot
 ```
 
 ## Anotaciones
 > [!NOTE]
-> El bot no necesita acceso a los ficheros descargados: se comunica con el gestor de torrents únicamente por RPC, por lo que no hay que mapear volúmenes.
+> El bot no necesita acceso a los ficheros descargados: se comunica con el gestor de torrents únicamente por RPC. El único volumen que hay que mapear es `/config`, donde el bot guarda sus ajustes para que persistan entre reinicios.
 
 > [!NOTE]
 > Si Transmission corre en la misma máquina que el bot pero fuera de Docker, usa `host.docker.internal` como `TORRENT_CLIENT_HOST` (en Linux añade `extra_hosts: ["host.docker.internal:host-gateway"]`).
@@ -129,6 +135,7 @@ torrent-controller-bot/
     ├── LICENSE
     ├── requirements.txt
     ├── README.md
+    ├── bot_settings.py
     ├── config.py
     ├── logger.py
     ├── message_queue.py
@@ -139,7 +146,9 @@ torrent-controller-bot/
     ├── torrent_clients
     │   ├── __init__.py
     │   ├── base.py
+    │   ├── deluge_client.py
     │   ├── factory.py
+    │   ├── qbittorrent_client.py
     │   └── transmission_client.py
     └── locale
         ├── en.json

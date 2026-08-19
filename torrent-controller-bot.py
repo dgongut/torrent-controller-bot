@@ -2,11 +2,13 @@ import html
 import json
 import math
 import re
+import requests
 import sys
 import telebot
 import threading
 import time
 import uuid
+from collections import Counter
 from config import *
 from datetime import datetime
 from telebot.types import ForceReply
@@ -14,11 +16,12 @@ from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue
-from smart_rename import parse_name
+from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, TemplateError, suggest_name, validate_template
 from torrent_clients import TorrentClientError, TorrentStatus, create_client
+import bot_settings
 import config as _config_module
 
-VERSION = "0.9.0"
+VERSION = "1.0.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -53,6 +56,17 @@ def get_text(key, *args):
 			translated_text = translated_text.replace(f"${i}", str(arg))
 
 	return translated_text
+
+
+def parse_name(filename):
+	"""Suggests a name using the user templates (or the defaults).
+	Returns None when no suggestion can be produced"""
+	return suggest_name(
+		filename,
+		template_movie=bot_settings.get("template_movie") or None,
+		template_series=bot_settings.get("template_series") or None,
+		season_prefix="T" if LANGUAGE.lower() == "es" else "S",
+	)
 
 
 # Initial variable validation
@@ -190,6 +204,13 @@ def delete_message(chat_id, message_id):
 		pass
 
 
+def notify(text):
+	"""Sends a bot-initiated notification to the configured destination:
+	the group (and thread) if set, otherwise the first admin"""
+	target = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
+	send_message(target, text, thread_id=TELEGRAM_THREAD)
+
+
 # ---------------------------------------------------------------------------
 # IN-MEMORY CONTEXTS
 # ---------------------------------------------------------------------------
@@ -198,6 +219,9 @@ _contexts_lock = threading.Lock()
 
 # Search contexts: short id -> {"query": str, "ts": float}
 search_contexts = {}
+
+# Tracker filter contexts: short id -> {"tracker": str, "ts": float}
+tracker_contexts = {}
 
 # Pending torrents waiting for a download dir: id -> {"magnet"/"data", "name", "ts"}
 pending_torrents = {}
@@ -247,6 +271,25 @@ def get_search_query(ctx_id):
 		return None
 
 
+def new_tracker_context(tracker):
+	with _contexts_lock:
+		now = time.time()
+		for key in [k for k, v in tracker_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del tracker_contexts[key]
+		ctx_id = uuid.uuid4().hex[:6]
+		tracker_contexts[ctx_id] = {"tracker": tracker, "ts": now}
+		return ctx_id
+
+
+def get_tracker_filter(ctx_id):
+	with _contexts_lock:
+		ctx = tracker_contexts.get(ctx_id)
+		if ctx:
+			ctx["ts"] = time.time()
+			return ctx["tracker"]
+		return None
+
+
 def new_pending_torrent(name, magnet=None, data=None):
 	with _contexts_lock:
 		now = time.time()
@@ -275,12 +318,21 @@ class ExpiredContext(Exception):
 	pass
 
 
+def is_known_filter(filter_key):
+	return filter_key in (FILTER_ALL, FILTER_COMPLETED) or filter_key in FILTER_TO_STATUS
+
+
 def get_filter_label(filter_key):
-	if filter_key.startswith("q"):
+	if not is_known_filter(filter_key) and filter_key.startswith("q"):
 		query = get_search_query(filter_key[1:])
 		if query is None:
 			raise ExpiredContext()
 		return get_text("SEARCH_RESULTS_TITLE", html.escape(query))
+	if not is_known_filter(filter_key) and filter_key.startswith("t"):
+		tracker = get_tracker_filter(filter_key[1:])
+		if tracker is None:
+			raise ExpiredContext()
+		return get_text("TRACKER_RESULTS_TITLE", html.escape(tracker))
 	if filter_key == FILTER_ALL:
 		return get_text("STATUS_ALL")
 	if filter_key == FILTER_COMPLETED:
@@ -292,12 +344,17 @@ def get_filter_label(filter_key):
 
 def get_filtered_torrents(filter_key):
 	"""Returns the list of TorrentInfo matching a filter key.
-	Raises ExpiredContext if it points to an expired search"""
-	if filter_key.startswith("q"):
+	Raises ExpiredContext if it points to an expired search or tracker filter"""
+	if not is_known_filter(filter_key) and filter_key.startswith("q"):
 		query = get_search_query(filter_key[1:])
 		if query is None:
 			raise ExpiredContext()
 		return client.get_torrents(query=query)
+	if not is_known_filter(filter_key) and filter_key.startswith("t"):
+		tracker = get_tracker_filter(filter_key[1:])
+		if tracker is None:
+			raise ExpiredContext()
+		return [t for t in client.get_torrents() if tracker in t.trackers]
 	if filter_key == FILTER_ALL:
 		return client.get_torrents()
 	if filter_key == FILTER_COMPLETED:
@@ -347,8 +404,9 @@ def build_dashboard(refreshing):
 	markup.add(*filter_buttons)
 	markup.add(
 		InlineKeyboardButton(get_text("BUTTON_SEARCH"), callback_data=build_call("search")),
-		InlineKeyboardButton(get_text("BUTTON_SETTINGS"), callback_data=build_call("settings")),
+		InlineKeyboardButton(get_text("BUTTON_TRACKERS"), callback_data=build_call("trackers")),
 	)
+	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTINGS"), callback_data=build_call("settings")))
 	bottom = []
 	if not refreshing:
 		bottom.append(InlineKeyboardButton(get_text("BUTTON_UPDATE"), callback_data=build_call("refreshDashboard")))
@@ -511,6 +569,11 @@ def build_detail(torrent_id, filter_key, page):
 	if torrent.status == TorrentStatus.DOWNLOADING:
 		lines.append(f"{get_text('INFO_ETA')}: {format_eta(torrent.eta)}")
 	lines.append(f"{get_text('INFO_PEERS')}: {torrent.peers}")
+	if torrent.trackers:
+		tracker_text = html.escape(torrent.trackers[0])
+		if len(torrent.trackers) > 1:
+			tracker_text += f" {get_text('INFO_TRACKER_AND_MORE', len(torrent.trackers) - 1)}"
+		lines.append(f"{get_text('INFO_TRACKER')}: {tracker_text}")
 	lines.append(f"{get_text('INFO_DIR')}: <code>{html.escape(torrent.download_dir)}</code>")
 	if torrent.added_date:
 		added = datetime.fromtimestamp(torrent.added_date).strftime("%Y-%m-%d %H:%M")
@@ -553,18 +616,44 @@ def render_detail(chat_id, message_id, torrent_id, filter_key, page):
 
 
 # ---------------------------------------------------------------------------
+# TRACKER FILTER
+# ---------------------------------------------------------------------------
+
+def build_trackers_menu():
+	counts = Counter()
+	for torrent in client.get_torrents():
+		for tracker in torrent.trackers:
+			counts[tracker] += 1
+	text = get_text("TRACKERS_TITLE", len(counts))
+	if not counts:
+		text += f"\n\n{get_text('TRACKERS_EMPTY')}"
+	markup = InlineKeyboardMarkup(row_width=1)
+	for tracker, count in counts.most_common(MAX_TRACKER_BUTTONS):
+		ctx_id = new_tracker_context(tracker)
+		markup.add(InlineKeyboardButton(
+			f"🌐 {truncate(tracker)} ({count})",
+			callback_data=build_call("list", f"t{ctx_id}", 0)))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return text, markup
+
+
+# ---------------------------------------------------------------------------
 # DIRECTORIES
 # ---------------------------------------------------------------------------
 
 def get_known_dirs():
-	"""Known directories: in use by the client + extras from DOWNLOAD_DIRS"""
+	"""Known directories: in use by the client + favorite dirs + auto download dir"""
 	dirs = []
 	try:
 		dirs.extend(client.get_download_dirs())
 	except TorrentClientError as e:
 		warning(f"Cannot get download dirs: {e}")
-	for extra in DOWNLOAD_DIRS.split(","):
-		extra = extra.strip().rstrip("/")
+	extras = list(bot_settings.get("favorite_dirs") or []) + [bot_settings.get("auto_download_dir")]
+	for extra in extras:
+		extra = (extra or "").strip().rstrip("/")
 		if extra and extra not in dirs:
 			dirs.append(extra)
 	return dirs
@@ -605,20 +694,39 @@ def build_settings():
 		return f"{value} KB/s" if enabled else get_text("NO_LIMIT")
 
 	lines = [get_text("SETTINGS_TITLE", settings["version"]), ""]
-	alt_state = get_text("ENABLED") if settings["alt_speed_enabled"] else get_text("DISABLED")
-	lines.append(get_text("SETTINGS_ALT_SPEED", alt_state, settings["alt_speed_down"], settings["alt_speed_up"]))
+	if client.supports_alt_speed:
+		alt_state = get_text("ENABLED") if settings["alt_speed_enabled"] else get_text("DISABLED")
+		lines.append(get_text("SETTINGS_ALT_SPEED", alt_state, settings["alt_speed_down"], settings["alt_speed_up"]))
 	lines.append(get_text("SETTINGS_DOWN_LIMIT", limit_text(settings["speed_limit_down"], settings["speed_limit_down_enabled"])))
 	lines.append(get_text("SETTINGS_UP_LIMIT", limit_text(settings["speed_limit_up"], settings["speed_limit_up_enabled"])))
 	lines.append(get_text("SETTINGS_DEFAULT_DIR", html.escape(settings["download_dir"])))
+	lines.append("")
+	lines.append(get_text("SETTINGS_BOT_TITLE"))
+	auto_dir = bot_settings.get("auto_download_dir")
+	auto_dir_label = f"<code>{html.escape(auto_dir)}</code>" if auto_dir else get_text("AUTO_DIR_CLIENT_DEFAULT")
+	lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label))
+
+	def toggle_button(setting_key, text_key):
+		state = "✅" if bot_settings.get(setting_key) else "❌"
+		return InlineKeyboardButton(f"{state} {get_text(text_key)}", callback_data=build_call("toggleSetting", setting_key))
 
 	markup = InlineKeyboardMarkup(row_width=1)
-	markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_ALT_SPEED"), callback_data=build_call("toggleAltSpeed")))
+	if client.supports_alt_speed:
+		markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_ALT_SPEED"), callback_data=build_call("toggleAltSpeed")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_DOWN_LIMIT"), callback_data=build_call("toggleDownLimit")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_UP_LIMIT"), callback_data=build_call("toggleUpLimit")))
 	markup.row(
 		InlineKeyboardButton(get_text("BUTTON_SET_DOWN_LIMIT"), callback_data=build_call("setDownLimit")),
 		InlineKeyboardButton(get_text("BUTTON_SET_UP_LIMIT"), callback_data=build_call("setUpLimit")),
 	)
+	markup.add(toggle_button("notify_completed", "BUTTON_SETTING_NOTIFY_COMPLETED"))
+	markup.add(toggle_button("notify_errors", "BUTTON_SETTING_NOTIFY_ERRORS"))
+	markup.add(toggle_button("auto_download", "BUTTON_SETTING_AUTO_DOWNLOAD"))
+	markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
+	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_AUTO_DIR"), callback_data=build_call("autoDirMenu", 0)))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_FAV_DIRS"), callback_data=build_call("favDirsMenu")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TEMPLATES"), callback_data=build_call("tplMenu")))
 	markup.row(
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
@@ -633,6 +741,58 @@ def render_settings(chat_id, message_id):
 		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
 		markup = back_close_markup()
 	edit_message(chat_id, message_id, text, markup)
+
+
+def render_favorite_dirs_menu(chat_id, message_id):
+	favorites = bot_settings.get("favorite_dirs") or []
+	lines = [get_text("FAV_DIRS_TITLE"), ""]
+	if favorites:
+		lines.append(get_text("FAV_DIRS_HINT"))
+	else:
+		lines.append(get_text("FAV_DIRS_EMPTY"))
+	markup = InlineKeyboardMarkup(row_width=1)
+	for directory in favorites:
+		label = directory if len(directory) <= MAX_NAME_LENGTH_IN_BUTTON else "…" + directory[-MAX_NAME_LENGTH_IN_BUTTON:]
+		markup.add(InlineKeyboardButton(f"🗑 {label}", callback_data=build_call("favDirDel", get_dir_id(directory))))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_FAV_DIR_ADD"), callback_data=build_call("favDirAdd")))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("settings")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	edit_message(chat_id, message_id, "\n".join(lines), markup)
+
+
+# ---------------------------------------------------------------------------
+# RENAME TEMPLATES
+# ---------------------------------------------------------------------------
+
+TEMPLATE_EXAMPLE_MOVIE = "Minions.and.Monsters.2026.1080p.AMZN.WEB-DL.AAC2.0.H.264-HDZ.mkv"
+TEMPLATE_EXAMPLE_SERIES = "Breaking.Bad.S01E03.720p.HDTV.x264.mkv"
+
+
+def render_templates_menu(chat_id, message_id):
+	template_movie = bot_settings.get("template_movie") or DEFAULT_MOVIE_TEMPLATE
+	template_series = bot_settings.get("template_series") or DEFAULT_SERIES_TEMPLATE
+	lines = [
+		get_text("TPL_TITLE"),
+		"",
+		get_text("TPL_CURRENT_MOVIE", html.escape(template_movie)),
+		get_text("TPL_PREVIEW", html.escape(parse_name(TEMPLATE_EXAMPLE_MOVIE) or "-")),
+		"",
+		get_text("TPL_CURRENT_SERIES", html.escape(template_series)),
+		get_text("TPL_PREVIEW", html.escape(parse_name(TEMPLATE_EXAMPLE_SERIES) or "-")),
+		"",
+		get_text("TPL_FIELDS_HELP"),
+	]
+	markup = InlineKeyboardMarkup(row_width=1)
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_EDIT_MOVIE"), callback_data=build_call("tplEdit", "movie")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_EDIT_SERIES"), callback_data=build_call("tplEdit", "series")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_RESET"), callback_data=build_call("tplReset")))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("settings")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	edit_message(chat_id, message_id, "\n".join(lines), markup)
 
 
 # ---------------------------------------------------------------------------
@@ -654,16 +814,66 @@ def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None,
 		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 
 
+def perform_add_torrent(pending, download_dir):
+	"""Adds the torrent and returns the result text
+	(add + optional auto-rename + optional low space warning)"""
+	torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"], download_dir=download_dir)
+	lines = [get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir))]
+	if bot_settings.get("auto_rename"):
+		suggested = parse_name(torrent.name)
+		if suggested and suggested != torrent.name:
+			try:
+				client.rename_torrent(torrent.id, suggested)
+				lines.append(get_text("ADD_AUTO_RENAMED", html.escape(suggested)))
+			except TorrentClientError as e:
+				warning(f"Auto-rename failed for {torrent.name}: {e}")
+	if bot_settings.get("low_space_warning"):
+		space_warning = build_low_space_warning(torrent.total_size, download_dir)
+		if space_warning:
+			lines.append(space_warning)
+	return "\n".join(lines)
+
+
+def build_low_space_warning(total_size, download_dir):
+	"""Returns the warning text if the torrent does not fit in download_dir, else None"""
+	if not total_size or total_size <= 0:
+		return None
+	try:
+		free = client.get_free_space(download_dir)
+	except TorrentClientError:
+		return None
+	if free is None or free < 0 or total_size <= free:
+		return None
+	return get_text("LOW_SPACE_WARNING", sizeof_fmt(total_size), sizeof_fmt(free))
+
+
 def do_add_torrent(chat_id, message_id, pending_id, download_dir):
 	pending = pop_pending_torrent(pending_id)
 	if pending is None:
 		edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
 		return
 	try:
-		torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"], download_dir=download_dir)
-		edit_message(chat_id, message_id, get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir)))
+		text = perform_add_torrent(pending, download_dir)
 	except TorrentClientError as e:
-		edit_message(chat_id, message_id, get_text("ADD_ERROR", html.escape(str(e))))
+		text = get_text("ADD_ERROR", html.escape(str(e)))
+	edit_message(chat_id, message_id, text)
+
+
+def start_add_flow(chat_id, name, magnet=None, data=None, thread_id=None):
+	"""Entry point when receiving a torrent: asks for the download dir, or adds it
+	directly to the automatic directory when auto download is enabled"""
+	if bot_settings.get("auto_download"):
+		download_dir = bot_settings.get("auto_download_dir")
+		try:
+			if not download_dir:
+				download_dir = client.get_default_download_dir()
+			text = perform_add_torrent({"name": name, "magnet": magnet, "data": data}, download_dir)
+		except TorrentClientError as e:
+			text = get_text("ADD_ERROR", html.escape(str(e)))
+		send_message(chat_id, text, thread_id=thread_id)
+		return
+	pending_id = new_pending_torrent(name, magnet=magnet, data=data)
+	ask_download_dir(chat_id, pending_id, name, thread_id=thread_id)
 
 
 def extract_magnet_name(magnet):
@@ -675,6 +885,36 @@ def extract_magnet_name(magnet):
 		except Exception:
 			pass
 	return "magnet"
+
+
+def download_torrent_from_url(url):
+	"""Downloads a .torrent from a URL with size/time limits and validates
+	the content is bencoded torrent metadata. Returns (data, name) or
+	raises ValueError if the content is not a torrent"""
+	data = b""
+	response = requests.get(url, stream=True, timeout=URL_DOWNLOAD_TIMEOUT, headers={"User-Agent": f"torrent-controller-bot/{VERSION}"})
+	try:
+		response.raise_for_status()
+		length = response.headers.get("Content-Length")
+		if length and int(length) > URL_DOWNLOAD_MAX_BYTES:
+			raise ValueError("too big")
+		for chunk in response.iter_content(chunk_size=64 * 1024):
+			data += chunk
+			if len(data) > URL_DOWNLOAD_MAX_BYTES:
+				raise ValueError("too big")
+			# A torrent file is a bencoded dict: abort early if it cannot be one
+			if not data.startswith(b"d"):
+				raise ValueError("not a torrent")
+	finally:
+		response.close()
+	if b"4:info" not in data or not data.endswith(b"e"):
+		raise ValueError("not a torrent")
+	name = "torrent"
+	match = re.search(rb"4:name(\d+):", data)
+	if match:
+		start = match.end()
+		name = data[start:start + int(match.group(1))].decode("utf-8", errors="replace")
+	return data, name
 
 
 # ---------------------------------------------------------------------------
@@ -806,16 +1046,40 @@ def handle_pending_input(message, pending):
 		deliver_move_order(chat_id, [pending["torrent_id"]], text, progress_text, success_text, thread_id=thread_id, reply_markup=back_close_markup())
 	elif action == "addDir":
 		pending_id = pending["pending_id"]
-		pending_torrent = get_pending_torrent(pending_id)
+		pending_torrent = pop_pending_torrent(pending_id)
 		if pending_torrent is None:
 			send_message(chat_id, get_text("ADD_EXPIRED"), thread_id=thread_id)
 			return
-		pop_pending_torrent(pending_id)
 		try:
-			torrent = client.add_torrent(magnet=pending_torrent["magnet"], torrent_data=pending_torrent["data"], download_dir=text)
-			send_message(chat_id, get_text("ADD_OK", html.escape(torrent.name), html.escape(text)), thread_id=thread_id)
+			result = perform_add_torrent(pending_torrent, text)
 		except TorrentClientError as e:
-			send_message(chat_id, get_text("ADD_ERROR", html.escape(str(e))), thread_id=thread_id)
+			result = get_text("ADD_ERROR", html.escape(str(e)))
+		send_message(chat_id, result, thread_id=thread_id)
+	elif action == "autoDir":
+		bot_settings.set("auto_download_dir", text)
+		send_message(chat_id, get_text("SETTINGS_UPDATED"), thread_id=thread_id)
+	elif action == "favDir":
+		directory = text.rstrip("/") or "/"
+		favorites = bot_settings.get("favorite_dirs") or []
+		if directory not in favorites:
+			favorites.append(directory)
+			bot_settings.set("favorite_dirs", favorites)
+		send_message(chat_id, get_text("SETTINGS_UPDATED"), thread_id=thread_id)
+	elif action == "template":
+		kind = pending["kind"]
+		try:
+			validate_template(text)
+		except TemplateError as e:
+			if e.code == "unknown_field":
+				error_text = get_text("TPL_ERROR_UNKNOWN_FIELD", html.escape(e.detail))
+			else:
+				error_text = get_text("TPL_ERROR_INVALID")
+			send_message(chat_id, f"{error_text}\n\n{get_text('TPL_FIELDS_HELP')}", thread_id=thread_id)
+			return
+		bot_settings.set("template_movie" if kind == "movie" else "template_series", text)
+		example = TEMPLATE_EXAMPLE_MOVIE if kind == "movie" else TEMPLATE_EXAMPLE_SERIES
+		preview = parse_name(example) or "-"
+		send_message(chat_id, get_text("TPL_SAVED", html.escape(text), html.escape(example), html.escape(preview)), thread_id=thread_id)
 	elif action == "massMove":
 		do_mass_move_to(chat_id, pending["filter_key"], text, thread_id=thread_id)
 	elif action in ("downLimit", "upLimit"):
@@ -920,6 +1184,7 @@ def command_start(message):
 def command_help(message):
 	if not check_auth(message):
 		return
+	delete_message(message.chat.id, message.message_id)
 	send_message(message.chat.id, get_text("START_MESSAGE"), thread_id=message.message_thread_id)
 
 
@@ -927,6 +1192,7 @@ def command_help(message):
 def command_list(message):
 	if not check_auth(message):
 		return
+	delete_message(message.chat.id, message.message_id)
 	render_list(message.chat.id, None, FILTER_ALL, 0, thread_id=message.message_thread_id)
 
 
@@ -934,6 +1200,7 @@ def command_list(message):
 def command_find(message):
 	if not check_auth(message):
 		return
+	delete_message(message.chat.id, message.message_id)
 	parts = message.text.split(maxsplit=1)
 	if len(parts) > 1 and parts[1].strip():
 		ctx_id = new_search_context(parts[1].strip())
@@ -946,6 +1213,7 @@ def command_find(message):
 def command_add(message):
 	if not check_auth(message):
 		return
+	delete_message(message.chat.id, message.message_id)
 	send_message(message.chat.id, get_text("ADD_USAGE"), thread_id=message.message_thread_id)
 
 
@@ -953,6 +1221,7 @@ def command_add(message):
 def command_settings(message):
 	if not check_auth(message):
 		return
+	delete_message(message.chat.id, message.message_id)
 	try:
 		text, markup = build_settings()
 	except TorrentClientError as e:
@@ -965,6 +1234,7 @@ def command_settings(message):
 def command_version(message):
 	if not check_auth(message):
 		return
+	delete_message(message.chat.id, message.message_id)
 	try:
 		connected_to = client.test_connection()
 	except TorrentClientError as e:
@@ -1011,8 +1281,7 @@ def handle_document(message):
 		send_message(message.chat.id, get_text("ADD_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
 		return
 	name = document.file_name[:-len(".torrent")]
-	pending_id = new_pending_torrent(name, data=data)
-	ask_download_dir(message.chat.id, pending_id, name, thread_id=message.message_thread_id)
+	start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
 
 
 @bot.message_handler(func=lambda message: True)
@@ -1030,8 +1299,24 @@ def handle_text(message):
 	text = message.text.strip()
 	if text.lower().startswith("magnet:"):
 		name = extract_magnet_name(text)
-		pending_id = new_pending_torrent(name, magnet=text)
-		ask_download_dir(message.chat.id, pending_id, name, thread_id=message.message_thread_id)
+		start_add_flow(message.chat.id, name, magnet=text, thread_id=message.message_thread_id)
+	elif text.lower().startswith(("http://", "https://")) and " " not in text:
+		# In groups, ignore invalid links silently (the bot may live with other
+		# bots and people pasting links); only reply in private chats
+		is_private = message.chat.type == "private"
+		try:
+			data, name = download_torrent_from_url(text)
+		except ValueError:
+			debug(f"URL is not a torrent, ignored: {text}")
+			if is_private:
+				send_message(message.chat.id, get_text("ADD_URL_NOT_TORRENT"), thread_id=message.message_thread_id)
+			return
+		except Exception as e:
+			debug(f"Cannot download URL {text}: {e}")
+			if is_private:
+				send_message(message.chat.id, get_text("ADD_URL_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
+			return
+		start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1473,10 @@ def handle_callback(call):
 		elif command == "search":
 			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), message_id=message_id)
 
+		elif command == "trackers":
+			text, markup = build_trackers_menu()
+			edit_message(chat_id, message_id, text, markup)
+
 		elif command == "addTo":
 			pending_id, dir_id = args[0], args[1]
 			download_dir = get_dir_by_id(dir_id)
@@ -1266,6 +1555,62 @@ def handle_callback(call):
 		elif command == "setUpLimit":
 			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), message_id=message_id)
 
+		elif command == "toggleSetting":
+			bot_settings.toggle(args[0])
+			render_settings(chat_id, message_id)
+
+		elif command == "autoDirMenu":
+			dir_page = int(args[0]) if args else 0
+			markup = build_dir_markup(
+				dir_call=lambda dir_id: build_call("autoDirSet", dir_id),
+				write_call=build_call("autoDirNew"),
+				cancel_call=build_call("settings"),
+				page_call=lambda p: build_call("autoDirMenu", p),
+				page=dir_page,
+			)
+			markup.keyboard.insert(0, [InlineKeyboardButton(get_text("BUTTON_AUTO_DIR_DEFAULT"), callback_data=build_call("autoDirDefault"))])
+			edit_message(chat_id, message_id, get_text("AUTO_DIR_ASK"), markup)
+
+		elif command == "autoDirSet":
+			new_dir = get_dir_by_id(args[0])
+			if new_dir is not None:
+				bot_settings.set("auto_download_dir", new_dir)
+			render_settings(chat_id, message_id)
+
+		elif command == "autoDirDefault":
+			bot_settings.set("auto_download_dir", "")
+			render_settings(chat_id, message_id)
+
+		elif command == "autoDirNew":
+			ask_for_input(chat_id, user_id, "autoDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id)
+
+		elif command == "favDirsMenu":
+			render_favorite_dirs_menu(chat_id, message_id)
+
+		elif command == "favDirAdd":
+			ask_for_input(chat_id, user_id, "favDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id)
+
+		elif command == "favDirDel":
+			directory = get_dir_by_id(args[0])
+			favorites = bot_settings.get("favorite_dirs") or []
+			if directory in favorites:
+				favorites.remove(directory)
+				bot_settings.set("favorite_dirs", favorites)
+			render_favorite_dirs_menu(chat_id, message_id)
+
+		elif command == "tplMenu":
+			render_templates_menu(chat_id, message_id)
+
+		elif command == "tplEdit":
+			kind = args[0]
+			prompt = get_text("TPL_ASK_MOVIE" if kind == "movie" else "TPL_ASK_SERIES", get_text("TPL_FIELDS_HELP"))
+			ask_for_input(chat_id, user_id, "template", prompt, message_id=message_id, kind=kind)
+
+		elif command == "tplReset":
+			bot_settings.set("template_movie", "")
+			bot_settings.set("template_series", "")
+			render_templates_menu(chat_id, message_id)
+
 		elif command == "cancelInput":
 			pop_pending_input(chat_id, user_id)
 			show_dashboard(chat_id, message_id=message_id)
@@ -1288,17 +1633,44 @@ def handle_callback(call):
 def send_startup_message():
 	try:
 		torrent_count = len(client.get_torrents())
-		default_dir = client.get_default_download_dir()
-		text = get_text("STARTUP_MESSAGE", VERSION, client_version, torrent_count, html.escape(default_dir))
+		text = get_text("STARTUP_MESSAGE", VERSION, client_version, torrent_count)
 	except TorrentClientError as e:
 		text = get_text("STARTUP_MESSAGE_ERROR", VERSION, html.escape(str(e)))
-	startup_chat = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
-	send_message(startup_chat, text, thread_id=TELEGRAM_THREAD)
+	notify(text)
+
+
+def torrent_monitor():
+	"""Background loop that detects finished/errored torrents and notifies.
+	The first poll only builds the baseline, so restarting the bot never
+	re-notifies torrents that were already finished or errored"""
+	known = {}
+	first_run = True
+	while True:
+		try:
+			torrents = client.get_torrents()
+		except TorrentClientError as e:
+			warning(f"Torrent monitor: {e}")
+			time.sleep(MONITOR_INTERVAL_SECONDS)
+			continue
+		new_known = {}
+		for torrent in torrents:
+			state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
+			prev = known.get(torrent.id)
+			if not first_run:
+				if state["finished"] and prev is not None and not prev["finished"] and bot_settings.get("notify_completed"):
+					notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
+				if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
+					notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
+			new_known[torrent.id] = state
+		known = new_known
+		first_run = False
+		time.sleep(MONITOR_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
 	debug(f"torrent-controller-bot {VERSION} started. Connected to {client_version}")
 	send_startup_message()
+	threading.Thread(target=torrent_monitor, daemon=True).start()
 	bot.set_my_commands([
 		telebot.types.BotCommand("/start", get_text("MENU_START")),
 		telebot.types.BotCommand("/list", get_text("MENU_LIST")),

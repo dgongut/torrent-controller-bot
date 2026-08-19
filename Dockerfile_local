@@ -8,7 +8,7 @@ WORKDIR /app
 # Install runtime dependencies and development tools
 RUN apk add --no-cache python3 py3-pip tzdata
 
-COPY requirements.txt torrent-controller-bot.py config.py logger.py message_queue.py smart_rename.py /app/
+COPY requirements.txt torrent-controller-bot.py bot_settings.py config.py logger.py message_queue.py name_parser.py /app/
 COPY torrent_clients /app/torrent_clients
 COPY locale /app/locale
 

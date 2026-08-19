@@ -1,6 +1,6 @@
 FROM alpine:3.23.5
 
-ARG VERSION=0.9.0
+ARG VERSION=1.0.0
 
 ENV TZ=UTC
 
@@ -11,10 +11,11 @@ RUN apk add --no-cache python3 py3-pip tzdata curl unzip && \
     curl -fsSL https://github.com/dgongut/torrent-controller-bot/archive/refs/tags/v${VERSION}.zip -o /tmp/app.zip && \
     unzip -q /tmp/app.zip -d /tmp && \
     mv /tmp/torrent-controller-bot-${VERSION}/torrent-controller-bot.py /app && \
+    mv /tmp/torrent-controller-bot-${VERSION}/bot_settings.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/config.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/logger.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/message_queue.py /app && \
-    mv /tmp/torrent-controller-bot-${VERSION}/smart_rename.py /app && \
+    mv /tmp/torrent-controller-bot-${VERSION}/name_parser.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/torrent_clients /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/locale /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/requirements.txt /app && \

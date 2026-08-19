@@ -9,7 +9,6 @@ LANGUAGE = os.environ.get("LANGUAGE", "ES")
 TORRENTS_PER_PAGE = int(os.environ.get("TORRENTS_PER_PAGE", "10"))
 DASHBOARD_REFRESH_SECONDS = int(os.environ.get("DASHBOARD_REFRESH_SECONDS", "2"))
 DASHBOARD_REFRESH_DURATION = int(os.environ.get("DASHBOARD_REFRESH_DURATION", "60"))
-DOWNLOAD_DIRS = os.environ.get("DOWNLOAD_DIRS", "")  # Extra download dirs, comma separated
 
 # TORRENT CLIENT (generic, valid for any supported manager)
 TORRENT_CLIENT = os.environ.get("TORRENT_CLIENT", "transmission")
@@ -23,11 +22,16 @@ TORRENT_CLIENT_RPC_PATH = os.environ.get("TORRENT_CLIENT_RPC_PATH")  # Default d
 # CONSTANTS
 ANONYMOUS_USER_ID = "1087968824"
 LOCALE_PATH = os.environ.get("LOCALE_PATH", "/app/locale")
+CONFIG_PATH = "/config"  # Persistent bot settings (mapped as a volume)
 MAX_DIR_BUTTONS = 10
 MAX_NAME_LENGTH_IN_BUTTON = 35
 SEARCH_CONTEXT_TTL = 3600  # Seconds a search/filter context is kept in memory
 MOVE_RETRY_DELAY = 60  # Seconds between retries when delivering a move order
 MOVE_RETRY_ATTEMPTS = 120  # Retries before giving up (client busy moving data)
+MONITOR_INTERVAL_SECONDS = 30  # Seconds between torrent monitor polls (completed/error notifications)
+MAX_TRACKER_BUTTONS = 25  # Max trackers listed in the tracker filter menu
+URL_DOWNLOAD_TIMEOUT = 10  # Seconds before aborting a .torrent URL download
+URL_DOWNLOAD_MAX_BYTES = 10 * 1024 * 1024  # A .torrent bigger than this is rejected
 
 # TORRENT STATUS FILTER CODES (short to fit in callback_data)
 FILTER_ALL = "al"
@@ -57,6 +61,7 @@ CALL_PATTERNS = {
 	"moveToDir": ["torrentId", "dirId"],
 	"moveNewDir": ["torrentId"],
 	"search": [],
+	"trackers": [],
 	"addTo": ["pendingId", "dirId"],
 	"addNewDir": ["pendingId"],
 	"cancelAdd": ["pendingId"],
@@ -70,6 +75,14 @@ CALL_PATTERNS = {
 	"toggleUpLimit": [],
 	"setDownLimit": [],
 	"setUpLimit": [],
+	"toggleSetting": ["settingKey"],
+	"autoDirMenu": ["dirPage"],
+	"autoDirSet": ["dirId"],
+	"autoDirDefault": [],
+	"autoDirNew": [],
+	"favDirsMenu": [],
+	"favDirAdd": [],
+	"favDirDel": ["dirId"],
 	"cancelInput": [],
 	"cerrar": [],
 }
