@@ -117,6 +117,13 @@ class TorrentClient(ABC):
 		pass
 
 	@abstractmethod
+	def rename_file(self, torrent_id, old_path, new_name):
+		"""Renames a single file inside the torrent. old_path is the path as
+		reported in TorrentInfo.files and new_name is only the new file name,
+		the file stays in the same folder"""
+		pass
+
+	@abstractmethod
 	def move_torrents(self, torrent_ids, new_dir):
 		"""Moves the downloaded data of the torrents to another directory"""
 		pass

@@ -16,12 +16,12 @@ from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue
-from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, TemplateError, suggest_name, validate_template
+from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, suggest_file_name, suggest_name, validate_template
 from torrent_clients import TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -63,6 +63,20 @@ def parse_name(filename):
 	Returns None when no suggestion can be produced"""
 	return suggest_name(
 		filename,
+		template_movie=bot_settings.get("template_movie") or None,
+		template_series=bot_settings.get("template_series") or None,
+		template_season=bot_settings.get("template_season") or None,
+		season_prefix="T" if LANGUAGE.lower() == "es" else "S",
+	)
+
+
+def parse_file_name(filename, parent_name, single_video):
+	"""Same as parse_name but for a file inside a torrent, using the torrent
+	name as context"""
+	return suggest_file_name(
+		filename,
+		parent_name=parent_name,
+		single_video=single_video,
 		template_movie=bot_settings.get("template_movie") or None,
 		template_series=bot_settings.get("template_series") or None,
 		template_season=bot_settings.get("template_season") or None,
@@ -227,6 +241,9 @@ tracker_contexts = {}
 # Pending torrents waiting for a download dir: id -> {"magnet"/"data", "name", "ts"}
 pending_torrents = {}
 
+# Files screen contexts: short id -> {"torrent_id", "filter_key", "page", "ts"}
+files_contexts = {}
+
 # Pending text inputs: (chat_id, user_id) -> {"action": str, ...}
 pending_inputs = {}
 
@@ -288,6 +305,31 @@ def get_tracker_filter(ctx_id):
 		if ctx:
 			ctx["ts"] = time.time()
 			return ctx["tracker"]
+		return None
+
+
+def new_files_context(torrent_id, filter_key, page):
+	"""Short id for the (torrent, filter, page) triplet: the files screen needs
+	the file page and index too and everything must fit in callback_data"""
+	with _contexts_lock:
+		now = time.time()
+		for key in [k for k, v in files_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del files_contexts[key]
+		for ctx_id, ctx in files_contexts.items():
+			if ctx["torrent_id"] == torrent_id and ctx["filter_key"] == filter_key and ctx["page"] == str(page):
+				ctx["ts"] = now
+				return ctx_id
+		ctx_id = uuid.uuid4().hex[:6]
+		files_contexts[ctx_id] = {"torrent_id": torrent_id, "filter_key": filter_key, "page": str(page), "ts": now}
+		return ctx_id
+
+
+def get_files_context(ctx_id):
+	with _contexts_lock:
+		ctx = files_contexts.get(ctx_id)
+		if ctx:
+			ctx["ts"] = time.time()
+			return ctx["torrent_id"], ctx["filter_key"], ctx["page"]
 		return None
 
 
@@ -596,9 +638,12 @@ def build_detail(torrent_id, filter_key, page):
 		toggle = InlineKeyboardButton(get_text("BUTTON_PAUSE"), callback_data=build_call("pause", torrent.id, filter_key, page))
 	markup.row(toggle, InlineKeyboardButton(get_text("BUTTON_VERIFY"), callback_data=build_call("verify", torrent.id, filter_key, page)))
 	markup.row(
-		InlineKeyboardButton(get_text("BUTTON_RENAME"), callback_data=build_call("rename", torrent.id, filter_key, page)),
+		InlineKeyboardButton(get_text(rename_key(torrent, "BUTTON_RENAME")), callback_data=build_call("rename", torrent.id, filter_key, page)),
 		InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)),
 	)
+	if torrent.files:
+		files_ctx = new_files_context(torrent.id, filter_key, page)
+		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES"), callback_data=build_call("files", files_ctx, 0)))
 	markup.row(InlineKeyboardButton(get_text("BUTTON_DELETE"), callback_data=build_call("delete", torrent.id, filter_key, page)))
 	markup.row(
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, page)),
@@ -614,6 +659,196 @@ def render_detail(chat_id, message_id, torrent_id, filter_key, page):
 		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
 		markup = back_close_markup(build_call("list", filter_key, page))
 	edit_message(chat_id, message_id, text, markup)
+
+
+# ---------------------------------------------------------------------------
+# TORRENT FILES
+# ---------------------------------------------------------------------------
+
+def file_basename(path):
+	return path.rsplit("/", 1)[-1]
+
+
+def file_folder(path):
+	return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def file_extension(path):
+	name = file_basename(path)
+	return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def is_video_file(path):
+	return file_extension(path) in VALID_EXTENSIONS
+
+
+def is_subtitle_file(path):
+	return file_extension(path) in SUBTITLE_EXTENSIONS
+
+
+def torrent_is_folder(torrent):
+	"""True when the torrent keeps its files inside a folder. Renaming such a
+	torrent only renames that folder, never the files inside"""
+	return any("/" in path for path, _, _ in torrent.files)
+
+
+def rename_key(torrent, key):
+	"""Picks the folder wording of a rename string when the torrent is a folder"""
+	return f"{key}_FOLDER" if torrent_is_folder(torrent) else key
+
+
+def suggest_for_file(torrent, path):
+	"""Suggestion for one file of the torrent, using the torrent name as
+	context. Returns None when nothing can be suggested"""
+	if not is_video_file(path):
+		return None
+	single_video = len([f for f in torrent.files if is_video_file(f[0])]) == 1
+	suggested = parse_file_name(file_basename(path), torrent.name, single_video)
+	if not suggested or suggested == file_basename(path):
+		return None
+	return suggested
+
+
+def subtitle_renames(torrent, video_path, new_name):
+	"""Renames needed so the subtitles of video_path keep matching it"""
+	renames = []
+	folder = file_folder(video_path)
+	video_file = file_basename(video_path)
+	for path, _, _ in torrent.files:
+		if path == video_path or file_folder(path) != folder or not is_subtitle_file(path):
+			continue
+		companion = companion_subtitle_name(file_basename(path), video_file, new_name)
+		if companion and companion != file_basename(path):
+			renames.append((path, companion))
+	return renames
+
+
+def build_rename_plan(torrent, only_path=None):
+	"""List of (old_path, new_name) for the videos of the torrent (or just
+	only_path) plus their subtitles. Also returns the names that collide"""
+	plan = []
+	taken = {file_basename(p) for p, _, _ in torrent.files}
+	collisions = []
+	for path, _, _ in torrent.files:
+		if only_path and path != only_path:
+			continue
+		suggested = suggest_for_file(torrent, path)
+		if not suggested:
+			continue
+		taken.discard(file_basename(path))
+		if suggested in taken:
+			collisions.append(suggested)
+			taken.add(file_basename(path))
+			continue
+		taken.add(suggested)
+		plan.append((path, suggested))
+		plan.extend(subtitle_renames(torrent, path, suggested))
+	return plan, collisions
+
+
+def apply_rename_plan(torrent_id, plan):
+	"""Applies the renames one by one. Returns (done, errors)"""
+	done = 0
+	errors = []
+	for old_path, new_name in plan:
+		try:
+			client.rename_file(torrent_id, old_path, new_name)
+			done += 1
+		except TorrentClientError as e:
+			errors.append(str(e))
+	return done, errors
+
+
+def build_files(ctx_id, torrent_id, filter_key, page, file_page):
+	torrent = client.get_torrent(torrent_id)
+	if torrent is None:
+		return get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page))
+
+	files = torrent.files
+	total = len(files)
+	pages = max(1, math.ceil(total / FILES_PER_PAGE))
+	file_page = max(0, min(int(file_page), pages - 1))
+	text = get_text("FILES_TITLE", html.escape(torrent.name), total, file_page + 1, pages)
+
+	markup = InlineKeyboardMarkup(row_width=1)
+	start = file_page * FILES_PER_PAGE
+	for index in range(start, min(start + FILES_PER_PAGE, total)):
+		path = files[index][0]
+		icon = "🎬" if is_video_file(path) else ("💬" if is_subtitle_file(path) else "📄")
+		markup.add(InlineKeyboardButton(
+			f"{icon} {truncate(file_basename(path))}",
+			callback_data=build_call("file", ctx_id, file_page, index)))
+
+	if pages > 1:
+		prev_call = build_call("files", ctx_id, file_page - 1) if file_page > 0 else build_call("noop")
+		next_call = build_call("files", ctx_id, file_page + 1) if file_page < pages - 1 else build_call("noop")
+		markup.row(
+			InlineKeyboardButton("⬅️", callback_data=prev_call),
+			InlineKeyboardButton(f"{file_page + 1}/{pages}", callback_data=build_call("noop")),
+			InlineKeyboardButton("➡️", callback_data=next_call),
+		)
+
+	plan, _ = build_rename_plan(torrent)
+	if plan:
+		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES_RENAME_ALL"), callback_data=build_call("filesAll", ctx_id, file_page)))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("info", torrent_id, filter_key, page)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return text, markup
+
+
+def render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, file_page):
+	try:
+		text, markup = build_files(ctx_id, torrent_id, filter_key, page, file_page)
+	except TorrentClientError as e:
+		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		markup = back_close_markup(build_call("info", torrent_id, filter_key, page))
+	edit_message(chat_id, message_id, text, markup)
+
+
+def get_torrent_file(torrent, file_index):
+	"""Returns (path, size) for the file index or None when out of range"""
+	try:
+		path, size, _ = torrent.files[int(file_index)]
+	except (IndexError, ValueError):
+		return None
+	return path, size
+
+
+def build_file_detail(torrent, path, size, ctx_id, file_page, file_index):
+	lines = [f"<b>{html.escape(file_basename(path))}</b>", ""]
+	folder = file_folder(path)
+	if folder:
+		lines.append(f"{get_text('INFO_DIR')}: <code>{html.escape(folder)}</code>")
+	lines.append(f"{get_text('INFO_SIZE')}: {sizeof_fmt(size)}")
+
+	markup = InlineKeyboardMarkup(row_width=1)
+	suggested = suggest_for_file(torrent, path)
+	if suggested:
+		lines.append("")
+		lines.append(get_text("FILE_SUGGEST", html.escape(suggested)))
+		subtitles = subtitle_renames(torrent, path, suggested)
+		if subtitles:
+			lines.append(get_text("FILE_SUBTITLES", len(subtitles)))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_AUTO"), callback_data=build_call("fileAuto", ctx_id, file_page, file_index)))
+	elif is_video_file(path):
+		lines.append("")
+		lines.append(get_text("FILE_NO_SUGGESTION"))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_MANUAL"), callback_data=build_call("fileManual", ctx_id, file_page, file_index)))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("files", ctx_id, file_page)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
+
+
+def build_plan_preview(plan):
+	shown = plan[:MAX_PLAN_PREVIEW_LINES]
+	lines = [f"• <code>{html.escape(file_basename(old))}</code> → <code>{html.escape(new)}</code>" for old, new in shown]
+	if len(plan) > len(shown):
+		lines.append(get_text("INFO_AND_MORE_FILES", len(plan) - len(shown)))
+	return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -850,22 +1085,61 @@ def name_already_exists(name, exclude_id=None):
 	return False
 
 
+def auto_rename_torrent(torrent):
+	"""Renames the torrent to its suggested name. Returns the new name, or None
+	when there is no suggestion or the rename is skipped"""
+	suggested = parse_name(torrent.name)
+	if not suggested or suggested == torrent.name:
+		return None
+	if name_already_exists(suggested, exclude_id=torrent.id):
+		warning(f"Auto-rename skipped for {torrent.name}: a torrent named '{suggested}' already exists")
+		return None
+	client.rename_torrent(torrent.id, suggested)
+	return suggested
+
+
+def deferred_auto_rename(torrent_id, original_name):
+	"""A magnet has no metadata when it is added: the client only knows the
+	name hinted in the link and rejects renaming until the real one arrives.
+	Waits in background for the metadata and renames then"""
+	for _ in range(AUTO_RENAME_WAIT_ATTEMPTS):
+		time.sleep(AUTO_RENAME_WAIT_DELAY)
+		try:
+			torrent = client.get_torrent(torrent_id)
+		except TorrentClientError as e:
+			warning(f"Auto-rename failed for {original_name}: {e}")
+			return
+		if torrent is None:
+			return
+		if not torrent.files:
+			continue
+		try:
+			renamed = auto_rename_torrent(torrent)
+		except TorrentClientError as e:
+			warning(f"Auto-rename failed for {torrent.name}: {e}")
+			return
+		if renamed:
+			notify(get_text("NOTIFY_AUTO_RENAMED", html.escape(original_name), html.escape(renamed)))
+		return
+	warning(f"Auto-rename gave up for {original_name}: the metadata never arrived")
+
+
 def perform_add_torrent(pending, download_dir):
 	"""Adds the torrent and returns the result text
 	(add + optional auto-rename + optional low space warning)"""
 	torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"], download_dir=download_dir)
 	lines = [get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir))]
 	if bot_settings.get("auto_rename"):
-		suggested = parse_name(torrent.name)
-		if suggested and suggested != torrent.name:
-			if name_already_exists(suggested, exclude_id=torrent.id):
-				warning(f"Auto-rename skipped for {torrent.name}: a torrent named '{suggested}' already exists")
-			else:
-				try:
-					client.rename_torrent(torrent.id, suggested)
-					lines.append(get_text("ADD_AUTO_RENAMED", html.escape(suggested)))
-				except TorrentClientError as e:
-					warning(f"Auto-rename failed for {torrent.name}: {e}")
+		if torrent.files:
+			try:
+				renamed = auto_rename_torrent(torrent)
+				if renamed:
+					lines.append(get_text("ADD_AUTO_RENAMED", html.escape(renamed)))
+			except TorrentClientError as e:
+				warning(f"Auto-rename failed for {torrent.name}: {e}")
+		else:
+			lines.append(get_text("ADD_AUTO_RENAME_PENDING"))
+			threading.Thread(target=deferred_auto_rename, args=(torrent.id, torrent.name), daemon=True).start()
 	if bot_settings.get("low_space_warning"):
 		space_warning = build_low_space_warning(torrent.total_size, download_dir)
 		if space_warning:
@@ -1076,8 +1350,28 @@ def handle_pending_input(message, pending):
 			send_message(chat_id, get_text("RENAME_DUPLICATE", html.escape(text)), thread_id=thread_id)
 			return
 		try:
+			torrent = client.get_torrent(pending["torrent_id"])
 			client.rename_torrent(pending["torrent_id"], text)
-			send_message(chat_id, get_text("RENAME_OK", html.escape(text)), thread_id=thread_id)
+			key = rename_key(torrent, "RENAME_OK") if torrent else "RENAME_OK"
+			send_message(chat_id, get_text(key, html.escape(text)), thread_id=thread_id)
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
+	elif action == "renameFile":
+		torrent_id = pending["torrent_id"]
+		file_path = pending["file_path"]
+		if "/" in text:
+			send_message(chat_id, get_text("FILE_RENAME_INVALID"), thread_id=thread_id)
+			return
+		try:
+			torrent = client.get_torrent(torrent_id)
+			plan = [(file_path, text)]
+			if torrent and is_video_file(file_path):
+				plan.extend(subtitle_renames(torrent, file_path, text))
+			done, errors = apply_rename_plan(torrent_id, plan)
+			if errors:
+				send_message(chat_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), thread_id=thread_id)
+			else:
+				send_message(chat_id, get_text("FILE_RENAME_OK", html.escape(text), done), thread_id=thread_id)
 		except TorrentClientError as e:
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
 	elif action == "move":
@@ -1455,9 +1749,9 @@ def handle_callback(call):
 					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_AUTO"), callback_data=build_call("renameAuto", torrent_id, filter_key, page)))
 					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_MANUAL"), callback_data=build_call("renameManual", torrent_id, filter_key, page)))
 					markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("info", torrent_id, filter_key, page)))
-					edit_message(chat_id, message_id, get_text("RENAME_SUGGEST", html.escape(torrent.name), html.escape(suggested)), markup)
+					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_SUGGEST"), html.escape(torrent.name), html.escape(suggested)), markup)
 				else:
-					ask_for_input(chat_id, user_id, "rename", get_text("RENAME_ASK", html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
+					ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
 
 		elif command == "renameAuto":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -1472,7 +1766,7 @@ def handle_callback(call):
 					edit_message(chat_id, message_id, get_text("RENAME_DUPLICATE", html.escape(suggested)), back_close_markup(build_call("info", torrent_id, filter_key, page)))
 				else:
 					client.rename_torrent(torrent_id, suggested)
-					edit_message(chat_id, message_id, get_text("RENAME_OK", html.escape(suggested)), back_close_markup(build_call("list", filter_key, page)))
+					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_OK"), html.escape(suggested)), back_close_markup(build_call("list", filter_key, page)))
 
 		elif command == "renameManual":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -1480,7 +1774,68 @@ def handle_callback(call):
 			if torrent is None:
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 			else:
-				ask_for_input(chat_id, user_id, "rename", get_text("RENAME_ASK", html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
+				ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
+
+		elif command in ("files", "file", "fileAuto", "fileManual", "filesAll", "filesAllOk"):
+			ctx = get_files_context(args[0])
+			if ctx is None:
+				edit_message(chat_id, message_id, get_text("FILES_CONTEXT_EXPIRED"), back_close_markup(build_call("dashboard")))
+				return
+			torrent_id, filter_key, page = ctx
+			ctx_id = args[0]
+			file_page = args[1]
+			back_call = build_call("files", ctx_id, file_page)
+
+			if command == "files":
+				render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, file_page)
+
+			elif command in ("file", "fileAuto", "fileManual"):
+				file_index = args[2]
+				torrent = client.get_torrent(torrent_id)
+				entry = get_torrent_file(torrent, file_index) if torrent else None
+				if entry is None:
+					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, file_page)
+				elif command == "file":
+					text, markup = build_file_detail(torrent, entry[0], entry[1], ctx_id, file_page, file_index)
+					edit_message(chat_id, message_id, text, markup)
+				elif command == "fileManual":
+					ask_for_input(chat_id, user_id, "renameFile", get_text("FILE_RENAME_ASK", html.escape(file_basename(entry[0]))),
+								message_id=message_id, torrent_id=torrent_id, file_path=entry[0])
+				else:
+					plan, collisions = build_rename_plan(torrent, only_path=entry[0])
+					if collisions:
+						edit_message(chat_id, message_id, get_text("FILE_RENAME_DUPLICATE", html.escape(collisions[0])), back_close_markup(back_call))
+					elif not plan:
+						edit_message(chat_id, message_id, get_text("FILE_NO_SUGGESTION"), back_close_markup(back_call))
+					else:
+						done, errors = apply_rename_plan(torrent_id, plan)
+						if errors:
+							edit_message(chat_id, message_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), back_close_markup(back_call))
+						else:
+							edit_message(chat_id, message_id, get_text("FILE_RENAME_OK", html.escape(plan[0][1]), done), back_close_markup(back_call))
+
+			else:
+				torrent = client.get_torrent(torrent_id)
+				if torrent is None:
+					edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+				else:
+					plan, collisions = build_rename_plan(torrent)
+					if not plan:
+						edit_message(chat_id, message_id, get_text("FILES_NO_SUGGESTIONS"), back_close_markup(back_call))
+					elif command == "filesAll":
+						text = get_text("FILES_RENAME_CONFIRM", len(plan), build_plan_preview(plan))
+						if collisions:
+							text += f"\n\n{get_text('FILES_RENAME_SKIPPED', len(collisions))}"
+						markup = InlineKeyboardMarkup(row_width=1)
+						markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("filesAllOk", ctx_id, file_page)))
+						markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=back_call))
+						edit_message(chat_id, message_id, text, markup)
+					else:
+						done, errors = apply_rename_plan(torrent_id, plan)
+						if errors:
+							edit_message(chat_id, message_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), back_close_markup(back_call))
+						else:
+							edit_message(chat_id, message_id, get_text("FILES_RENAME_OK", done), back_close_markup(back_call))
 
 		elif command == "move":
 			torrent_id, filter_key, page = args[0], args[1], args[2]

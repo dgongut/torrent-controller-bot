@@ -271,6 +271,22 @@ class DelugeClient(TorrentClient):
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error renaming torrent {torrent_id}: {e}")
 
+	def rename_file(self, torrent_id, old_path, new_name):
+		folder = old_path.rsplit("/", 1)[0] if "/" in old_path else ""
+		new_path = f"{folder}/{new_name}" if folder else new_name
+		try:
+			t = self._call("core.get_torrent_status", torrent_id, ["files"])
+			index = None
+			for f in (t or {}).get("files") or []:
+				if f.get("path", "") == old_path:
+					index = f.get("index")
+					break
+			if index is None:
+				raise TorrentClientError("File not found in torrent")
+			self._call("core.rename_files", torrent_id, [[index, new_path]])
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error renaming file {old_path}: {e}")
+
 	def move_torrents(self, torrent_ids, new_dir):
 		try:
 			self._call("core.move_storage", list(torrent_ids), new_dir, timeout=MOVE_RPC_TIMEOUT)

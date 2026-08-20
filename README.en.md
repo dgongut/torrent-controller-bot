@@ -23,6 +23,7 @@ Control your torrent client from a single place.
 - ✅ Pause, resume, verify and delete torrents (with or without their data)
 - ✅ Move torrents to another directory with a notice when the move finishes
 - ✅ Renaming with automatic suggestion for movies and series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
+- ✅ Renaming the files inside a torrent, one by one or in batch, dragging their subtitles along
 - ✅ Mass actions over a filter or search: resume, pause, delete or move all
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
 - ✅ Client settings: turtle mode and upload/download speed limits
@@ -74,6 +75,18 @@ When pressing ✏️ Rename on a torrent, the bot tries to generate a clean name
 - **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (supports `Cap.103`, `S01E03` and `3x05` formats)
 
 If no suggestion can be generated, you can always type the name manually.
+
+### Files inside the torrent
+
+From a torrent's detail, the 🗂️ Files button lists the files it contains and lets you rename them one by one or all at once (with a preview before confirming). Files inherit from the torrent name whatever they do not carry themselves (title, year and season, never the episode), so a bare episode like `01.mkv` inside `Show.Name.S02.1080p` becomes `2x01 - Show Name - 1080p.mkv`. Subtitles next to a video are renamed along with it so they keep matching, and everything goes through the torrent client, so seeding is preserved.
+
+### Episode title
+
+The `{episode_title}` field picks up the text that follows the episode marker, so `Family.Guy.S01E01.Death.Has.a.Shadow.1080p.mkv` keeps `Death Has a Shadow`. Not every episode carries one, so it is best used inside brackets:
+
+```
+{season}x{episode} - {title}[ - {episode_title}][.{extension}]
+```
 
 ## Configuration via Docker Compose variables
 

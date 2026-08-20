@@ -290,6 +290,15 @@ class QBittorrentClient(TorrentClient):
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error renaming torrent {torrent_id}: {e}")
 
+	def rename_file(self, torrent_id, old_path, new_name):
+		folder = old_path.rsplit("/", 1)[0] if "/" in old_path else ""
+		new_path = f"{folder}/{new_name}" if folder else new_name
+		try:
+			self._post("torrents/renameFile", data={
+				"hash": torrent_id, "oldPath": old_path, "newPath": new_path})
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error renaming file {old_path}: {e}")
+
 	def move_torrents(self, torrent_ids, new_dir):
 		try:
 			self._post("torrents/setLocation", data={

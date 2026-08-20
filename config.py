@@ -29,7 +29,11 @@ SEARCH_CONTEXT_TTL = 3600  # Seconds a search/filter context is kept in memory
 MOVE_RETRY_DELAY = 60  # Seconds between retries when delivering a move order
 MOVE_RETRY_ATTEMPTS = 120  # Retries before giving up (client busy moving data)
 MONITOR_INTERVAL_SECONDS = 30  # Seconds between torrent monitor polls (completed/error notifications)
+AUTO_RENAME_WAIT_DELAY = 5  # Seconds between checks while a magnet downloads its metadata
+AUTO_RENAME_WAIT_ATTEMPTS = 60  # Checks before giving up on the deferred auto-rename
 MAX_TRACKER_BUTTONS = 25  # Max trackers listed in the tracker filter menu
+FILES_PER_PAGE = 8  # Files listed per page in the torrent files screen
+MAX_PLAN_PREVIEW_LINES = 12  # Renames shown in the batch rename preview
 URL_DOWNLOAD_TIMEOUT = 10  # Seconds before aborting a .torrent URL download
 URL_DOWNLOAD_MAX_BYTES = 10 * 1024 * 1024  # A .torrent bigger than this is rejected
 
@@ -57,6 +61,12 @@ CALL_PATTERNS = {
 	"rename": ["torrentId", "filterKey", "page"],
 	"renameAuto": ["torrentId", "filterKey", "page"],
 	"renameManual": ["torrentId", "filterKey", "page"],
+	"files": ["filesCtxId", "filePage"],
+	"file": ["filesCtxId", "filePage", "fileIndex"],
+	"fileAuto": ["filesCtxId", "filePage", "fileIndex"],
+	"fileManual": ["filesCtxId", "filePage", "fileIndex"],
+	"filesAll": ["filesCtxId", "filePage"],
+	"filesAllOk": ["filesCtxId", "filePage"],
 	"move": ["torrentId", "filterKey", "page"],
 	"moveToDir": ["torrentId", "dirId"],
 	"moveNewDir": ["torrentId"],

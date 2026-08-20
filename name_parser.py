@@ -13,11 +13,24 @@ import re
 # Valid video extensions
 VALID_EXTENSIONS = {"mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "mpg", "mpeg", "m4v", "ts", "m2ts"}
 
+# Subtitle extensions: they follow the video file name so players keep matching them
+SUBTITLE_EXTENSIONS = {"srt", "ass", "ssa", "sub", "idx", "vtt", "sup"}
+
 # Episode patterns: S01E03, 1x03, Cap.103 / Capitulo 103
 EPISODE_PATTERNS = [
 	re.compile(r'[Ss](\d{1,2})[\s._-]?[Ee](\d{1,3})'),
 	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})(?!\d)'),
 	re.compile(r'[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})'),
+]
+
+# Bare episode numbers used inside season packs (E01, - 01, [01], 01). Only
+# tried when the context already says the file belongs to a series, since on
+# their own these are far too ambiguous
+_BARE_EPISODE_PATTERNS = [
+	re.compile(r'(?<![A-Za-z0-9])[Ee][Pp]?[\s._-]?(\d{1,3})(?![\dpPiI])'),
+	re.compile(r'[\s._]-[\s._](\d{1,3})(?![\dpPiI])'),
+	re.compile(r'\[(\d{1,3})\](?![\dpPiI])'),
+	re.compile(r'^(\d{1,3})$'),
 ]
 
 # Season-only patterns (packs): S02, Temporada 2, Season 2, T2
@@ -108,7 +121,7 @@ _GROUP_PATTERN = re.compile(r'-([A-Za-z0-9]{2,20})\s*$')
 _GROUP_BLACKLIST = {"dl", "hd", "ma", "rip", "x264", "x265", "264", "265"}
 
 CANONICAL_FIELDS = {
-	"title", "year", "chapter", "season", "episode_number", "resolution",
+	"title", "episode_title", "year", "chapter", "season", "episode_number", "resolution",
 	"hdr", "extension", "language", "video_codec", "audio_codec", "source", "group",
 }
 
@@ -116,6 +129,7 @@ CANONICAL_FIELDS = {
 FIELD_ALIASES = {
 	# Spanish
 	"titulo": "title", "título": "title",
+	"titulo_episodio": "episode_title", "título_episodio": "episode_title",
 	"año": "year", "anio": "year",
 	"capitulo": "chapter", "capítulo": "chapter",
 	"temporada": "season",
@@ -129,6 +143,7 @@ FIELD_ALIASES = {
 	"grupo": "group",
 	# English
 	"title": "title",
+	"episode_title": "episode_title",
 	"year": "year",
 	"chapter": "chapter",
 	"season": "season",
@@ -165,7 +180,7 @@ def _split_extension(filename):
 
 
 def _find_episode(name):
-	"""Returns (season, episode, match_start) or None"""
+	"""Returns (season, episode, match_start, match_end) or None"""
 	for i, pattern in enumerate(EPISODE_PATTERNS):
 		match = pattern.search(name)
 		if match:
@@ -176,7 +191,7 @@ def _find_episode(name):
 			else:
 				season = int(match.group(1))
 				episode = int(match.group(2))
-			return season, episode, match.start()
+			return season, episode, match.start(), match.end()
 	return None
 
 
@@ -187,6 +202,31 @@ def _find_season_only(name):
 		if match:
 			return int(match.group(1)), match.start()
 	return None
+
+
+def _find_bare_episode(name, limit):
+	"""Returns (episode, match_start, match_end) for an episode number without
+	a season marker, or None. Only matches before limit (the first metadata
+	token) to keep resolutions, codecs and channel counts out"""
+	for pattern in _BARE_EPISODE_PATTERNS:
+		match = pattern.search(name)
+		if match and match.start() < limit:
+			return int(match.group(1)), match.start(), match.end()
+	return None
+
+
+def _extract_episode_title(name, start, limit):
+	"""Returns the episode title: the text between the episode marker and the
+	first metadata token. Release junk lands here too ('1of2', '2v3'), so only
+	plain words are accepted: a single token mixing letters and digits is
+	discarded, and so is anything without letters"""
+	candidate = _clean_title(name[start:limit])
+	candidate = re.sub(r'^[\s\-–_.]+', '', candidate).strip()
+	if not candidate or not re.search(r'[A-Za-zÀ-ÿ]', candidate):
+		return ""
+	if " " not in candidate and re.search(r'\d', candidate):
+		return ""
+	return candidate
 
 
 def _clean_title(title_part):
@@ -257,11 +297,13 @@ def _detect_group(name):
 	return ""
 
 
-def parse_metadata(filename, season_prefix="T"):
+def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	"""Extracts all detectable metadata from a release name.
 	Returns a dict with all CANONICAL_FIELDS (empty string when missing)
 	plus 'is_series' (bool). season_prefix is used for the 'chapter' field
-	on season-only packs (T2 in Spanish, S2 in English)"""
+	on season-only packs (T2 in Spanish, S2 in English).
+	allow_bare_episode enables matching episode numbers without a season
+	marker, only safe when the caller already knows it is a series file"""
 	name, ext = _split_extension(filename)
 
 	fields = {key: "" for key in CANONICAL_FIELDS}
@@ -270,6 +312,7 @@ def parse_metadata(filename, season_prefix="T"):
 
 	# Episode/season detection determines the title boundary
 	title_end = len(name)
+	episode_end = None
 	episode_range = _EPISODE_RANGE_PATTERN.search(name)
 	episode_info = _find_episode(name)
 	season_range = _SEASON_RANGE_PATTERN.search(name)
@@ -281,12 +324,13 @@ def parse_metadata(filename, season_prefix="T"):
 		fields["chapter"] = f"{season}x{ep1:02d}-{ep2:02d}"
 		title_end = episode_range.start()
 	elif episode_info:
-		season, episode, start = episode_info
+		season, episode, start, end = episode_info
 		fields["is_series"] = True
 		fields["season"] = str(season)
 		fields["episode_number"] = f"{episode:02d}"
 		fields["chapter"] = f"{season}x{episode:02d}"
 		title_end = start
+		episode_end = end
 	elif season_range:
 		s1, s2 = int(season_range.group(1)), int(season_range.group(2))
 		fields["is_series"] = True
@@ -312,6 +356,25 @@ def parse_metadata(filename, season_prefix="T"):
 				meta_start = match.start()
 	if meta_start < title_end:
 		title_end = meta_start
+
+	# Files inside a season pack usually carry the episode number alone
+	if allow_bare_episode and not fields["episode_number"]:
+		bare = _find_bare_episode(name, meta_start)
+		if bare:
+			episode, start, end = bare
+			fields["is_series"] = True
+			fields["episode_number"] = f"{episode:02d}"
+			if fields["season"] and "-" not in fields["season"]:
+				fields["chapter"] = f"{fields['season']}x{episode:02d}"
+			else:
+				fields["chapter"] = ""
+			if start < title_end:
+				title_end = start
+			episode_end = end
+
+	# Whatever sits between the episode marker and the metadata is its title
+	if episode_end is not None and episode_end < meta_start:
+		fields["episode_title"] = _extract_episode_title(name, episode_end, meta_start)
 
 	# Year: range (collections) > parentheses > last plain year before the
 	# metadata tags (in "Blade Runner 2049 2017" the release year is 2017)
@@ -432,18 +495,15 @@ DEFAULT_SERIES_TEMPLATE = "{season}x{episode} - {title}[ - {resolution}][ {hdr}]
 DEFAULT_SEASON_PACK_TEMPLATE = "{chapter} - {title}[ - {resolution}][ {hdr}][.{extension}]"
 
 
-def suggest_name(filename, template_movie=None, template_series=None, template_season=None, season_prefix="T"):
-	"""Parses the name and renders the matching template: season pack when a
-	season without episode is found, series when an episode marker is found,
-	movie otherwise. Returns the suggested name or None when a required field
-	is missing or the result equals the original name"""
-	fields = parse_metadata(filename, season_prefix=season_prefix)
+def _pick_template(fields, template_movie, template_series, template_season):
 	if fields["is_series"] and fields["season"] and not fields["episode_number"]:
-		template = template_season or DEFAULT_SEASON_PACK_TEMPLATE
-	elif fields["is_series"]:
-		template = template_series or DEFAULT_SERIES_TEMPLATE
-	else:
-		template = template_movie or DEFAULT_MOVIE_TEMPLATE
+		return template_season or DEFAULT_SEASON_PACK_TEMPLATE
+	if fields["is_series"]:
+		return template_series or DEFAULT_SERIES_TEMPLATE
+	return template_movie or DEFAULT_MOVIE_TEMPLATE
+
+
+def _render(template, fields, filename):
 	try:
 		suggested = render_template(template, fields)
 	except Exception:
@@ -451,3 +511,81 @@ def suggest_name(filename, template_movie=None, template_series=None, template_s
 	if not suggested or suggested == filename:
 		return None
 	return suggested
+
+
+def suggest_name(filename, template_movie=None, template_series=None, template_season=None, season_prefix="T"):
+	"""Parses the name and renders the matching template: season pack when a
+	season without episode is found, series when an episode marker is found,
+	movie otherwise. Returns the suggested name or None when a required field
+	is missing or the result equals the original name"""
+	fields = parse_metadata(filename, season_prefix=season_prefix)
+	template = _pick_template(fields, template_movie, template_series, template_season)
+	return _render(template, fields, filename)
+
+
+# Metadata taken from the torrent name when the file itself does not carry it.
+# The episode and its title are deliberately excluded: both must always come
+# from the file, otherwise every file would end up with the same name
+_INHERITABLE_FIELDS = (
+	"title", "year", "season", "resolution", "hdr", "language",
+	"video_codec", "audio_codec", "source", "group",
+)
+
+
+def suggest_file_name(filename, parent_name=None, single_video=False, template_movie=None,
+						template_series=None, template_season=None, season_prefix="T"):
+	"""Suggests a name for a single video file inside a torrent. parent_name is
+	the torrent name, used as context: the fields missing in the file are
+	inherited from it (the season included, never the episode), so files named
+	just '01.mkv' inside a season pack can still be renamed. single_video tells
+	whether the torrent holds just one video, which is what allows a file with
+	no metadata of its own to take the whole torrent name.
+	Returns None when the file cannot be identified"""
+	parent = parse_metadata(parent_name, season_prefix=season_prefix) if parent_name else None
+	parent_is_series = bool(parent and parent["is_series"])
+	fields = parse_metadata(filename, season_prefix=season_prefix, allow_bare_episode=parent_is_series)
+	own_year = fields["year"]
+
+	if parent:
+		for key in _INHERITABLE_FIELDS:
+			if not fields[key] and parent[key]:
+				fields[key] = parent[key]
+		# Without a year of its own the file title is just the leftovers of the
+		# file name (numbers, tags...), so the torrent title is more reliable
+		if not own_year and parent["title"]:
+			fields["title"] = parent["title"]
+		if parent_is_series:
+			fields["is_series"] = True
+		if not fields["chapter"] and fields["season"] and "-" not in fields["season"]:
+			if fields["episode_number"]:
+				fields["chapter"] = f"{fields['season']}x{fields['episode_number']}"
+			else:
+				fields["chapter"] = f"{season_prefix}{fields['season']}"
+
+	if fields["is_series"]:
+		# Every file needs its own episode, otherwise all of them would
+		# collapse into the same name
+		if not fields["episode_number"]:
+			return None
+	elif not single_video and not own_year:
+		# One video among many with nothing identifying it: the torrent name
+		# belongs to the pack, not to this particular file
+		return None
+
+	template = _pick_template(fields, template_movie, template_series, template_season)
+	return _render(template, fields, filename)
+
+
+def companion_subtitle_name(subtitle_name, video_name, new_video_name):
+	"""Returns the name a subtitle must take so it keeps matching its video
+	after the video is renamed, preserving any language suffix and its own
+	extension. Returns None when the subtitle does not belong to the video"""
+	subtitle_stem, _, subtitle_ext = subtitle_name.rpartition(".")
+	if not subtitle_stem or subtitle_ext.lower() not in SUBTITLE_EXTENSIONS:
+		return None
+	video_stem = _split_extension(video_name)[0]
+	if not subtitle_stem.startswith(video_stem):
+		return None
+	suffix = subtitle_stem[len(video_stem):]
+	new_stem = _split_extension(new_video_name)[0]
+	return f"{new_stem}{suffix}.{subtitle_ext}"

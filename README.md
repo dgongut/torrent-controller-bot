@@ -23,6 +23,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Pausar, reanudar, verificar y borrar torrents (con o sin sus datos)
 - ✅ Mover torrents de directorio con aviso al terminar el movimiento
 - ✅ Renombrado con sugerencia automática para películas y series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
+- ✅ Renombrado de los archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
 - ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar o mover todos
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
@@ -74,6 +75,18 @@ Al pulsar ✏️ Renombrar sobre un torrent, el bot intenta generar una sugerenc
 - **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (soporta formatos `Cap.103`, `S01E03` y `3x05`)
 
 Si no puede generar sugerencia, siempre puedes escribir el nombre manualmente.
+
+### Archivos dentro del torrent
+
+Desde el detalle de un torrent, el botón 🗂️ Archivos lista los ficheros que contiene y permite renombrarlos uno a uno o todos de golpe (con previsualización antes de confirmar). Los archivos heredan del nombre del torrent lo que no llevan encima (título, año y temporada, nunca el episodio), así que un episodio suelto como `01.mkv` dentro de `Show.Name.S02.1080p` se convierte en `2x01 - Show Name - 1080p.mkv`. Los subtítulos que acompañan a un vídeo se renombran con él para no romper el emparejamiento, y todo se hace a través del gestor de torrents, por lo que el seeding se mantiene.
+
+### Título del episodio
+
+El campo `{titulo_episodio}` recoge el texto que va después del marcador de episodio, así que `Family.Guy.S01E01.Death.Has.a.Shadow.1080p.mkv` conserva `Death Has a Shadow`. No todos los episodios lo traen, por lo que conviene usarlo siempre entre corchetes:
+
+```
+{temporada}x{episodio} - {titulo}[ - {titulo_episodio}][.{extension}]
+```
 
 ## Configuración en las variables del Docker Compose
 

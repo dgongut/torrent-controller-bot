@@ -23,6 +23,8 @@ LIGHT_FIELDS = [
 FULL_FIELDS = LIGHT_FIELDS + [
 	"totalSize", "downloadedEver", "uploadedEver", "uploadRatio", "eta",
 	"peersConnected", "files", "hashString", "isFinished",
+	# get_files() combines these three: without them it raises KeyError
+	"fileStats", "priorities", "wanted",
 ]
 
 SUMMARY_FIELDS = ["id", "status", "error", "percentDone", "rateDownload", "rateUpload"]
@@ -223,6 +225,12 @@ class TransmissionClient(TorrentClient):
 			self.client.rename_torrent_path(int(torrent_id), location=torrent.name, name=new_name)
 		except Exception as e:
 			raise TorrentClientError(f"Error renaming torrent {torrent_id}: {e}")
+
+	def rename_file(self, torrent_id, old_path, new_name):
+		try:
+			self.client.rename_torrent_path(int(torrent_id), location=old_path, name=new_name)
+		except Exception as e:
+			raise TorrentClientError(f"Error renaming file {old_path}: {e}")
 
 	def move_torrents(self, torrent_ids, new_dir):
 		try:
