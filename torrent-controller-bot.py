@@ -21,7 +21,7 @@ from torrent_clients import TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -881,13 +881,19 @@ def build_trackers_menu():
 # ---------------------------------------------------------------------------
 
 def get_known_dirs():
-	"""Known directories: in use by the client + favorite dirs + auto download dir"""
+	"""Known directories: favorite dirs first, then the ones in use by the
+	client (most used first) and the auto download dir"""
 	dirs = []
+	for favorite in bot_settings.get("favorite_dirs") or []:
+		favorite = (favorite or "").strip().rstrip("/")
+		if favorite and favorite not in dirs:
+			dirs.append(favorite)
 	try:
-		dirs.extend(client.get_download_dirs())
+		in_use = client.get_download_dirs()
 	except TorrentClientError as e:
 		warning(f"Cannot get download dirs: {e}")
-	extras = list(bot_settings.get("favorite_dirs") or []) + [bot_settings.get("auto_download_dir")]
+		in_use = []
+	extras = list(in_use) + [bot_settings.get("auto_download_dir")]
 	for extra in extras:
 		extra = (extra or "").strip().rstrip("/")
 		if extra and extra not in dirs:
