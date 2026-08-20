@@ -122,6 +122,8 @@ class DelugeClient(TorrentClient):
 			eta=eta if eta and eta > 0 else -1,
 			ratio=round(float(t.get("ratio", 0) or 0), 2),
 			peers=t.get("num_peers", 0) + t.get("num_seeds", 0),
+			seeders=t.get("num_seeds", 0),
+			leechers=t.get("num_peers", 0),
 			download_dir=t.get("save_path", "") or "",
 			error_message=t.get("message", "") if state == "Error" else "",
 			added_date=t.get("time_added", None),

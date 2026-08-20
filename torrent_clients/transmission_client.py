@@ -22,7 +22,8 @@ LIGHT_FIELDS = [
 
 FULL_FIELDS = LIGHT_FIELDS + [
 	"totalSize", "downloadedEver", "uploadedEver", "uploadRatio", "eta",
-	"peersConnected", "files", "hashString", "isFinished",
+	"peersConnected", "peersSendingToUs", "peersGettingFromUs",
+	"files", "hashString", "isFinished",
 	# get_files() combines these three: without them it raises KeyError
 	"fileStats", "priorities", "wanted",
 ]
@@ -101,6 +102,8 @@ class TransmissionClient(TorrentClient):
 			eta=eta if eta is not None and eta >= 0 else -1,
 			ratio=round(self._raw(torrent, "uploadRatio", 0) or 0, 2),
 			peers=self._raw(torrent, "peersConnected", 0),
+			seeders=self._raw(torrent, "peersSendingToUs", 0),
+			leechers=self._raw(torrent, "peersGettingFromUs", 0),
 			download_dir=self._raw(torrent, "downloadDir", "") or "",
 			error_message=self._raw(torrent, "errorString", "") or "",
 			added_date=self._raw(torrent, "addedDate", None),

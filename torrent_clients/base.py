@@ -39,6 +39,8 @@ class TorrentInfo:
 	eta: int = -1  # seconds, -1 unknown
 	ratio: float = 0.0
 	peers: int = 0
+	seeders: int = 0  # connected peers that have the whole torrent
+	leechers: int = 0  # connected peers still downloading
 	download_dir: str = ""
 	error_message: str = ""
 	added_date: object = None  # datetime

@@ -21,7 +21,7 @@ from torrent_clients import TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -241,8 +241,8 @@ tracker_contexts = {}
 # Pending torrents waiting for a download dir: id -> {"magnet"/"data", "name", "ts"}
 pending_torrents = {}
 
-# Files screen contexts: short id -> {"torrent_id", "filter_key", "page", "ts"}
-files_contexts = {}
+# Navigation contexts: short id -> {"torrent_id", "filter_key", "page", "ts"}
+nav_contexts = {}
 
 # Pending text inputs: (chat_id, user_id) -> {"action": str, ...}
 pending_inputs = {}
@@ -308,25 +308,25 @@ def get_tracker_filter(ctx_id):
 		return None
 
 
-def new_files_context(torrent_id, filter_key, page):
-	"""Short id for the (torrent, filter, page) triplet: the files screen needs
-	the file page and index too and everything must fit in callback_data"""
+def new_nav_context(torrent_id, filter_key, page):
+	"""Short id for the (torrent, filter, page) triplet: the files and move
+	screens need extra args too and everything must fit in callback_data"""
 	with _contexts_lock:
 		now = time.time()
-		for key in [k for k, v in files_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
-			del files_contexts[key]
-		for ctx_id, ctx in files_contexts.items():
+		for key in [k for k, v in nav_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del nav_contexts[key]
+		for ctx_id, ctx in nav_contexts.items():
 			if ctx["torrent_id"] == torrent_id and ctx["filter_key"] == filter_key and ctx["page"] == str(page):
 				ctx["ts"] = now
 				return ctx_id
 		ctx_id = uuid.uuid4().hex[:6]
-		files_contexts[ctx_id] = {"torrent_id": torrent_id, "filter_key": filter_key, "page": str(page), "ts": now}
+		nav_contexts[ctx_id] = {"torrent_id": torrent_id, "filter_key": filter_key, "page": str(page), "ts": now}
 		return ctx_id
 
 
-def get_files_context(ctx_id):
+def get_nav_context(ctx_id):
 	with _contexts_lock:
-		ctx = files_contexts.get(ctx_id)
+		ctx = nav_contexts.get(ctx_id)
 		if ctx:
 			ctx["ts"] = time.time()
 			return ctx["torrent_id"], ctx["filter_key"], ctx["page"]
@@ -611,7 +611,7 @@ def build_detail(torrent_id, filter_key, page):
 	lines.append(f"{get_text('INFO_RATIO')}: {torrent.ratio}")
 	if torrent.status == TorrentStatus.DOWNLOADING:
 		lines.append(f"{get_text('INFO_ETA')}: {format_eta(torrent.eta)}")
-	lines.append(f"{get_text('INFO_PEERS')}: {torrent.peers}")
+	lines.append(f"{get_text('INFO_PEERS')}: {torrent.peers} {get_text('INFO_PEERS_DETAIL', torrent.seeders, torrent.leechers)}")
 	if torrent.trackers:
 		tracker_text = html.escape(torrent.trackers[0])
 		if len(torrent.trackers) > 1:
@@ -623,7 +623,8 @@ def build_detail(torrent_id, filter_key, page):
 		lines.append(f"{get_text('INFO_ADDED')}: {added}")
 	if torrent.error_message:
 		lines.append(f"{get_text('INFO_ERROR')}: <code>{html.escape(torrent.error_message)}</code>")
-	if torrent.files:
+	show_files = has_browsable_files(torrent)
+	if show_files:
 		lines.append("")
 		lines.append(f"<b>{get_text('INFO_FILES')} ({len(torrent.files)}):</b>")
 		for path, size, _ in torrent.files[:10]:
@@ -641,8 +642,8 @@ def build_detail(torrent_id, filter_key, page):
 		InlineKeyboardButton(get_text(rename_key(torrent, "BUTTON_RENAME")), callback_data=build_call("rename", torrent.id, filter_key, page)),
 		InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)),
 	)
-	if torrent.files:
-		files_ctx = new_files_context(torrent.id, filter_key, page)
+	if show_files:
+		files_ctx = new_nav_context(torrent.id, filter_key, page)
 		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES"), callback_data=build_call("files", files_ctx, 0)))
 	markup.row(InlineKeyboardButton(get_text("BUTTON_DELETE"), callback_data=build_call("delete", torrent.id, filter_key, page)))
 	markup.row(
@@ -690,6 +691,12 @@ def torrent_is_folder(torrent):
 	"""True when the torrent keeps its files inside a folder. Renaming such a
 	torrent only renames that folder, never the files inside"""
 	return any("/" in path for path, _, _ in torrent.files)
+
+
+def has_browsable_files(torrent):
+	"""Single file torrents are renamed through the torrent itself, so there is
+	nothing to browse in their file list"""
+	return bool(torrent.files) and (len(torrent.files) > 1 or torrent_is_folder(torrent))
 
 
 def rename_key(torrent, key):
@@ -744,6 +751,15 @@ def build_rename_plan(torrent, only_path=None):
 		plan.append((path, suggested))
 		plan.extend(subtitle_renames(torrent, path, suggested))
 	return plan, collisions
+
+
+def file_rename_ok_text(new_name, done):
+	"""Result of renaming one file: done counts the file itself plus the
+	subtitles renamed along with it"""
+	subtitles = max(done - 1, 0)
+	if subtitles:
+		return get_text("FILE_RENAME_OK_SUBTITLES", html.escape(new_name), subtitles)
+	return get_text("FILE_RENAME_OK", html.escape(new_name))
 
 
 def apply_rename_plan(torrent_id, plan):
@@ -1344,8 +1360,10 @@ def handle_pending_input(message, pending):
 		delete_message(chat_id, prompt_message_id)
 	delete_message(chat_id, message.message_id)
 
+	back_markup = back_close_markup(pending.get("back_call"))
+
 	if not text or text.lower() in ("/cancel", "cancel", "cancelar"):
-		show_dashboard(chat_id, thread_id=thread_id)
+		send_message(chat_id, get_text("INPUT_CANCELLED"), reply_markup=back_markup, thread_id=thread_id)
 		return
 
 	if action == "search":
@@ -1353,20 +1371,20 @@ def handle_pending_input(message, pending):
 		render_list(chat_id, None, f"q{ctx_id}", 0, thread_id=thread_id)
 	elif action == "rename":
 		if name_already_exists(text, exclude_id=pending["torrent_id"]):
-			send_message(chat_id, get_text("RENAME_DUPLICATE", html.escape(text)), thread_id=thread_id)
+			send_message(chat_id, get_text("RENAME_DUPLICATE", html.escape(text)), reply_markup=back_markup, thread_id=thread_id)
 			return
 		try:
 			torrent = client.get_torrent(pending["torrent_id"])
 			client.rename_torrent(pending["torrent_id"], text)
 			key = rename_key(torrent, "RENAME_OK") if torrent else "RENAME_OK"
-			send_message(chat_id, get_text(key, html.escape(text)), thread_id=thread_id)
+			send_message(chat_id, get_text(key, html.escape(text)), reply_markup=back_markup, thread_id=thread_id)
 		except TorrentClientError as e:
-			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 	elif action == "renameFile":
 		torrent_id = pending["torrent_id"]
 		file_path = pending["file_path"]
 		if "/" in text:
-			send_message(chat_id, get_text("FILE_RENAME_INVALID"), thread_id=thread_id)
+			send_message(chat_id, get_text("FILE_RENAME_INVALID"), reply_markup=back_markup, thread_id=thread_id)
 			return
 		try:
 			torrent = client.get_torrent(torrent_id)
@@ -1375,28 +1393,28 @@ def handle_pending_input(message, pending):
 				plan.extend(subtitle_renames(torrent, file_path, text))
 			done, errors = apply_rename_plan(torrent_id, plan)
 			if errors:
-				send_message(chat_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), thread_id=thread_id)
+				send_message(chat_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), reply_markup=back_markup, thread_id=thread_id)
 			else:
-				send_message(chat_id, get_text("FILE_RENAME_OK", html.escape(text), done), thread_id=thread_id)
+				send_message(chat_id, file_rename_ok_text(text, done), reply_markup=back_markup, thread_id=thread_id)
 		except TorrentClientError as e:
-			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 	elif action == "move":
 		name = html.escape(pending.get("name", ""))
 		dest = html.escape(text)
 		progress_text = get_text("MOVING", name, dest)
 		success_text = get_text("MOVE_OK", name, dest)
-		deliver_move_order(chat_id, [pending["torrent_id"]], text, progress_text, success_text, thread_id=thread_id, reply_markup=back_close_markup())
+		deliver_move_order(chat_id, [pending["torrent_id"]], text, progress_text, success_text, thread_id=thread_id, reply_markup=back_markup)
 	elif action == "addDir":
 		pending_id = pending["pending_id"]
 		pending_torrent = pop_pending_torrent(pending_id)
 		if pending_torrent is None:
-			send_message(chat_id, get_text("ADD_EXPIRED"), thread_id=thread_id)
+			send_message(chat_id, get_text("ADD_EXPIRED"), reply_markup=back_markup, thread_id=thread_id)
 			return
 		try:
 			result = perform_add_torrent(pending_torrent, text)
 		except TorrentClientError as e:
 			result = get_text("ADD_ERROR", html.escape(str(e)))
-		send_message(chat_id, result, thread_id=thread_id)
+		send_message(chat_id, result, reply_markup=back_markup, thread_id=thread_id)
 	elif action == "autoDir":
 		bot_settings.set("auto_download_dir", text.rstrip("/") or "/")
 		send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"))
@@ -1417,12 +1435,12 @@ def handle_pending_input(message, pending):
 				error_text = get_text("TPL_ERROR_UNKNOWN_FIELD", html.escape(e.detail))
 			else:
 				error_text = get_text("TPL_ERROR_INVALID")
-			send_message(chat_id, f"{error_text}\n\n{get_text('TPL_FIELDS_HELP')}", thread_id=thread_id)
+			send_message(chat_id, f"{error_text}\n\n{get_text('TPL_FIELDS_HELP')}", reply_markup=back_markup, thread_id=thread_id)
 			return
 		bot_settings.set(f"template_{kind}", text)
 		example = {"movie": TEMPLATE_EXAMPLE_MOVIE, "series": TEMPLATE_EXAMPLE_SERIES, "season": TEMPLATE_EXAMPLE_SEASON}[kind]
 		preview = parse_name(example) or "-"
-		send_message(chat_id, get_text("TPL_SAVED", html.escape(text), html.escape(example), html.escape(preview)), thread_id=thread_id)
+		send_message(chat_id, get_text("TPL_SAVED", html.escape(text), html.escape(example), html.escape(preview)), reply_markup=back_markup, thread_id=thread_id)
 	elif action == "massMove":
 		do_mass_move_to(chat_id, pending["filter_key"], text, thread_id=thread_id)
 	elif action in ("downLimit", "upLimit"):
@@ -1431,7 +1449,7 @@ def handle_pending_input(message, pending):
 			if kbps < 0:
 				raise ValueError()
 		except ValueError:
-			send_message(chat_id, get_text("INVALID_NUMBER"), thread_id=thread_id)
+			send_message(chat_id, get_text("INVALID_NUMBER"), reply_markup=back_markup, thread_id=thread_id)
 			return
 		direction = "down" if action == "downLimit" else "up"
 		try:
@@ -1441,7 +1459,7 @@ def handle_pending_input(message, pending):
 				client.set_speed_limit(direction, kbps, enabled=True)
 			send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"))
 		except TorrentClientError as e:
-			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), thread_id=thread_id)
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 
 
 def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None):
@@ -1587,6 +1605,48 @@ def command_version(message):
 	except TorrentClientError as e:
 		connected_to = f"❌ {e}"
 	send_message(message.chat.id, get_text("VERSION_TEXT", VERSION, connected_to), thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["donate"])
+def command_donate(message):
+	if not check_auth(message):
+		return
+	delete_message(message.chat.id, message.message_id)
+	send_message(message.chat.id, get_text("DONATE"), thread_id=message.message_thread_id)
+
+
+@bot.message_handler(commands=["donors"])
+def command_donors(message):
+	if not check_auth(message):
+		return
+	delete_message(message.chat.id, message.message_id)
+	donors = get_donors_online()
+	if donors:
+		text = get_text("DONORS_LIST", "\n".join(f"· {html.escape(d)}" for d in donors))
+	else:
+		text = get_text("ERROR_GETTING_DONORS")
+	send_message(message.chat.id, text, thread_id=message.message_thread_id)
+
+
+def get_donors_online():
+	"""Sorted list of donor names, empty when the list cannot be retrieved"""
+	try:
+		response = requests.get(DONORS_URL, timeout=URL_DOWNLOAD_TIMEOUT, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
+	except Exception as e:
+		error(f"Error getting donors: {e}")
+		return []
+	if response.status_code != 200:
+		error(f"Error getting donors: error code [{response.status_code}]")
+		return []
+	try:
+		data = response.json()
+	except ValueError:
+		error(f"Error getting donors: data is not a json [{response.text}]")
+		return []
+	if not isinstance(data, list):
+		error(f"Error getting donors: data is not a list [{data}]")
+		return []
+	return sorted(str(d) for d in data)
 
 
 def current_dirs_text(dirs):
@@ -1757,7 +1817,8 @@ def handle_callback(call):
 					markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("info", torrent_id, filter_key, page)))
 					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_SUGGEST"), html.escape(torrent.name), html.escape(suggested)), markup)
 				else:
-					ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
+					ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)),
+								message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
 
 		elif command == "renameAuto":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -1772,7 +1833,7 @@ def handle_callback(call):
 					edit_message(chat_id, message_id, get_text("RENAME_DUPLICATE", html.escape(suggested)), back_close_markup(build_call("info", torrent_id, filter_key, page)))
 				else:
 					client.rename_torrent(torrent_id, suggested)
-					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_OK"), html.escape(suggested)), back_close_markup(build_call("list", filter_key, page)))
+					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_OK"), html.escape(suggested)), back_close_markup(build_call("info", torrent_id, filter_key, page)))
 
 		elif command == "renameManual":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -1780,10 +1841,11 @@ def handle_callback(call):
 			if torrent is None:
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 			else:
-				ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)), message_id=message_id, torrent_id=torrent_id)
+				ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)),
+							message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
 
 		elif command in ("files", "file", "fileAuto", "fileManual", "filesAll", "filesAllOk"):
-			ctx = get_files_context(args[0])
+			ctx = get_nav_context(args[0])
 			if ctx is None:
 				edit_message(chat_id, message_id, get_text("FILES_CONTEXT_EXPIRED"), back_close_markup(build_call("dashboard")))
 				return
@@ -1801,24 +1863,26 @@ def handle_callback(call):
 				entry = get_torrent_file(torrent, file_index) if torrent else None
 				if entry is None:
 					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, file_page)
-				elif command == "file":
+					return
+				file_back_call = build_call("file", ctx_id, file_page, file_index)
+				if command == "file":
 					text, markup = build_file_detail(torrent, entry[0], entry[1], ctx_id, file_page, file_index)
 					edit_message(chat_id, message_id, text, markup)
 				elif command == "fileManual":
 					ask_for_input(chat_id, user_id, "renameFile", get_text("FILE_RENAME_ASK", html.escape(file_basename(entry[0]))),
-								message_id=message_id, torrent_id=torrent_id, file_path=entry[0])
+								message_id=message_id, torrent_id=torrent_id, file_path=entry[0], back_call=file_back_call)
 				else:
 					plan, collisions = build_rename_plan(torrent, only_path=entry[0])
 					if collisions:
-						edit_message(chat_id, message_id, get_text("FILE_RENAME_DUPLICATE", html.escape(collisions[0])), back_close_markup(back_call))
+						edit_message(chat_id, message_id, get_text("FILE_RENAME_DUPLICATE", html.escape(collisions[0])), back_close_markup(file_back_call))
 					elif not plan:
-						edit_message(chat_id, message_id, get_text("FILE_NO_SUGGESTION"), back_close_markup(back_call))
+						edit_message(chat_id, message_id, get_text("FILE_NO_SUGGESTION"), back_close_markup(file_back_call))
 					else:
 						done, errors = apply_rename_plan(torrent_id, plan)
 						if errors:
-							edit_message(chat_id, message_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), back_close_markup(back_call))
+							edit_message(chat_id, message_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), back_close_markup(file_back_call))
 						else:
-							edit_message(chat_id, message_id, get_text("FILE_RENAME_OK", html.escape(plan[0][1]), done), back_close_markup(back_call))
+							edit_message(chat_id, message_id, file_rename_ok_text(plan[0][1], done), back_close_markup(file_back_call))
 
 			else:
 				torrent = client.get_torrent(torrent_id)
@@ -1850,35 +1914,41 @@ def handle_callback(call):
 			if torrent is None:
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 			else:
+				nav_ctx = new_nav_context(torrent_id, filter_key, page)
 				markup = build_dir_markup(
-					dir_call=lambda dir_id: build_call("moveToDir", torrent_id, dir_id),
-					write_call=build_call("moveNewDir", torrent_id),
+					dir_call=lambda dir_id: build_call("moveToDir", nav_ctx, dir_id),
+					write_call=build_call("moveNewDir", nav_ctx),
 					cancel_call=build_call("info", torrent_id, filter_key, page),
 					page_call=lambda p: build_call("move", torrent_id, filter_key, page, p),
 					page=dir_page,
 				)
 				edit_message(chat_id, message_id, get_text("MOVE_ASK_DIR", html.escape(torrent.name)), markup)
 
-		elif command == "moveToDir":
-			torrent_id, dir_id = args[0], args[1]
-			new_dir = get_dir_by_id(dir_id)
-			torrent = client.get_torrent(torrent_id)
-			name = torrent.name if torrent else torrent_id
-			if new_dir is None:
+		elif command in ("moveToDir", "moveNewDir"):
+			ctx = get_nav_context(args[0])
+			if ctx is None:
 				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"), back_close_markup())
-			else:
-				progress_text = get_text("MOVING", html.escape(name), html.escape(new_dir))
-				success_text = get_text("MOVE_OK", html.escape(name), html.escape(new_dir))
-				deliver_move_order(chat_id, [torrent_id], new_dir, progress_text, success_text, message_id=message_id, reply_markup=back_close_markup())
-
-		elif command == "moveNewDir":
-			torrent_id = args[0]
+				return
+			torrent_id, filter_key, page = ctx
+			back_call = build_call("info", torrent_id, filter_key, page)
 			torrent = client.get_torrent(torrent_id)
-			name = torrent.name if torrent else ""
-			prompt = get_text("MOVE_NEW_DIR_ASK")
-			if torrent and torrent.download_dir:
-				prompt = f"{current_dirs_text([torrent.download_dir])}\n{prompt}"
-			ask_for_input(chat_id, user_id, "move", prompt, message_id=message_id, torrent_id=torrent_id, name=name)
+			if command == "moveToDir":
+				new_dir = get_dir_by_id(args[1])
+				name = torrent.name if torrent else torrent_id
+				if new_dir is None:
+					edit_message(chat_id, message_id, get_text("ADD_EXPIRED"), back_close_markup(back_call))
+				else:
+					progress_text = get_text("MOVING", html.escape(name), html.escape(new_dir))
+					success_text = get_text("MOVE_OK", html.escape(name), html.escape(new_dir))
+					deliver_move_order(chat_id, [torrent_id], new_dir, progress_text, success_text, message_id=message_id, reply_markup=back_close_markup(back_call))
+			else:
+				name = torrent.name if torrent else ""
+				prompt = get_text("MOVE_NEW_DIR_ASK")
+				if torrent and torrent.download_dir:
+					prompt = f"{current_dirs_text([torrent.download_dir])}\n{prompt}"
+				if name:
+					prompt = f"{get_text('MOVE_ASK_DIR', html.escape(name))}\n\n{prompt}"
+				ask_for_input(chat_id, user_id, "move", prompt, message_id=message_id, torrent_id=torrent_id, name=name, back_call=back_call)
 
 		elif command == "search":
 			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), message_id=message_id)
@@ -1897,10 +1967,16 @@ def handle_callback(call):
 
 		elif command == "addNewDir":
 			pending_id = args[0]
-			if get_pending_torrent(pending_id) is None:
+			pending_torrent = get_pending_torrent(pending_id)
+			if pending_torrent is None:
 				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
 			else:
-				ask_for_input(chat_id, user_id, "addDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id, pending_id=pending_id)
+				prompt = get_text("MOVE_NEW_DIR_ASK")
+				name = pending_torrent.get("name")
+				if name:
+					prompt = f"{get_text('ADD_ASK_DIR', html.escape(name))}\n\n{prompt}"
+				ask_for_input(chat_id, user_id, "addDir", prompt, message_id=message_id, pending_id=pending_id,
+							back_call=build_call("dashboard"))
 
 		elif command == "cancelAdd":
 			pop_pending_torrent(args[0])
@@ -1941,7 +2017,8 @@ def handle_callback(call):
 					prompt = f"{dirs_text}\n{prompt}"
 			except (ExpiredContext, TorrentClientError):
 				pass
-			ask_for_input(chat_id, user_id, "massMove", prompt, message_id=message_id, filter_key=filter_key)
+			ask_for_input(chat_id, user_id, "massMove", prompt, message_id=message_id, filter_key=filter_key,
+						back_call=build_call("list", filter_key, 0))
 
 		elif command == "settings":
 			render_settings(chat_id, message_id)
@@ -1960,10 +2037,12 @@ def handle_callback(call):
 			render_settings(chat_id, message_id)
 
 		elif command == "setDownLimit":
-			ask_for_input(chat_id, user_id, "downLimit", get_text("SETTINGS_ASK_DOWN_LIMIT"), message_id=message_id)
+			ask_for_input(chat_id, user_id, "downLimit", get_text("SETTINGS_ASK_DOWN_LIMIT"), message_id=message_id,
+						back_call=build_call("settings"))
 
 		elif command == "setUpLimit":
-			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), message_id=message_id)
+			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), message_id=message_id,
+						back_call=build_call("settings"))
 
 		elif command == "toggleSetting":
 			bot_settings.toggle(args[0])
@@ -1992,13 +2071,15 @@ def handle_callback(call):
 			render_settings(chat_id, message_id)
 
 		elif command == "autoDirNew":
-			ask_for_input(chat_id, user_id, "autoDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id)
+			ask_for_input(chat_id, user_id, "autoDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id,
+						back_call=build_call("settings"))
 
 		elif command == "favDirsMenu":
 			render_favorite_dirs_menu(chat_id, message_id)
 
 		elif command == "favDirAdd":
-			ask_for_input(chat_id, user_id, "favDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id)
+			ask_for_input(chat_id, user_id, "favDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id,
+						back_call=build_call("favDirsMenu"))
 
 		elif command == "favDirDel":
 			directory = get_dir_by_id(args[0])
@@ -2019,7 +2100,8 @@ def handle_callback(call):
 			current_block = get_text("TPL_ASK_CURRENT", html.escape(current), html.escape(parse_name(example) or "-"))
 			prompt_key = {"movie": "TPL_ASK_MOVIE", "series": "TPL_ASK_SERIES", "season": "TPL_ASK_SEASON"}[kind]
 			prompt = get_text(prompt_key, f"{current_block}\n\n{get_text('TPL_FIELDS_HELP')}")
-			ask_for_input(chat_id, user_id, "template", prompt, message_id=message_id, kind=kind)
+			ask_for_input(chat_id, user_id, "template", prompt, message_id=message_id, kind=kind,
+						back_call=build_call("tplMenu"))
 
 		elif command == "tplReset":
 			bot_settings.set("template_movie", "")
@@ -2028,8 +2110,12 @@ def handle_callback(call):
 			render_templates_menu(chat_id, message_id)
 
 		elif command == "cancelInput":
-			pop_pending_input(chat_id, user_id)
-			show_dashboard(chat_id, message_id=message_id)
+			pending_input = pop_pending_input(chat_id, user_id)
+			back_call = (pending_input or {}).get("back_call")
+			if back_call:
+				edit_message(chat_id, message_id, get_text("INPUT_CANCELLED"), back_close_markup(back_call))
+			else:
+				show_dashboard(chat_id, message_id=message_id)
 
 		else:
 			debug(f"Unknown callback: {call.data}")
@@ -2095,6 +2181,8 @@ if __name__ == "__main__":
 			telebot.types.BotCommand("/settings", get_text("MENU_SETTINGS")),
 			telebot.types.BotCommand("/version", get_text("MENU_VERSION")),
 			telebot.types.BotCommand("/help", get_text("MENU_HELP")),
+			telebot.types.BotCommand("/donate", get_text("MENU_DONATE")),
+			telebot.types.BotCommand("/donors", get_text("MENU_DONORS")),
 		])
 	except Exception as e:
 		warning(f"Cannot set bot commands: {e}")

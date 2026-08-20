@@ -21,6 +21,7 @@ TORRENT_CLIENT_RPC_PATH = os.environ.get("TORRENT_CLIENT_RPC_PATH")  # Default d
 
 # CONSTANTS
 ANONYMOUS_USER_ID = "1087968824"
+DONORS_URL = "https://donate.dgongut.com/donors.json"
 LOCALE_PATH = os.environ.get("LOCALE_PATH", "/app/locale")
 CONFIG_PATH = "/config"  # Persistent bot settings (mapped as a volume)
 MAX_DIR_BUTTONS = 10

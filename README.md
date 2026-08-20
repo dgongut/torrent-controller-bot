@@ -66,6 +66,7 @@ Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu
 | `/settings` | Ajustes del gestor: modo tortuga y límites de velocidad |
 | `/version` | Muestra la versión actual y el gestor al que está conectado |
 | `/help` | Lista de comandos |
+| `/donate` `/donors` | Dona al desarrollador / lista de donantes |
 
 ## Renombrado inteligente
 

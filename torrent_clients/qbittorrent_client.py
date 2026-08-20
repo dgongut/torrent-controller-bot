@@ -118,6 +118,8 @@ class QBittorrentClient(TorrentClient):
 			eta=eta,
 			ratio=round(float(t.get("ratio", 0) or 0), 2),
 			peers=t.get("num_leechs", 0) + t.get("num_seeds", 0),
+			seeders=t.get("num_seeds", 0),
+			leechers=t.get("num_leechs", 0),
 			download_dir=t.get("save_path", "") or "",
 			error_message=error_message,
 			added_date=t.get("added_on", None),
