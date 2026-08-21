@@ -14,6 +14,7 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	content_root,
 	sort_files,
 )
 
@@ -270,14 +271,16 @@ class DelugeClient(TorrentClient):
 			t = self._call("core.get_torrent_status", torrent_id, ["name", "files"])
 			if not t:
 				raise TorrentClientError("Torrent not found")
-			old_name = t.get("name", "")
 			files = t.get("files") or []
-			if len(files) == 1 and "/" not in files[0].get("path", ""):
+			# The path on disk has to come from the file list: Deluge sanitizes it,
+			# so it does not always match the torrent name
+			root = content_root(f.get("path", "") for f in files)
+			if root:
+				# Content inside a folder: rename the folder
+				self._call("core.rename_folder", torrent_id, f"{root}/", f"{new_name}/")
+			elif len(files) == 1:
 				# Single file at top level: rename the file on disk
 				self._call("core.rename_files", torrent_id, [[files[0].get("index", 0), new_name]])
-			elif files and files[0].get("path", "").startswith(f"{old_name}/"):
-				# Content inside a folder named like the torrent: rename the folder
-				self._call("core.rename_folder", torrent_id, f"{old_name}/", f"{new_name}/")
 			else:
 				raise TorrentClientError("Torrent content layout does not support renaming")
 		except TorrentClientError as e:

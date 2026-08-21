@@ -32,6 +32,23 @@ def sort_files(files):
 	return files
 
 
+def content_root(paths, fallback=""):
+	"""Top level folder shared by every file path, or an empty string when the
+	content is not inside a single folder. Torrent managers sanitize the paths
+	they write on disk (trailing dots and spaces, reserved characters...), so
+	the torrent name is not always a usable path: it has to be read back from
+	the file list. Returns fallback when there are no paths to look at"""
+	roots = set()
+	for path in paths:
+		if path:
+			roots.add(path.split("/", 1)[0] if "/" in path else "")
+	if not roots:
+		return fallback
+	if len(roots) == 1:
+		return roots.pop()
+	return ""
+
+
 @dataclass
 class TorrentInfo:
 	id: str

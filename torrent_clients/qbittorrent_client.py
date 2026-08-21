@@ -14,6 +14,7 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	content_root,
 	sort_files,
 )
 
@@ -288,17 +289,20 @@ class QBittorrentClient(TorrentClient):
 			torrents = self._get("torrents/info", params={"hashes": torrent_id}).json()
 			if not torrents:
 				raise TorrentClientError("Torrent not found")
-			old_name = torrents[0].get("name", "")
 			files = self._get("torrents/files", params={"hash": torrent_id}).json()
+			paths = [f.get("name", "") for f in files]
 			self._post("torrents/rename", data={"hash": torrent_id, "name": new_name})
-			if len(files) == 1 and "/" not in files[0].get("name", ""):
+			# The path on disk has to come from the file list: qBittorrent sanitizes
+			# it, so it does not always match the torrent name
+			root = content_root(paths)
+			if root:
+				# Content inside a folder: rename the folder
+				self._post("torrents/renameFolder", data={
+					"hash": torrent_id, "oldPath": root, "newPath": new_name})
+			elif len(paths) == 1:
 				# Single file at top level: rename the file on disk too
 				self._post("torrents/renameFile", data={
-					"hash": torrent_id, "oldPath": files[0]["name"], "newPath": new_name})
-			elif files and files[0].get("name", "").startswith(f"{old_name}/"):
-				# Content inside a folder named like the torrent: rename the folder
-				self._post("torrents/renameFolder", data={
-					"hash": torrent_id, "oldPath": old_name, "newPath": new_name})
+					"hash": torrent_id, "oldPath": paths[0], "newPath": new_name})
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error renaming torrent {torrent_id}: {e}")
 

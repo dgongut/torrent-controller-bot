@@ -11,6 +11,7 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	content_root,
 	sort_files,
 )
 
@@ -236,8 +237,15 @@ class TransmissionClient(TorrentClient):
 
 	def rename_torrent(self, torrent_id, new_name):
 		try:
-			torrent = self.client.get_torrent(int(torrent_id), arguments=["id", "name"])
-			self.client.rename_torrent_path(int(torrent_id), location=torrent.name, name=new_name)
+			torrent = self.client.get_torrent(int(torrent_id), arguments=["id", "name", "files"])
+			paths = [f.get("name", "") for f in (self._raw(torrent, "files", []) or [])]
+			# The path has to come from the file list: Transmission only accepts
+			# a path it really has on disk, which is not always the torrent name
+			location = content_root(paths, fallback=torrent.name)
+			if not location:
+				# Single file at top level: the path to rename is the file itself
+				location = paths[0] if len(paths) == 1 else torrent.name
+			self.client.rename_torrent_path(int(torrent_id), location=location, name=new_name)
 		except Exception as e:
 			raise TorrentClientError(f"Error renaming torrent {torrent_id}: {e}")
 
