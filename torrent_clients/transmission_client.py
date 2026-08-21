@@ -11,6 +11,7 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	sort_files,
 )
 
 # Light fields requested when listing (keeps RPC payload small with thousands of torrents)
@@ -78,6 +79,7 @@ class TransmissionClient(TorrentClient):
 			try:
 				for f in torrent.get_files():
 					files.append((f.name, f.size, f.completed))
+				sort_files(files)
 			except Exception:
 				files = []
 		trackers = []
@@ -132,20 +134,30 @@ class TransmissionClient(TorrentClient):
 
 		counts = Counter()
 		completed = 0
+		uploading = 0
+		downloading = 0
 		download_rate = 0
 		upload_rate = 0
 		for t in torrents:
 			counts[self._normalize_status(t)] += 1
 			if self._raw(t, "percentDone", 0) >= 1:
 				completed += 1
-			download_rate += self._raw(t, "rateDownload", 0)
-			upload_rate += self._raw(t, "rateUpload", 0)
+			rate_download = self._raw(t, "rateDownload", 0)
+			download_rate += rate_download
+			if rate_download > 0:
+				downloading += 1
+			rate_upload = self._raw(t, "rateUpload", 0)
+			upload_rate += rate_upload
+			if rate_upload > 0:
+				uploading += 1
 
 		free_space = self.get_free_space(session.download_dir)
 		return SessionSummary(
 			counts=dict(counts),
 			total=len(torrents),
 			completed=completed,
+			uploading=uploading,
+			downloading=downloading,
 			download_rate=download_rate,
 			upload_rate=upload_rate,
 			free_space=free_space,

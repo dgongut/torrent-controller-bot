@@ -21,7 +21,7 @@ from torrent_clients import TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -188,6 +188,19 @@ def build_call(command, *args):
 	return "|".join([command] + [str(a) for a in args])
 
 
+def pagination_row(page, pages, *base):
+	"""Prev/next buttons plus a central one (current page) that asks which page
+	to jump to. base is the callback prefix that receives the page as last arg"""
+	base_call = build_call(*base)
+	prev_call = f"{base_call}|{page - 1}" if page > 0 else build_call("noop")
+	next_call = f"{base_call}|{page + 1}" if page < pages - 1 else build_call("noop")
+	return [
+		InlineKeyboardButton("⬅️", callback_data=prev_call),
+		InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=build_call("goto", new_page_context(base_call), page, pages)),
+		InlineKeyboardButton("➡️", callback_data=next_call),
+	]
+
+
 def is_authorized(user_id, chat_id):
 	if str(user_id) not in ADMIN_IDS:
 		return False
@@ -243,6 +256,9 @@ pending_torrents = {}
 
 # Navigation contexts: short id -> {"torrent_id", "filter_key", "page", "ts"}
 nav_contexts = {}
+
+# Pagination contexts: short id -> {"base": callback prefix, "ts": float}
+page_contexts = {}
 
 # Pending text inputs: (chat_id, user_id) -> {"action": str, ...}
 pending_inputs = {}
@@ -333,6 +349,31 @@ def get_nav_context(ctx_id):
 		return None
 
 
+def new_page_context(base):
+	"""Short id for the callback prefix of a paginated view, so the jump to
+	page button always fits in callback_data"""
+	with _contexts_lock:
+		now = time.time()
+		for key in [k for k, v in page_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del page_contexts[key]
+		for ctx_id, ctx in page_contexts.items():
+			if ctx["base"] == base:
+				ctx["ts"] = now
+				return ctx_id
+		ctx_id = uuid.uuid4().hex[:6]
+		page_contexts[ctx_id] = {"base": base, "ts": now}
+		return ctx_id
+
+
+def get_page_context(ctx_id):
+	with _contexts_lock:
+		ctx = page_contexts.get(ctx_id)
+		if ctx:
+			ctx["ts"] = time.time()
+			return ctx["base"]
+		return None
+
+
 def new_pending_torrent(name, magnet=None, data=None):
 	with _contexts_lock:
 		now = time.time()
@@ -362,7 +403,7 @@ class ExpiredContext(Exception):
 
 
 def is_known_filter(filter_key):
-	return filter_key in (FILTER_ALL, FILTER_COMPLETED) or filter_key in FILTER_TO_STATUS
+	return filter_key in (FILTER_ALL, FILTER_COMPLETED, FILTER_UPLOADING, FILTER_DOWNLOADING_NOW) or filter_key in FILTER_TO_STATUS
 
 
 def get_filter_label(filter_key):
@@ -380,6 +421,10 @@ def get_filter_label(filter_key):
 		return get_text("STATUS_ALL")
 	if filter_key == FILTER_COMPLETED:
 		return get_text("STATUS_COMPLETED")
+	if filter_key == FILTER_UPLOADING:
+		return f"🔼 {get_text('STATUS_UPLOADING')}"
+	if filter_key == FILTER_DOWNLOADING_NOW:
+		return f"🔽 {get_text('STATUS_DOWNLOADING_NOW')}"
 	status = FILTER_TO_STATUS.get(filter_key)
 	emoji = STATUS_EMOJI.get(status, "")
 	return f"{emoji} {get_text(STATUS_TEXT_KEY[status])}" if status else get_text("STATUS_ALL")
@@ -402,6 +447,10 @@ def get_filtered_torrents(filter_key):
 		return client.get_torrents()
 	if filter_key == FILTER_COMPLETED:
 		return [t for t in client.get_torrents() if t.is_finished]
+	if filter_key == FILTER_UPLOADING:
+		return [t for t in client.get_torrents() if t.upload_rate > 0]
+	if filter_key == FILTER_DOWNLOADING_NOW:
+		return [t for t in client.get_torrents() if t.download_rate > 0]
 	status = FILTER_TO_STATUS.get(filter_key)
 	if status is None:
 		return client.get_torrents()
@@ -420,6 +469,10 @@ def build_dashboard(refreshing):
 	for status in (TorrentStatus.DOWNLOADING, TorrentStatus.SEEDING, TorrentStatus.PAUSED,
 			TorrentStatus.QUEUED, TorrentStatus.CHECKING, TorrentStatus.ERROR):
 		lines.append(f"{STATUS_EMOJI[status]} {get_text(STATUS_TEXT_KEY[status])}: <b>{counts.get(status, 0)}</b>")
+		if status == TorrentStatus.DOWNLOADING:
+			lines.append(f"🔽 {get_text('STATUS_DOWNLOADING_NOW')}: <b>{summary.downloading}</b>")
+		if status == TorrentStatus.SEEDING:
+			lines.append(f"🔼 {get_text('STATUS_UPLOADING')}: <b>{summary.uploading}</b>")
 	lines.append(f"✅ {get_text('STATUS_COMPLETED')}: <b>{summary.completed}</b>")
 	lines.append("")
 	lines.append(get_text("DASHBOARD_SPEEDS", sizeof_fmt(summary.download_rate), sizeof_fmt(summary.upload_rate)))
@@ -436,13 +489,15 @@ def build_dashboard(refreshing):
 	markup = InlineKeyboardMarkup(row_width=2)
 	filter_buttons = [
 		InlineKeyboardButton(f"📋 {get_text('STATUS_ALL')} ({summary.total})", callback_data=build_call("list", FILTER_ALL, 0)),
+		InlineKeyboardButton(f"✅ {get_text('STATUS_COMPLETED')} ({summary.completed})", callback_data=build_call("list", FILTER_COMPLETED, 0)),
 		InlineKeyboardButton(f"📥 {get_text('STATUS_DOWNLOADING')} ({counts.get(TorrentStatus.DOWNLOADING, 0)})", callback_data=build_call("list", FILTER_DOWNLOADING, 0)),
+		InlineKeyboardButton(f"🔽 {get_text('STATUS_DOWNLOADING_NOW')} ({summary.downloading})", callback_data=build_call("list", FILTER_DOWNLOADING_NOW, 0)),
 		InlineKeyboardButton(f"🌱 {get_text('STATUS_SEEDING')} ({counts.get(TorrentStatus.SEEDING, 0)})", callback_data=build_call("list", FILTER_SEEDING, 0)),
+		InlineKeyboardButton(f"🔼 {get_text('STATUS_UPLOADING')} ({summary.uploading})", callback_data=build_call("list", FILTER_UPLOADING, 0)),
 		InlineKeyboardButton(f"⏸️ {get_text('STATUS_PAUSED')} ({counts.get(TorrentStatus.PAUSED, 0)})", callback_data=build_call("list", FILTER_PAUSED, 0)),
 		InlineKeyboardButton(f"⏳ {get_text('STATUS_QUEUED')} ({counts.get(TorrentStatus.QUEUED, 0)})", callback_data=build_call("list", FILTER_QUEUED, 0)),
 		InlineKeyboardButton(f"🔍 {get_text('STATUS_CHECKING')} ({counts.get(TorrentStatus.CHECKING, 0)})", callback_data=build_call("list", FILTER_CHECKING, 0)),
 		InlineKeyboardButton(f"❌ {get_text('STATUS_ERROR')} ({counts.get(TorrentStatus.ERROR, 0)})", callback_data=build_call("list", FILTER_ERROR, 0)),
-		InlineKeyboardButton(f"✅ {get_text('STATUS_COMPLETED')} ({summary.completed})", callback_data=build_call("list", FILTER_COMPLETED, 0)),
 	]
 	markup.add(*filter_buttons)
 	markup.add(
@@ -542,13 +597,7 @@ def build_list(filter_key, page):
 			callback_data=build_call("info", torrent.id, filter_key, page)))
 
 	if pages > 1:
-		prev_call = build_call("list", filter_key, page - 1) if page > 0 else build_call("noop")
-		next_call = build_call("list", filter_key, page + 1) if page < pages - 1 else build_call("noop")
-		markup.row(
-			InlineKeyboardButton("⬅️", callback_data=prev_call),
-			InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=build_call("noop")),
-			InlineKeyboardButton("➡️", callback_data=next_call),
-		)
+		markup.row(*pagination_row(page, pages, "list", filter_key))
 
 	if total > 0:
 		markup.row(
@@ -588,6 +637,12 @@ def back_close_markup(back_call=None):
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=back_call or build_call("dashboard")),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
 	)
+	return markup
+
+
+def close_markup():
+	markup = InlineKeyboardMarkup()
+	markup.row(InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")))
 	return markup
 
 
@@ -796,13 +851,7 @@ def build_files(ctx_id, torrent_id, filter_key, page, file_page):
 			callback_data=build_call("file", ctx_id, file_page, index)))
 
 	if pages > 1:
-		prev_call = build_call("files", ctx_id, file_page - 1) if file_page > 0 else build_call("noop")
-		next_call = build_call("files", ctx_id, file_page + 1) if file_page < pages - 1 else build_call("noop")
-		markup.row(
-			InlineKeyboardButton("⬅️", callback_data=prev_call),
-			InlineKeyboardButton(f"{file_page + 1}/{pages}", callback_data=build_call("noop")),
-			InlineKeyboardButton("➡️", callback_data=next_call),
-		)
+		markup.row(*pagination_row(file_page, pages, "files", ctx_id))
 
 	plan, _ = build_rename_plan(torrent)
 	if plan:
@@ -917,10 +966,10 @@ def get_known_dirs():
 	return dirs
 
 
-def build_dir_markup(dir_call, write_call, cancel_call, page_call=None, page=0):
+def build_dir_markup(dir_call, write_call, cancel_call, page_parts=None, page=0):
 	"""Keyboard with one button per known dir (paginated) + write path + cancel.
 	dir_call receives the dir_id and must return the callback_data.
-	page_call receives the page number and must return the callback_data"""
+	page_parts is the callback prefix that receives the page as last arg"""
 	markup = InlineKeyboardMarkup(row_width=1)
 	dirs = get_known_dirs()
 	pages = max(1, math.ceil(len(dirs) / MAX_DIR_BUTTONS))
@@ -928,14 +977,8 @@ def build_dir_markup(dir_call, write_call, cancel_call, page_call=None, page=0):
 	start = page * MAX_DIR_BUTTONS
 	for directory in dirs[start:start + MAX_DIR_BUTTONS]:
 		markup.add(InlineKeyboardButton(f"📂 {truncate_dir(directory)}", callback_data=dir_call(get_dir_id(directory))))
-	if pages > 1 and page_call:
-		prev_call = page_call(page - 1) if page > 0 else build_call("noop")
-		next_call = page_call(page + 1) if page < pages - 1 else build_call("noop")
-		markup.row(
-			InlineKeyboardButton("⬅️", callback_data=prev_call),
-			InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=build_call("noop")),
-			InlineKeyboardButton("➡️", callback_data=next_call),
-		)
+	if pages > 1 and page_parts:
+		markup.row(*pagination_row(page, pages, *page_parts))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_WRITE_DIR"), callback_data=write_call))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=cancel_call))
 	return markup
@@ -964,9 +1007,9 @@ def build_settings():
 	auto_dir_label = f"<code>{html.escape(auto_dir)}</code>" if auto_dir else get_text("AUTO_DIR_CLIENT_DEFAULT")
 	lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label))
 
-	def toggle_button(setting_key, text_key):
+	def toggle_button(setting_key, text_key, prefix=""):
 		state = "✅" if bot_settings.get(setting_key) else "❌"
-		return InlineKeyboardButton(f"{state} {get_text(text_key)}", callback_data=build_call("toggleSetting", setting_key))
+		return InlineKeyboardButton(f"{prefix}{state} {get_text(text_key)}", callback_data=build_call("toggleSetting", setting_key))
 
 	markup = InlineKeyboardMarkup(row_width=1)
 	if client.supports_alt_speed:
@@ -981,6 +1024,8 @@ def build_settings():
 	markup.add(toggle_button("notify_errors", "BUTTON_SETTING_NOTIFY_ERRORS"))
 	markup.add(toggle_button("auto_download", "BUTTON_SETTING_AUTO_DOWNLOAD"))
 	markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
+	if bot_settings.get("auto_rename"):
+		markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
 	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_AUTO_DIR"), callback_data=build_call("autoDirMenu", 0)))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_FAV_DIRS"), callback_data=build_call("favDirsMenu")))
@@ -1086,7 +1131,7 @@ def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None,
 		dir_call=lambda dir_id: build_call("addTo", pending_id, dir_id),
 		write_call=build_call("addNewDir", pending_id),
 		cancel_call=build_call("cancelAdd", pending_id),
-		page_call=lambda p: build_call("addDirPage", pending_id, p),
+		page_parts=("addDirPage", pending_id),
 		page=dir_page,
 	)
 	text = get_text("ADD_ASK_DIR", html.escape(name))
@@ -1120,6 +1165,25 @@ def auto_rename_torrent(torrent):
 	return suggested
 
 
+def auto_rename_torrent_files(torrent_id):
+	"""Renames the files inside a folder torrent to their suggested names.
+	Returns the preview of what was renamed, or None when nothing was done"""
+	torrent = client.get_torrent(torrent_id)  # Reread: renaming the torrent changed the file paths
+	if torrent is None or not torrent_is_folder(torrent):
+		return None
+	plan, collisions = build_rename_plan(torrent)
+	if collisions:
+		warning(f"Auto-rename skipped {len(collisions)} file(s) of {torrent.name}: the suggested name is already in use")
+	if not plan:
+		return None
+	done, errors = apply_rename_plan(torrent_id, plan)
+	for message in errors:
+		warning(f"Auto-rename failed for a file of {torrent.name}: {message}")
+	if not done:
+		return None
+	return get_text("ADD_AUTO_RENAMED_FILES", done, build_plan_preview(plan))
+
+
 def deferred_auto_rename(torrent_id, original_name):
 	"""A magnet has no metadata when it is added: the client only knows the
 	name hinted in the link and rejects renaming until the real one arrives.
@@ -1137,11 +1201,14 @@ def deferred_auto_rename(torrent_id, original_name):
 			continue
 		try:
 			renamed = auto_rename_torrent(torrent)
+			files_renamed = auto_rename_torrent_files(torrent_id) if bot_settings.get("auto_rename_files") else None
 		except TorrentClientError as e:
 			warning(f"Auto-rename failed for {torrent.name}: {e}")
 			return
 		if renamed:
 			notify(get_text("NOTIFY_AUTO_RENAMED", html.escape(original_name), html.escape(renamed)))
+		if files_renamed:
+			notify(f"{get_text('NOTIFY_AUTO_RENAMED_FILES', html.escape(renamed or original_name))}\n{files_renamed}")
 		return
 	warning(f"Auto-rename gave up for {original_name}: the metadata never arrived")
 
@@ -1157,6 +1224,10 @@ def perform_add_torrent(pending, download_dir):
 				renamed = auto_rename_torrent(torrent)
 				if renamed:
 					lines.append(get_text("ADD_AUTO_RENAMED", html.escape(renamed)))
+				if bot_settings.get("auto_rename_files"):
+					files_renamed = auto_rename_torrent_files(torrent.id)
+					if files_renamed:
+						lines.append(files_renamed)
 			except TorrentClientError as e:
 				warning(f"Auto-rename failed for {torrent.name}: {e}")
 		else:
@@ -1289,7 +1360,7 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 			dir_call=lambda dir_id: build_call("massMoveDir", filter_key, dir_id),
 			write_call=build_call("massMoveNew", filter_key),
 			cancel_call=back_call,
-			page_call=lambda p: build_call("mass", "move", filter_key, p),
+			page_parts=("mass", "move", filter_key),
 			page=dir_page,
 		)
 	else:
@@ -1360,7 +1431,8 @@ def handle_pending_input(message, pending):
 		delete_message(chat_id, prompt_message_id)
 	delete_message(chat_id, message.message_id)
 
-	back_markup = back_close_markup(pending.get("back_call"))
+	# The paginated message is still on screen, so a "back" button here would duplicate it
+	back_markup = close_markup() if action == "gotoPage" else back_close_markup(pending.get("back_call"))
 
 	if not text or text.lower() in ("/cancel", "cancel", "cancelar"):
 		send_message(chat_id, get_text("INPUT_CANCELLED"), reply_markup=back_markup, thread_id=thread_id)
@@ -1369,6 +1441,16 @@ def handle_pending_input(message, pending):
 	if action == "search":
 		ctx_id = new_search_context(text)
 		render_list(chat_id, None, f"q{ctx_id}", 0, thread_id=thread_id)
+	elif action == "gotoPage":
+		pages = pending["pages"]
+		try:
+			number = int(text)
+		except ValueError:
+			number = 0
+		if number < 1 or number > pages:
+			send_message(chat_id, get_text("GOTO_PAGE_INVALID", pages), reply_markup=back_markup, thread_id=thread_id)
+			return
+		dispatch_callback(chat_id, pending["target_message_id"], message.from_user.id, f"{pending['base']}|{number - 1}")
 	elif action == "rename":
 		if name_already_exists(text, exclude_id=pending["torrent_id"]):
 			send_message(chat_id, get_text("RENAME_DUPLICATE", html.escape(text)), reply_markup=back_markup, thread_id=thread_id)
@@ -1738,10 +1820,7 @@ def handle_callback(call):
 
 	chat_id = call.message.chat.id
 	message_id = call.message.message_id
-	user_id = call.from_user.id
-	parts = call.data.split("|")
-	command = parts[0]
-	args = parts[1:]
+	command = call.data.split("|")[0]
 
 	tooltip = None
 	if command == "cancelInput":
@@ -1754,6 +1833,14 @@ def handle_callback(call):
 		pass
 
 	stop_dashboard(chat_id, message_id)
+	dispatch_callback(chat_id, message_id, call.from_user.id, call.data)
+
+
+def dispatch_callback(chat_id, message_id, user_id, data):
+	"""Runs the action encoded in a callback_data string, editing message_id"""
+	parts = data.split("|")
+	command = parts[0]
+	args = parts[1:]
 
 	try:
 		if command == "noop":
@@ -1919,7 +2006,7 @@ def handle_callback(call):
 					dir_call=lambda dir_id: build_call("moveToDir", nav_ctx, dir_id),
 					write_call=build_call("moveNewDir", nav_ctx),
 					cancel_call=build_call("info", torrent_id, filter_key, page),
-					page_call=lambda p: build_call("move", torrent_id, filter_key, page, p),
+					page_parts=("move", torrent_id, filter_key, page),
 					page=dir_page,
 				)
 				edit_message(chat_id, message_id, get_text("MOVE_ASK_DIR", html.escape(torrent.name)), markup)
@@ -2045,7 +2132,10 @@ def handle_callback(call):
 						back_call=build_call("settings"))
 
 		elif command == "toggleSetting":
-			bot_settings.toggle(args[0])
+			enabled = bot_settings.toggle(args[0])
+			if args[0] == "auto_rename" and not enabled:
+				# The file rename depends on the torrent rename: never leave it active but hidden
+				bot_settings.set("auto_rename_files", False)
 			render_settings(chat_id, message_id)
 
 		elif command == "autoDirMenu":
@@ -2054,7 +2144,7 @@ def handle_callback(call):
 				dir_call=lambda dir_id: build_call("autoDirSet", dir_id),
 				write_call=build_call("autoDirNew"),
 				cancel_call=build_call("settings"),
-				page_call=lambda p: build_call("autoDirMenu", p),
+				page_parts=("autoDirMenu",),
 				page=dir_page,
 			)
 			markup.keyboard.insert(0, [InlineKeyboardButton(get_text("BUTTON_AUTO_DIR_DEFAULT"), callback_data=build_call("autoDirDefault"))])
@@ -2109,6 +2199,15 @@ def handle_callback(call):
 			bot_settings.set("template_season", "")
 			render_templates_menu(chat_id, message_id)
 
+		elif command == "goto":
+			base = get_page_context(args[0])
+			page, pages = int(args[1]), int(args[2])
+			if base is None:
+				edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
+			else:
+				ask_for_input(chat_id, user_id, "gotoPage", get_text("GOTO_PAGE_ASK", pages),
+							back_call=f"{base}|{page}", target_message_id=message_id, base=base, pages=pages)
+
 		elif command == "cancelInput":
 			pending_input = pop_pending_input(chat_id, user_id)
 			back_call = (pending_input or {}).get("back_call")
@@ -2118,14 +2217,14 @@ def handle_callback(call):
 				show_dashboard(chat_id, message_id=message_id)
 
 		else:
-			debug(f"Unknown callback: {call.data}")
+			debug(f"Unknown callback: {data}")
 
 	except TorrentClientError as e:
 		edit_message(chat_id, message_id, get_text("CONNECTION_ERROR", html.escape(str(e))), back_close_markup())
 	except ExpiredContext:
 		edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
 	except Exception as e:
-		error(f"Error handling callback {call.data}: {e}")
+		error(f"Error handling callback {data}: {e}")
 		edit_message(chat_id, message_id, get_text("ERROR_GENERIC", html.escape(str(e))), back_close_markup())
 
 

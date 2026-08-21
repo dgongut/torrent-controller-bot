@@ -29,7 +29,7 @@ Control your torrent client from a single place.
 - ✅ Client settings: turtle mode and upload/download speed limits
 - ✅ Notifications for completed downloads and torrent errors (can be toggled from the settings)
 - ✅ Automatic download without asking for the path, with a configurable directory
-- ✅ Automatic rename when adding a torrent (can be toggled from the settings)
+- ✅ Automatic rename when adding a torrent, optionally including the files it contains (can be toggled from the settings)
 - ✅ Warning if the torrent you add may not fit on the disk
 - ✅ Bot settings persist across restarts (`/config` volume)
 - ✅ Notification to the administrator when the bot starts

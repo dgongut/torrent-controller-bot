@@ -18,6 +18,7 @@ DEFAULTS = {
 	"auto_download": False,
 	"auto_download_dir": "",  # "" = torrent client default dir
 	"auto_rename": False,
+	"auto_rename_files": False,  # Only used when auto_rename is enabled
 	"low_space_warning": True,
 	"favorite_dirs": [],  # Extra dirs offered as buttons when adding/moving torrents
 	"template_movie": "",  # "" = built-in default template

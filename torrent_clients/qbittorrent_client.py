@@ -14,6 +14,7 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	sort_files,
 )
 
 REQUEST_TIMEOUT = 15
@@ -164,16 +165,24 @@ class QBittorrentClient(TorrentClient):
 
 		counts = Counter()
 		completed = 0
+		uploading = 0
+		downloading = 0
 		for t in torrents:
 			counts[STATUS_MAP.get(t.get("state", ""), TorrentStatus.PAUSED)] += 1
 			if float(t.get("progress", 0)) >= 1:
 				completed += 1
+			if int(t.get("upspeed", 0) or 0) > 0:
+				uploading += 1
+			if int(t.get("dlspeed", 0) or 0) > 0:
+				downloading += 1
 
 		server_state = maindata.get("server_state", {})
 		return SessionSummary(
 			counts=dict(counts),
 			total=len(torrents),
 			completed=completed,
+			uploading=uploading,
+			downloading=downloading,
 			download_rate=transfer.get("dl_info_speed", 0),
 			upload_rate=transfer.get("up_info_speed", 0),
 			free_space=server_state.get("free_space_on_disk", -1),
@@ -212,6 +221,7 @@ class QBittorrentClient(TorrentClient):
 			for f in self._get("torrents/files", params={"hash": torrent_id}).json():
 				size = f.get("size", 0)
 				files.append((f.get("name", ""), size, int(size * float(f.get("progress", 0)))))
+			sort_files(files)
 		except TorrentClientError:
 			files = []
 		return self._to_info(t, files=files, trackers=self._tracker_hosts(torrent_id))

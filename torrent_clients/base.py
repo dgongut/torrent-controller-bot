@@ -25,6 +25,13 @@ class TorrentClientError(Exception):
 	pass
 
 
+def sort_files(files):
+	"""Sorts a list of (path, size, completed) alphabetically by path,
+	so files inside a folder keep a predictable order"""
+	files.sort(key=lambda f: f[0].lower())
+	return files
+
+
 @dataclass
 class TorrentInfo:
 	id: str
@@ -57,6 +64,8 @@ class SessionSummary:
 	counts: dict = field(default_factory=dict)  # {TorrentStatus: int}
 	total: int = 0
 	completed: int = 0
+	uploading: int = 0  # torrents actually uploading right now (upload rate > 0)
+	downloading: int = 0  # torrents actually downloading right now (download rate > 0)
 	download_rate: int = 0  # bytes/s
 	upload_rate: int = 0  # bytes/s
 	free_space: int = -1  # bytes, -1 unknown

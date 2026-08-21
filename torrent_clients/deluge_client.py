@@ -14,6 +14,7 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	sort_files,
 )
 
 REQUEST_TIMEOUT = 15
@@ -97,6 +98,7 @@ class DelugeClient(TorrentClient):
 				size = f.get("size", 0)
 				done = progress[i] if i < len(progress) else 0
 				files.append((f.get("path", ""), size, int(size * done)))
+			sort_files(files)
 		trackers = []
 		if full:
 			for tracker in t.get("trackers") or []:
@@ -146,7 +148,7 @@ class DelugeClient(TorrentClient):
 
 	def get_summary(self):
 		try:
-			torrents = self._torrents_status(["state", "progress"])
+			torrents = self._torrents_status(["state", "progress", "upload_payload_rate", "download_payload_rate"])
 			session = self._call(
 				"core.get_session_status", ["payload_download_rate", "payload_upload_rate"]) or {}
 			free_space = self.get_free_space(None)
@@ -155,15 +157,23 @@ class DelugeClient(TorrentClient):
 
 		counts = Counter()
 		completed = 0
+		uploading = 0
+		downloading = 0
 		for t in torrents.values():
 			counts[STATUS_MAP.get(t.get("state", ""), TorrentStatus.PAUSED)] += 1
 			if float(t.get("progress", 0)) >= 100:
 				completed += 1
+			if int(t.get("upload_payload_rate", 0) or 0) > 0:
+				uploading += 1
+			if int(t.get("download_payload_rate", 0) or 0) > 0:
+				downloading += 1
 
 		return SessionSummary(
 			counts=dict(counts),
 			total=len(torrents),
 			completed=completed,
+			uploading=uploading,
+			downloading=downloading,
 			download_rate=int(session.get("payload_download_rate", 0)),
 			upload_rate=int(session.get("payload_upload_rate", 0)),
 			free_space=free_space,

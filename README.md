@@ -29,7 +29,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
 - ✅ Notificaciones de descarga completada y de errores en torrents (activables desde los ajustes)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
-- ✅ Renombrado automático al añadir un torrent (activable desde los ajustes)
+- ✅ Renombrado automático al añadir un torrent, opcionalmente también de los archivos que contiene (activable desde los ajustes)
 - ✅ Aviso si el torrent que añades puede no caber en el disco
 - ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
 - ✅ Notificación al administrador al arrancar el bot
