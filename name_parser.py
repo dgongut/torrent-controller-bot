@@ -105,6 +105,21 @@ _SOURCES = [
 	(re.compile(r'\bWEB\b', re.IGNORECASE), "WEB-DL"),
 ]
 
+# Streaming platform/provider tags. They are metadata, not part of the episode
+# title (Episodio 7.NF.WEB-DL...). Matched only as standalone tokens, so a word
+# containing the same letters (Max, Stan, Crash...) is never touched
+_PLATFORM_TAGS = [
+	"PARAMOUNT", "HULU", "AMZN", "AMZP", "HMAX", "DSNP", "DSNY", "ATVP", "PCOK",
+	"PMTP", "STAN", "VIKI", "CRAV", "STARZ", "APTV", "AVPT", "MVSP", "AMZ",
+	"ATV", "MAX", "PMT", "SHO", "NF", "CR", "iP",
+]
+
+_PLATFORM_TAG_PATTERN = re.compile(
+	r'(?<![A-Za-z0-9])(?:' + "|".join(_PLATFORM_TAGS) + r')(?![A-Za-z0-9])', re.IGNORECASE)
+
+# Separators allowed between a platform tag and the metadata that follows it
+_TAG_SEPARATORS = re.compile(r'[\s._\-\[\]()]*')
+
 _LANGUAGES = [
 	(re.compile(r'\bCastellano\b|\bSpanish\b|\bEspañol\b|\bESP\b', re.IGNORECASE), "Castellano"),
 	(re.compile(r'\bLatino\b', re.IGNORECASE), "Latino"),
@@ -227,6 +242,27 @@ def _extract_episode_title(name, start, limit):
 	if " " not in candidate and re.search(r'\d', candidate):
 		return ""
 	return candidate
+
+
+def _episode_title_limit(name, start, limit):
+	"""Platform tags are metadata as well, so the episode title also ends at
+	the first one found after the episode marker. Only counted when real
+	metadata follows and nothing but separators or further tags sit in
+	between (NF.WEB-DL, AMZN.DSNP.1080p): standing alone at the end of the
+	name they cannot be told apart from a legitimate word"""
+	if limit >= len(name):
+		return limit
+	for match in _PLATFORM_TAG_PATTERN.finditer(name, start, limit):
+		position = match.end()
+		while position < limit:
+			position = _TAG_SEPARATORS.match(name, position, limit).end()
+			following = _PLATFORM_TAG_PATTERN.match(name, position, limit)
+			if not following:
+				break
+			position = following.end()
+		if position >= limit:
+			return match.start()
+	return limit
 
 
 def _clean_title(title_part):
@@ -374,7 +410,8 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 
 	# Whatever sits between the episode marker and the metadata is its title
 	if episode_end is not None and episode_end < meta_start:
-		fields["episode_title"] = _extract_episode_title(name, episode_end, meta_start)
+		fields["episode_title"] = _extract_episode_title(
+			name, episode_end, _episode_title_limit(name, episode_end, meta_start))
 
 	# Year: range (collections) > parentheses > last plain year before the
 	# metadata tags (in "Blade Runner 2049 2017" the release year is 2017)
