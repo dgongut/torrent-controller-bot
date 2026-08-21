@@ -21,7 +21,7 @@ from torrent_clients import TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1023,11 +1023,12 @@ def build_settings():
 	markup.add(toggle_button("notify_completed", "BUTTON_SETTING_NOTIFY_COMPLETED"))
 	markup.add(toggle_button("notify_errors", "BUTTON_SETTING_NOTIFY_ERRORS"))
 	markup.add(toggle_button("auto_download", "BUTTON_SETTING_AUTO_DOWNLOAD"))
+	if bot_settings.get("auto_download"):
+		markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_DIR')}", callback_data=build_call("autoDirMenu", 0)))
 	markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
 	if bot_settings.get("auto_rename"):
 		markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
 	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
-	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_AUTO_DIR"), callback_data=build_call("autoDirMenu", 0)))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_FAV_DIRS"), callback_data=build_call("favDirsMenu")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TEMPLATES"), callback_data=build_call("tplMenu")))
 	markup.row(
@@ -1515,6 +1516,8 @@ def handle_pending_input(message, pending):
 		except TemplateError as e:
 			if e.code == "unknown_field":
 				error_text = get_text("TPL_ERROR_UNKNOWN_FIELD", html.escape(e.detail))
+			elif e.code == "padding_not_allowed":
+				error_text = get_text("TPL_ERROR_PADDING_NOT_ALLOWED", html.escape(e.detail))
 			else:
 				error_text = get_text("TPL_ERROR_INVALID")
 			send_message(chat_id, f"{error_text}\n\n{get_text('TPL_FIELDS_HELP')}", reply_markup=back_markup, thread_id=thread_id)

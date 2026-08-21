@@ -2,10 +2,12 @@
 
 Extracts as much metadata as possible from a release name (title, year,
 season/episode, resolution, HDR, extension, language, codecs, source and
-release group) and renders user-defined templates with two constructs:
-  {field}   required field: if missing, no suggestion is produced
-  [ ... ]   optional block: dropped entirely (literals included) when any
-            field inside it has no value
+release group) and renders user-defined templates with these constructs:
+  {field}    required field: if missing, no suggestion is produced
+  {field.N}  same, but zero-padded to N digits (only 'season' and
+             'episode_number' support this; e.g. {episode.3} -> "007")
+  [ ... ]    optional block: dropped entirely (literals included) when any
+             field inside it has no value
 Field names are accepted both in Spanish and English."""
 
 import re
@@ -409,14 +411,14 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 		season, ep1, ep2 = int(episode_range.group(1)), int(episode_range.group(2)), int(episode_range.group(3))
 		fields["is_series"] = True
 		fields["season"] = str(season)
-		fields["episode_number"] = f"{ep1:02d}-{ep2:02d}"
+		fields["episode_number"] = f"{ep1}-{ep2}"
 		fields["chapter"] = f"{season}x{ep1:02d}-{ep2:02d}"
 		title_end = episode_range.start()
 	elif episode_info:
 		season, episode, start, end = episode_info
 		fields["is_series"] = True
 		fields["season"] = str(season)
-		fields["episode_number"] = f"{episode:02d}"
+		fields["episode_number"] = str(episode)
 		fields["chapter"] = f"{season}x{episode:02d}"
 		title_end = start
 		episode_end = end
@@ -453,7 +455,7 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 		if bare:
 			episode, start, end = bare
 			fields["is_series"] = True
-			fields["episode_number"] = f"{episode:02d}"
+			fields["episode_number"] = str(episode)
 			if fields["season"] and "-" not in fields["season"]:
 				fields["chapter"] = f"{fields['season']}x{episode:02d}"
 			else:
@@ -510,11 +512,21 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 # TEMPLATE ENGINE
 # ---------------------------------------------------------------------------
 
-_TOKEN_PATTERN = re.compile(r'\{([^{}\[\]]+)\}')
+_TOKEN_PATTERN = re.compile(r'\{([^{}\[\].]+)(?:\.(\d+))?\}')
+
+# Fields whose value is a plain number (or a "N-M" range of them) and can
+# therefore be zero-padded with the {field.N} syntax
+_PADDABLE_FIELDS = {"season", "episode_number"}
 
 
 def _resolve_field(raw_name):
 	return FIELD_ALIASES.get(raw_name.strip().lower())
+
+
+def _apply_padding(value, width):
+	"""Zero-pads value to width digits. Handles "N-M" ranges by padding each
+	side independently. Never truncates a longer number"""
+	return "-".join(part.zfill(width) if part.isdigit() else part for part in value.split("-"))
 
 
 def validate_template(template):
@@ -537,10 +549,12 @@ def validate_template(template):
 	if "{" in _TOKEN_PATTERN.sub("", template) or "}" in _TOKEN_PATTERN.sub("", template):
 		raise TemplateError("unbalanced_braces")
 	used = []
-	for raw_name in _TOKEN_PATTERN.findall(template):
+	for raw_name, padding in _TOKEN_PATTERN.findall(template):
 		field = _resolve_field(raw_name)
 		if field is None:
 			raise TemplateError("unknown_field", raw_name.strip())
+		if padding and field not in _PADDABLE_FIELDS:
+			raise TemplateError("padding_not_allowed", raw_name.strip())
 		used.append(field)
 	if not used:
 		raise TemplateError("empty")
@@ -557,6 +571,9 @@ def _render_fragment(fragment, fields):
 		value = fields.get(field, "")
 		if not value:
 			return None
+		padding = match.group(2)
+		if padding:
+			value = _apply_padding(value, int(padding))
 		result += fragment[last:match.start()] + value
 		last = match.end()
 	return result + fragment[last:]
@@ -592,7 +609,7 @@ def render_template(template, fields):
 # ---------------------------------------------------------------------------
 
 DEFAULT_MOVIE_TEMPLATE = "{title} ({year}) - {resolution}[ {hdr}][.{extension}]"
-DEFAULT_SERIES_TEMPLATE = "{season}x{episode} - {title}[ - {resolution}][ {hdr}][.{extension}]"
+DEFAULT_SERIES_TEMPLATE = "{season}x{episode.2} - {title}[ - {resolution}][ {hdr}][.{extension}]"
 DEFAULT_SEASON_PACK_TEMPLATE = "{chapter} - {title}[ - {resolution}][ {hdr}][.{extension}]"
 
 
@@ -683,7 +700,7 @@ def suggest_file_name(filename, parent_name=None, single_video=False, template_m
 			fields["is_series"] = True
 		if not fields["chapter"] and fields["season"] and "-" not in fields["season"]:
 			if fields["episode_number"]:
-				fields["chapter"] = f"{fields['season']}x{fields['episode_number']}"
+				fields["chapter"] = f"{fields['season']}x{int(fields['episode_number']):02d}"
 			else:
 				fields["chapter"] = f"{season_prefix}{fields['season']}"
 

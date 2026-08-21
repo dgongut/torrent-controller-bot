@@ -1,7 +1,7 @@
 """Test battery for name_parser.py. Run with: python3 test_name_parser.py"""
 
 from name_parser import (companion_subtitle_name, parse_metadata, render_template, suggest_file_name,
-						suggest_name, validate_template, TemplateError, _PLATFORM_TAGS)
+						suggest_name, validate_template, TemplateError, _PLATFORM_TAGS, CANONICAL_FIELDS)
 
 FAILED = []
 
@@ -56,12 +56,12 @@ check_fields("Pelicula.2023.BDRemux.EAC3.5.1.Latino.mkv",
 
 # --- Series ----------------------------------------------------------------
 check_fields("Breaking.Bad.S01E03.720p.HDTV.x264.mkv",
-	title="Breaking Bad", chapter="1x03", season="1", episode_number="03",
+	title="Breaking Bad", chapter="1x03", season="1", episode_number="3",
 	resolution="720p", source="HDTV", is_series=True)
 check_fields("La.Casa.de.Papel.3x05.1080p.WEB-DL.Castellano.mkv",
 	title="La Casa de Papel", chapter="3x05", language="Castellano", is_series=True)
-check_fields("Serie Cap.103 HDTV.avi", title="Serie", chapter="1x03", season="1", episode_number="03")
-check_fields("Otra.Serie.Capitulo.1204.mp4", chapter="12x04", season="12", episode_number="04")
+check_fields("Serie Cap.103 HDTV.avi", title="Serie", chapter="1x03", season="1", episode_number="3")
+check_fields("Otra.Serie.Capitulo.1204.mp4", chapter="12x04", season="12", episode_number="4")
 check_fields("Show.Name.S02.Complete.1080p.mkv",
 	title="Show Name", season="2", chapter="T2", episode_number="", is_series=True)
 check_fields("Serie.Temporada.2.Completa.720p.mkv", season="2", chapter="T2", is_series=True)
@@ -89,7 +89,7 @@ check_fields("Star.Wars.Saga.Completa.1977-2019.1080p.BluRay.MULTi.DD5.1.x265-Gr
 check_fields("House.M.D.S01-S08.1080p.BluRay.MULTi.AAC.2.0.x265-GRP",
 	title="House M.D", chapter="T1-T8", season="1-8", audio_codec="AAC 2.0", is_series=True)
 check_fields("The.Boys.S04E01-E08.1080p.AMZN.WEB-DL.DDP5.1.Atmos.HEVC-GRP",
-	title="The Boys", chapter="4x01-08", season="4", episode_number="01-08",
+	title="The Boys", chapter="4x01-08", season="4", episode_number="1-8",
 	audio_codec="EAC3 5.1 Atmos", is_series=True)
 check_fields("The.Office.US.S03E12.1080p.NF.WEB-DL.ENG.ESP.DDP5.1.SUBS.HEVC-GRP",
 	title="The Office US", chapter="3x12", language="Castellano", is_series=True)
@@ -111,12 +111,126 @@ series_fields = parse_metadata("Breaking.Bad.S01E03.720p.HDTV.x264.mkv")
 check("default series template",
 	render_template("{chapter} - {title}[ - {resolution}][ {hdr}][.{extension}]", series_fields),
 	"1x03 - Breaking Bad - 720p.mkv")
-check("episode is number only",
+check("episode without padding is the raw number",
 	render_template("{season}x{episode} - {title}", series_fields),
-	"1x03 - Breaking Bad")
+	"1x3 - Breaking Bad")
 check("spanish series aliases",
 	render_template("{capitulo} - {titulo}.{extension}", series_fields),
 	"1x03 - Breaking Bad.mkv")
+
+# --- Zero-padded season/episode ({field.N}) ----------------------------------
+# Fields used across this whole section
+big_episode_fields = parse_metadata("Show.Name.S12E123.mkv")
+season_range_fields = parse_metadata("House.M.D.S01-S08.1080p.BluRay.MULTi.AAC.2.0.x265-GRP.mkv")
+episode_range_fields = parse_metadata("The.Boys.S04E01-E08.1080p.AMZN.WEB-DL.DDP5.1.Atmos.HEVC-GRP.mkv")
+
+
+def render(template, **fields):
+	"""Shortcut to render_template with a synthetic fields dict, for testing
+	the padding math in isolation without going through parse_metadata"""
+	return render_template(template, fields)
+
+
+# --- Basic padding, single-digit values --------------------------------------
+check("season/episode padding together (spanish aliases)",
+	render_template("{temporada.2}x{episodio.3}", series_fields),
+	"01x003")
+check("season/episode padding together (english aliases)",
+	render_template("{season.2}x{episode.3}", series_fields),
+	"01x003")
+check("episode padding width 1 == natural width",
+	render_template("{episodio.1}", series_fields), "3")
+check("episode padding width 2",
+	render_template("{episodio.2}", series_fields), "03")
+check("episode padding width 3",
+	render_template("{episodio.3}", series_fields), "003")
+check("episode padding width 5",
+	render_template("{episodio.5}", series_fields), "00003")
+check("season padding width 1 == natural width",
+	render_template("{temporada.1}", series_fields), "1")
+check("season padding width 2",
+	render_template("{temporada.2}", series_fields), "01")
+check("season padding width 4",
+	render_template("{temporada.4}", series_fields), "0001")
+check("explicit .2 reproduces the old fixed-width behavior",
+	render_template("{season}x{episode.2} - {title}", series_fields),
+	"1x03 - Breaking Bad")
+
+# --- Padding never truncates a longer number ---------------------------------
+check("episode.1 on a 3-digit episode keeps all digits",
+	render_template("{episodio.1}", big_episode_fields), "123")
+check("episode.2 on a 3-digit episode keeps all digits",
+	render_template("{episodio.2}", big_episode_fields), "123")
+check("episode.3 on a 3-digit episode is a no-op",
+	render_template("{episodio.3}", big_episode_fields), "123")
+check("episode.4 on a 3-digit episode adds one zero",
+	render_template("{episodio.4}", big_episode_fields), "0123")
+check("season.1 on a 2-digit season keeps both digits",
+	render_template("{temporada.1}", big_episode_fields), "12")
+check("season.3 on a 2-digit season adds one zero",
+	render_template("{temporada.3}", big_episode_fields), "012")
+
+# --- Ranges: each side padded independently -----------------------------------
+check("season range, width == natural width is a no-op",
+	render_template("{season.1}", season_range_fields), "1-8")
+check("season range padding width 2",
+	render_template("{season.2}", season_range_fields), "01-08")
+check("season range padding width 3",
+	render_template("{season.3}", season_range_fields), "001-008")
+check("episode range, width == natural width is a no-op",
+	render_template("{episode.1}", episode_range_fields), "1-8")
+check("episode range padding width 2",
+	render_template("{episode.2}", episode_range_fields), "01-08")
+check("episode range padding width 3",
+	render_template("{episode.3}", episode_range_fields), "001-008")
+check("chapter built from a padded range keeps the fixed 2-digit width",
+	render_template("{chapter}", episode_range_fields), "4x01-08")
+
+# --- Synthetic edge cases (bypass parse_metadata entirely) --------------------
+check("uneven range widths are padded independently",
+	render("{season.3}", season="1-12"), "001-012")
+check("uneven range widths, smaller target width",
+	render("{season.2}", season="1-12"), "01-12")
+check("padding width 0 is a no-op",
+	render("{episode.0}", episode_number="7"), "7")
+check("missing required paddable field still yields None",
+	render("{season.2}", season=""), None)
+check("same field rendered twice with the same width",
+	render("{episode.2}-{episode.2}", episode_number="5"), "05-05")
+check("same field rendered twice with different widths",
+	render("{episode.1}-{episode.3}", episode_number="5"), "5-005")
+check("field name with stray whitespace still resolves with padding",
+	render("{ temporada .3}", season="1"), "001")
+check("field name is case-insensitive with padding",
+	render("{TEMPORADA.2}", season="1"), "01")
+check("large padding width",
+	render("{episode.10}", episode_number="7"), "0000000007")
+
+# --- Padding inside optional blocks -------------------------------------------
+check("padded field present inside an optional block",
+	render_template("{title}[ - {episode.3}]", series_fields),
+	"Breaking Bad - 003")
+check("padded field absent drops the whole optional block",
+	render_template("{title}[ - {episode.3}]", movie_fields),
+	"Minions and Monsters")
+
+# --- End-to-end through suggest_name / suggest_file_name ----------------------
+check("suggest_name with padded custom template",
+	suggest_name("Breaking.Bad.S01E03.720p.HDTV.x264.mkv",
+		template_series="{season.2}x{episode.3} - {title}[ - {resolution}][.{extension}]"),
+	"01x003 - Breaking Bad - 720p.mkv")
+check("suggest_file_name: bare episode inside a season pack, padded",
+	suggest_file_name("01.mkv", parent_name="Show.Name.S02.Complete.1080p.WEB-DL",
+		template_series="{season.3}x{episode.3} - {title}[ - {resolution}][.{extension}]"),
+	"002x001 - Show Name - 1080p.mkv")
+check("suggest_name with padded episode range",
+	suggest_name("The.Boys.S04E01-E08.1080p.AMZN.WEB-DL.DDP5.1.Atmos.HEVC-GRP.mkv",
+		template_series="{season}x{episode.3} - {title}"),
+	"4x001-008 - The Boys")
+check("suggest_name with padded season-only pack",
+	suggest_name("House.M.D.S01-S08.1080p.BluRay.MULTi.AAC.2.0.x265-GRP.mkv",
+		template_season="{season.2} - {title}"),
+	"01-08 - House M.D")
 
 # Required field missing -> None
 no_year = parse_metadata("Movie.Without.Year.1080p.mkv")
@@ -129,13 +243,44 @@ check("optional hdr dropped",
 # --- Template validation ----------------------------------------------------
 for bad, code in [("{title} [unclosed", "unbalanced_brackets"), ("{title} ]bad[", "unbalanced_brackets"),
 					("{title} {bad_field}", "unknown_field"), ("no fields at all", "empty"),
-					("", "empty"), ("{title} {year", "unbalanced_braces")]:
+					("", "empty"), ("{title} {year", "unbalanced_braces"),
+					("{title.3}", "padding_not_allowed"), ("{chapter.2}", "padding_not_allowed"),
+					# Malformed padding syntax: no digit after the dot, a
+					# negative number, or two dots. None of these fully match
+					# a token, so they surface as unbalanced/stray braces
+					("{episodio.}", "unbalanced_braces"), ("{episodio.-1}", "unbalanced_braces"),
+					("{episodio.1.2}", "unbalanced_braces")]:
 	try:
 		validate_template(bad)
 		check(f"validate({bad!r}) should fail", "no error", code)
 	except TemplateError as e:
 		check(f"validate({bad!r}) error code", e.code, code)
 check("validate ok", validate_template("{titulo} ({año})[ {hdr}]"), ["title", "year", "hdr"])
+check("validate ok with padding (spanish)",
+	validate_template("{temporada.2}x{episodio.3}"), ["season", "episode_number"])
+check("validate ok with padding (english)",
+	validate_template("{season.2}x{episode.3}"), ["season", "episode_number"])
+check("validate ok, canonical episode_number alias with padding",
+	validate_template("{episode_number.2}"), ["episode_number"])
+
+# Systematically confirm padding is rejected on every field except season and
+# episode_number -- if a future field is added to CANONICAL_FIELDS without
+# updating _PADDABLE_FIELDS this loop will pass it silently instead of raising,
+# which is the failure mode we most want to catch here
+_PADDABLE = {"season", "episode_number"}
+for field in sorted(CANONICAL_FIELDS - _PADDABLE):
+	try:
+		validate_template("{" + field + ".2}")
+		check(f"padding on {{{field}.2}} should be rejected", "no error", "padding_not_allowed")
+	except TemplateError as e:
+		check(f"padding on {{{field}.2}} error code", e.code, "padding_not_allowed")
+		check(f"padding on {{{field}.2}} error detail", e.detail, field)
+# ...and confirm both paddable fields are actually accepted (the loop above
+# would stay green even if _PADDABLE_FIELDS were accidentally emptied)
+for field in sorted(_PADDABLE):
+	check(f"padding on {{{field}.2}} is accepted",
+		validate_template("{" + field + ".2}"), [field])
+check("validate ok with padding", validate_template("{temporada.2}x{episodio.3}"), ["season", "episode_number"])
 
 # --- suggest_name high level -------------------------------------------------
 check("suggest movie", suggest_name("The.Matrix.1999.1080p.BluRay.x264-GROUP.mkv"),
@@ -263,10 +408,10 @@ for alias, expected in [("FullHD", "1080p"), ("FHD", "1080p"), ("HD", "HD"), ("m
 
 check("platform tag out of the rendered episode title",
 	suggest_name("Estafadores.de.Tokio.2024.S01E07.Episodio 7.NF.WEB-DL.1080P.ESP.JAP.EAC3 5.1.SUB-Txv2.mkv",
-		template_series="{season}x{episode} - {title} - {episode_title}[.{extension}]"),
+		template_series="{season}x{episode.2} - {title} - {episode_title}[.{extension}]"),
 	"1x07 - Estafadores de Tokio - Episodio 7.mkv")
 
-EPISODE_TITLE_TEMPLATE = "{season}x{episode} - {title}[ - {episode_title}][.{extension}]"
+EPISODE_TITLE_TEMPLATE = "{season}x{episode.2} - {title}[ - {episode_title}][.{extension}]"
 # Bare episodes inside a season pack keep the title of the episode
 check("bare episode keeps its title",
 	suggest_file_name("E1 - Death Has a Shadow.mkv", parent_name="Family Guy - S1",
@@ -301,7 +446,7 @@ check("already renamed file is left alone",
 check("series name prefix dropped from the episode title",
 	suggest_file_name("13x05 - La que se avecina - El titulo.mkv",
 		parent_name="La que se avecina - Temporada 13",
-		template_series="{season}x{episode}. {title}[ - {episode_title}][.{extension}]"),
+		template_series="{season}x{episode.2}. {title}[ - {episode_title}][.{extension}]"),
 	"13x05. La que se avecina - El titulo.mkv")
 # A title that merely starts with the series name keeps its own text
 check("episode title starting like the series is kept",

@@ -85,8 +85,26 @@ From a torrent's detail, the 🗂️ Files button lists the files it contains an
 The `{episode_title}` field picks up the text that follows the episode marker, so `Family.Guy.S01E01.Death.Has.a.Shadow.1080p.mkv` keeps `Death Has a Shadow`. Not every episode carries one, so it is best used inside brackets:
 
 ```
-{season}x{episode} - {title}[ - {episode_title}][.{extension}]
+{season}x{episode.2} - {title}[ - {episode_title}][.{extension}]
 ```
+
+### Zero-padding
+
+`{season}` and `{episode}` accept a `.N` suffix that pads the number with zeros up to **N digits in total**, so seasons and episodes line up:
+
+| Template | Season 1, episode 7 |
+|---|---|
+| `{season}x{episode}` | `1x7` |
+| `{season}x{episode.2}` | `1x07` |
+| `{season.2}x{episode.2}` | `01x07` |
+| `{season.2}x{episode.3}` | `01x007` |
+
+Things to keep in mind:
+
+- The number is **never truncated**: with `{episode.2}`, episode 123 stays `123`.
+- Ranges are padded on each side, so `S01-S08` with `{season.2}` gives `01-08`.
+- It only works on `{season}` and `{episode}`; on any other field the bot rejects the template.
+- `{chapter}` is unaffected: it always keeps its two-digit format (`1x03`, `T2`).
 
 ## Configuration via Docker Compose variables
 

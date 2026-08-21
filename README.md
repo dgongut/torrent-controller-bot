@@ -86,8 +86,26 @@ Desde el detalle de un torrent, el botón 🗂️ Archivos lista los ficheros qu
 El campo `{titulo_episodio}` recoge el texto que va después del marcador de episodio, así que `Family.Guy.S01E01.Death.Has.a.Shadow.1080p.mkv` conserva `Death Has a Shadow`. No todos los episodios lo traen, por lo que conviene usarlo siempre entre corchetes:
 
 ```
-{temporada}x{episodio} - {titulo}[ - {titulo_episodio}][.{extension}]
+{temporada}x{episodio.2} - {titulo}[ - {titulo_episodio}][.{extension}]
 ```
+
+### Relleno con ceros
+
+`{temporada}` y `{episodio}` admiten un sufijo `.N` que rellena el número con ceros hasta **N dígitos en total**, para que las temporadas y los episodios queden alineados:
+
+| Plantilla | Temporada 1, episodio 7 |
+|---|---|
+| `{temporada}x{episodio}` | `1x7` |
+| `{temporada}x{episodio.2}` | `1x07` |
+| `{temporada.2}x{episodio.2}` | `01x07` |
+| `{temporada.2}x{episodio.3}` | `01x007` |
+
+Detalles a tener en cuenta:
+
+- El número **nunca se recorta**: con `{episodio.2}`, el episodio 123 sigue siendo `123`.
+- En rangos se rellena cada lado por separado, así que `S01-S08` con `{temporada.2}` da `01-08`.
+- Solo funciona en `{temporada}` y `{episodio}`; en cualquier otro campo el bot rechaza la plantilla.
+- `{capitulo}` no se ve afectado: mantiene siempre su formato de dos dígitos (`1x03`, `T2`).
 
 ## Configuración en las variables del Docker Compose
 
