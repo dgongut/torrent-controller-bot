@@ -206,9 +206,6 @@ tempCodeRunnerFile.py
 # Local bot settings (mapped to /config in docker-compose.local.yaml)
 config/
 
-# Local dev tests
-test_name_parser.py
-
 # Ruff stuff:
 .ruff_cache/
 

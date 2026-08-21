@@ -45,6 +45,11 @@ SEASON_ONLY_PATTERNS = [
 _EPISODE_RANGE_PATTERN = re.compile(r'[Ss](\d{1,2})[\s._-]?[Ee](\d{1,3})[\s._-]?-[\s._-]?[Ee]?(\d{1,3})(?![\dpP])')
 _SEASON_RANGE_PATTERN = re.compile(r'\b[Ss](\d{1,2})[\s._-]?-[\s._-]?[Ss](\d{1,2})\b')
 
+# 'Cap.1984': four digits that look like a year. On their own they are still a
+# valid chapter (1901 is season 19, episode 01), so they only count as junk
+# when the name already carries a year somewhere else
+_CHAPTER_YEAR = re.compile(r'[\s._-][Cc]ap(?:[íi]tulo)?[\s._-]?(19|20)\d{2}(?!\d)')
+
 # Year ranges for collections/trilogies: 1977-2019, 2006.-.2016
 _YEAR_RANGE = re.compile(r'(?<!\d)((19|20)\d{2})[\s._]*-[\s._]*((19|20)\d{2})(?!\d)')
 _YEAR_PLAIN = re.compile(r'[\s._-]((19|20)\d{2})(?=[\s._-]|$)')
@@ -60,7 +65,10 @@ _RESOLUTION_PATTERNS = [
 	(re.compile(r'1080([pi])', re.IGNORECASE), "1080{0}"),
 	(re.compile(r'720([pi])', re.IGNORECASE), "720{0}"),
 	(re.compile(r'480([pi])', re.IGNORECASE), "480{0}"),
+	(re.compile(r'(?<![A-Za-z0-9])(?:Full[\s._-]?HD|FHD)(?![A-Za-z])', re.IGNORECASE), "1080p"),
 	(re.compile(r'\bmHD\b', re.IGNORECASE), "mHD"),
+	# Bare HD: not part of TrueHD/DTS-HD/HDTV/HDR nor of the aliases above
+	(re.compile(r'(?<![A-Za-z0-9])(?<!DTS[\s._-])(?<!True[\s._-])HD(?![A-Za-z])', re.IGNORECASE), "HD"),
 ]
 
 _HDR_PATTERN = re.compile(r'\bHDR10\+?|\bHDR\b|Dolby[\s._-]?Vision\b|\bDoVi\b|\bDV\b')
@@ -109,9 +117,18 @@ _SOURCES = [
 # title (Episodio 7.NF.WEB-DL...). Matched only as standalone tokens, so a word
 # containing the same letters (Max, Stan, Crash...) is never touched
 _PLATFORM_TAGS = [
-	"PARAMOUNT", "HULU", "AMZN", "AMZP", "HMAX", "DSNP", "DSNY", "ATVP", "PCOK",
-	"PMTP", "STAN", "VIKI", "CRAV", "STARZ", "APTV", "AVPT", "MVSP", "AMZ",
-	"ATV", "MAX", "PMT", "SHO", "NF", "CR", "iP",
+	"ATRESPLAYER", "PARAMOUNT", "MOVISTAR", "SONYLIV", "BGLOBAL",
+	"HIDIVE", "KOCOWA", "ANPLUS", "MITELE", "FILMIN", "10PLAY",
+	"STARZ", "TVING", "WAVVE", "JIOHS", "ATRES", "PLAYZ", "SKYST",
+	"HULU", "AMZN", "AMZP", "HMAX", "DSNP", "DSNY", "ATVP", "PCOK", "PMTP",
+	"STAN", "VIKI", "CRAV", "APTV", "AVPT", "MVSP", "NFLX", "HBOM", "PEAC",
+	"DSCP", "MUBI", "TUBI", "ROKU", "PLEX", "CRKL", "EPIX", "BRAV", "ITVX",
+	"ALL4", "UKTV", "FUNI", "WETV", "CPNG", "HTSR", "ZEE5", "RTVE", "FLMN",
+	"SKST", "GLBP", "AUBC", "9NOW",
+	"MITL",
+	"AMZ", "ATV", "MAX", "PMT", "SHO", "MGM", "LGP", "STZ", "ITV", "MY5",
+	"BBC", "RTE", "VRV", "WKN", "VIU", "VIX", "CBC", "4OD",
+	"NF", "CR", "iP",
 ]
 
 _PLATFORM_TAG_PATTERN = re.compile(
@@ -194,11 +211,31 @@ def _split_extension(filename):
 	return filename, ""
 
 
-def _find_episode(name):
-	"""Returns (season, episode, match_start, match_end) or None"""
+def _find_chapter_year(name):
+	"""Returns the 'Cap.<year>' match when its digits are junk rather than a
+	chapter: only when the name carries another year outside of it, which is
+	what tells 'Viernes 13 ... 1985 capitulo 1984' from 'Serie Capitulo 1901'"""
+	match = _CHAPTER_YEAR.search(name)
+	if not match:
+		return None
+	for year in _YEAR_PLAIN.finditer(name):
+		if year.start() >= match.end() or year.end() <= match.start():
+			return match
+	return None
+
+
+def _find_episode(name, skip_span=None):
+	"""Returns (season, episode, match_start, match_end) or None. skip_span is
+	a region of the name that must not be read as an episode marker"""
 	for i, pattern in enumerate(EPISODE_PATTERNS):
-		match = pattern.search(name)
-		if match:
+		position = 0
+		while True:
+			match = pattern.search(name, position)
+			if not match:
+				break
+			if skip_span and match.start() < skip_span[1] and match.end() > skip_span[0]:
+				position = match.start() + 1
+				continue
 			if i == 2:  # Cap.NNN(N): last two digits are the episode
 				digits = match.group(1)
 				season = int(digits[:-2]) if len(digits) > 2 else 1
@@ -272,8 +309,9 @@ def _clean_title(title_part):
 	# Replace underscores with spaces
 	title = re.sub(r'_', ' ', title)
 
-	# Preserve dots in acronyms (J.F.K.) and numbers (20.000)
-	title = re.sub(r'([A-Z])\.(?=[A-Z])', r'\1§PUNTO§', title)
+	# Preserve dots in acronyms (J.F.K.) and numbers (20.000). Every letter of
+	# an acronym stands alone, so 'Parte V.Un nuevo' is just a word separator
+	title = re.sub(r'([A-Z])\.(?=[A-Z](?:[\s._-]|$))', r'\1§PUNTO§', title)
 	title = re.sub(r'(\d)\.(?=\d)', r'\1§PUNTO§', title)
 
 	# Replace remaining dots (word separators) with spaces
@@ -362,8 +400,10 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	# Episode/season detection determines the title boundary
 	title_end = len(name)
 	episode_end = None
+	episode_span = None
 	episode_range = _EPISODE_RANGE_PATTERN.search(name)
-	episode_info = _find_episode(name)
+	chapter_year = _find_chapter_year(name)
+	episode_info = _find_episode(name, chapter_year.span() if chapter_year else None)
 	season_range = _SEASON_RANGE_PATTERN.search(name)
 	if episode_range:
 		season, ep1, ep2 = int(episode_range.group(1)), int(episode_range.group(2)), int(episode_range.group(3))
@@ -380,6 +420,7 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 		fields["chapter"] = f"{season}x{episode:02d}"
 		title_end = start
 		episode_end = end
+		episode_span = (start, end)
 	elif season_range:
 		s1, s2 = int(season_range.group(1)), int(season_range.group(2))
 		fields["is_series"] = True
@@ -426,6 +467,14 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 		fields["episode_title"] = _extract_episode_title(
 			name, episode_end, _episode_title_limit(name, episode_end, meta_start))
 
+	# A junk 'Cap.1984' is neither a chapter nor the release year, but it does
+	# end the title: everything from it on is junk
+	if chapter_year:
+		if chapter_year.start() < title_end:
+			title_end = chapter_year.start()
+		if chapter_year.start() < meta_start:
+			meta_start = chapter_year.start()
+
 	# Year: range (collections) > parentheses > last plain year before the
 	# metadata tags (in "Blade Runner 2049 2017" the release year is 2017)
 	year_range = _YEAR_RANGE.search(name)
@@ -436,7 +485,9 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	else:
 		year_match = re.search(r'\((19|20)\d{2}', name)
 		if not year_match:
-			plain_years = [m for m in _YEAR_PLAIN.finditer(name)]
+			# 'Capitulo.1901' is season 19, episode 01: those digits are not a year
+			plain_years = [m for m in _YEAR_PLAIN.finditer(name)
+				if not (episode_span and m.start() < episode_span[1] and m.end() > episode_span[0])]
 			before_meta = [m for m in plain_years if m.start() <= meta_start]
 			year_match = before_meta[-1] if before_meta else (plain_years[0] if plain_years else None)
 		if year_match:
@@ -553,6 +604,29 @@ def _pick_template(fields, template_movie, template_series, template_season):
 	return template_movie or DEFAULT_MOVIE_TEMPLATE
 
 
+def _comparable(text):
+	return re.sub(r'[^a-z0-9]', '', text.lower())
+
+
+def _drop_series_title_from_episode_title(fields):
+	"""Files already named after the series ('2x01 - Succession [x265]') leave
+	the series name where the episode title should be, and files renamed twice
+	repeat it as a prefix ('13x05 - Serie - El titulo'). Neither is a title"""
+	title = fields["title"]
+	episode_title = fields["episode_title"]
+	if not title or not episode_title:
+		return
+	if _comparable(episode_title) == _comparable(title):
+		fields["episode_title"] = ""
+		return
+	# Only a dash tells the repeated series name apart from an episode title
+	# that merely begins with the same words ('Succession Day')
+	if episode_title[:len(title)].lower() == title.lower():
+		remainder = re.sub(r'^\s*[-–]\s*', '', episode_title[len(title):])
+		if remainder and remainder != episode_title[len(title):]:
+			fields["episode_title"] = remainder.strip()
+
+
 def _render(template, fields, filename):
 	try:
 		suggested = render_template(template, fields)
@@ -569,6 +643,7 @@ def suggest_name(filename, template_movie=None, template_series=None, template_s
 	movie otherwise. Returns the suggested name or None when a required field
 	is missing or the result equals the original name"""
 	fields = parse_metadata(filename, season_prefix=season_prefix)
+	_drop_series_title_from_episode_title(fields)
 	template = _pick_template(fields, template_movie, template_series, template_season)
 	return _render(template, fields, filename)
 
@@ -611,6 +686,8 @@ def suggest_file_name(filename, parent_name=None, single_video=False, template_m
 				fields["chapter"] = f"{fields['season']}x{fields['episode_number']}"
 			else:
 				fields["chapter"] = f"{season_prefix}{fields['season']}"
+
+	_drop_series_title_from_episode_title(fields)
 
 	if fields["is_series"]:
 		# Every file needs its own episode, otherwise all of them would
