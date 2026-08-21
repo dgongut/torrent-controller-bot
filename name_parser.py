@@ -285,8 +285,21 @@ def _clean_title(title_part):
 	# Collapse multiple spaces
 	title = re.sub(r'\s+', ' ', title).strip()
 
-	# Remove trailing opening parenthesis and leftover separators
-	title = re.sub(r'\s*\(\s*$', '', title).strip()
+	# Drop an unclosed parenthesis group and whatever follows it: cutting at
+	# the first metadata token can leave one behind ('(HD' out of '(HD 1080p)')
+	depth = 0
+	opener = -1
+	for index, char in enumerate(title):
+		if char == "(":
+			if depth == 0:
+				opener = index
+			depth += 1
+		elif char == ")" and depth:
+			depth -= 1
+	if depth:
+		title = title[:opener]
+
+	# Remove leftover separators
 	title = re.sub(r'[\s\-–_.]+$', '', title).strip()
 	return title
 
