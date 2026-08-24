@@ -1,6 +1,7 @@
 """qBittorrent implementation of the TorrentClient interface (Web API v2)"""
 
 import json
+import re
 import time
 import uuid
 from collections import Counter
@@ -21,6 +22,8 @@ from torrent_clients.base import (
 REQUEST_TIMEOUT = 15
 MOVE_RPC_TIMEOUT = 60
 ETA_INFINITE = 8640000
+TEMP_TAG_PREFIX = "tcb-"
+TEMP_TAG_RE = re.compile(rf"^{TEMP_TAG_PREFIX}[0-9a-f]{{8}}$")
 
 STATUS_MAP = {
 	"downloading": TorrentStatus.DOWNLOADING,
@@ -53,6 +56,7 @@ class QBittorrentClient(TorrentClient):
 		self.password = password or ""
 		self.session = requests.Session()
 		self._login()
+		self._purge_temp_tags()
 
 	def _login(self):
 		try:
@@ -228,7 +232,7 @@ class QBittorrentClient(TorrentClient):
 		return self._to_info(t, files=files, trackers=self._tracker_hosts(torrent_id))
 
 	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None):
-		tag = f"tcb-{uuid.uuid4().hex[:8]}"  # Unique tag to find the new hash
+		tag = f"{TEMP_TAG_PREFIX}{uuid.uuid4().hex[:8]}"  # Unique tag to find the new hash
 		data = {"tags": tag}
 		if download_dir:
 			data["savepath"] = download_dir
@@ -250,12 +254,32 @@ class QBittorrentClient(TorrentClient):
 				time.sleep(0.5)
 			if not torrent_hash:
 				raise TorrentClientError("Torrent added but not found (duplicate?)")
-			self._post("torrents/removeTags", data={"hashes": torrent_hash, "tags": tag})
 			return self.get_torrent(torrent_hash)
 		except TorrentClientError:
 			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error adding torrent: {e}")
+		finally:
+			# deleteTags (not removeTags) so the tag also disappears from
+			# qBittorrent's global tag list instead of piling up there
+			self._delete_tags([tag])
+
+	def _delete_tags(self, tags):
+		if not tags:
+			return
+		try:
+			self._post("torrents/deleteTags", data={"tags": ",".join(tags)})
+		except Exception:
+			pass  # Cleaning up temporary tags must never break the operation
+
+	def _purge_temp_tags(self):
+		"""Delete leftover temporary tags from previous runs (older versions
+		only removed them from the torrent, so they stayed in the tag list)"""
+		try:
+			tags = self._get("torrents/tags").json()
+		except Exception:
+			return
+		self._delete_tags([t for t in tags if TEMP_TAG_RE.match(t)])
 
 	def remove_torrents(self, torrent_ids, delete_data=False):
 		try:
