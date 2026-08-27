@@ -37,7 +37,7 @@ Control your torrent client from a single place.
 - ✅ Multi-arch image (amd64, arm64, armv7…) compatible with Raspberry Pi, NAS and standard servers
 - ✅ Language support (Spanish, English)
 
-It currently supports **Transmission**, **qBittorrent** and **Deluge** as torrent clients. The internal architecture is client-agnostic, so more clients may be added in the future.
+It currently supports **Transmission**, **qBittorrent**, **Deluge** and **Synology Download Station** as torrent clients. The internal architecture is client-agnostic, so more clients may be added in the future. Their APIs do not all offer the same operations: the detail is in [what the bot can do with each client](#what-the-bot-can-do-with-each-client).
 
 Looking for it on [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/torrent-controller-bot)?
 
@@ -106,6 +106,52 @@ Things to keep in mind:
 - It only works on `{season}` and `{episode}`; on any other field the bot rejects the template.
 - `{chapter}` is unaffected: it always keeps its two-digit format (`1x03`, `T2`).
 
+## What the bot can do with each client
+
+The architecture of the bot is client-agnostic, but their APIs do not offer the same operations. The bot **hides the buttons** for whatever the configured client cannot do, so you never see options that would fail.
+
+| | Transmission | qBittorrent | Deluge | Download Station |
+|:---|:---:|:---:|:---:|:---:|
+| Add by magnet or `.torrent` | ✅ | ✅ | ✅ | ✅ |
+| Pause and resume | ✅ | ✅ | ✅ | ✅ |
+| Listings, search and filters | ✅ | ✅ | ✅ | ✅ |
+| Filter by tracker | ✅ | ✅ | ✅ | ✅ |
+| Mass actions | ✅ | ✅ | ✅ | ✅ |
+| Completed and error notifications | ✅ | ✅ | ✅ | ✅ |
+| Move the data to another folder | ✅ | ✅ | ✅ | ✅ |
+| Delete the torrent along with its data | ✅ | ✅ | ✅ | ✅ |
+| Free space and low disk warning | ✅ | ✅ | ✅ | ✅ |
+| Speed limits | ✅ | ✅ | ✅ | ✅ |
+| Alternative speed (turtle mode) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
+| Verify the data | ✅ | ✅ | ✅ | ❌ ² |
+| Smart, manual and automatic renaming | ✅ | ✅ | ✅ | ❌ ³ |
+
+¹ Neither Deluge nor Download Station has an alternative speed mode. Regular speed limits do work on both.
+
+² Download Station exposes no way to re-check the data of a task.
+
+³ The Download Station API has no field for the name of a task or of the files it contains: the only editable thing about a task is its destination. The content can be renamed on disk with File Station, but then the task no longer finds its files and breaks on the next check DSM makes (a reboot of the NAS, of the package, or a pause and resume), so the bot does not do it. It is the same limitation the DSM interface itself has, where a download cannot be renamed either.
+
+## Synology Download Station
+
+To use Download Station (`TORRENT_CLIENT=download_station`) the bot talks to the DSM web API with a NAS user, the same kind of account you use to log in to DSM. The recommended setup is to **create a user dedicated to the bot**:
+
+1. In DSM, go to `Control Panel` → `User & Group` → `Create`.
+2. Give it a password and **do not enable two step verification** on it: the login API rejects the account without a TOTP code and the bot will not be able to start.
+3. In the application permissions, grant it access to **Download Station** and to **File Station**. File Station is used to move data, to delete it, to create destination folders that do not exist yet and to read the free space, things the Download Station API cannot do.
+4. It does not need to be an administrator, nor to have write access to any shared folder other than the download ones.
+
+Those credentials go into `TORRENT_CLIENT_USER` and `TORRENT_CLIENT_PASSWORD`. The port is the DSM one: 5000 over http or 5001 over https (set `TORRENT_CLIENT_PROTOCOL=https` if you use 5001).
+
+> [!NOTE]
+> Download Station download paths are relative to the shared folder, not absolute: they are written as `Downloads` or `video/movies`, not `/volume1/Downloads`. The bot creates the folder you type if it does not exist yet, unless it is a shared folder, which can only be created from DSM.
+
+> [!NOTE]
+> The bot lists **every** Download Station task, including the HTTP or FTP downloads you added from DSM. For those, Download Station considers the download closed as soon as it ends and no longer allows changing its destination: if you try to move one, the bot says so and leaves the files alone.
+
+> [!NOTE]
+> Moving a torrent that is seeding leaves it waiting for a few seconds and runs a quick check before it seeds again. That is how DSM behaves when its destination changes, not an error.
+
 ## Configuration via Docker Compose variables
 
 | KEY  | MANDATORY | VALUE |
@@ -116,13 +162,13 @@ Things to keep in mind:
 |TELEGRAM_THREAD |❌| Topic thread inside a supergroup; numeric value (2,3,4..). Default 1. Used together with the TELEGRAM_GROUP variable |
 |TZ |✅| Timezone (e.g. Europe/Madrid) |
 |LANGUAGE |❌| Language, can be ES / EN. Default ES (Spanish) |
-|TORRENT_CLIENT |❌| Torrent client: `transmission`, `qbittorrent` or `deluge`. Default transmission |
+|TORRENT_CLIENT |❌| Torrent client: `transmission`, `qbittorrent`, `deluge` or `download_station`. Default transmission |
 |TORRENT_CLIENT_HOST |✅| Host or IP where the torrent client is running |
-|TORRENT_CLIENT_PORT |❌| Torrent client port. Default 9091 (Transmission), 8080 (qBittorrent) or 8112 (Deluge Web UI) |
+|TORRENT_CLIENT_PORT |❌| Torrent client port. Default 9091 (Transmission), 8080 (qBittorrent), 8112 (Deluge Web UI) or 5000/5001 (Synology DSM) |
 |TORRENT_CLIENT_USER |❌| Torrent client user, if it has authentication |
 |TORRENT_CLIENT_PASSWORD |❌| Torrent client password, if it has authentication |
 |TORRENT_CLIENT_PROTOCOL |❌| Connection protocol, http or https. Default http |
-|TORRENT_CLIENT_RPC_PATH |❌| RPC path. Default /transmission/rpc (Transmission) |
+|TORRENT_CLIENT_RPC_PATH |❌| RPC path. Default /transmission/rpc (Transmission) or /webapi (Synology) |
 |TORRENTS_PER_PAGE |❌| Number of torrents per page in the lists. Default 10 |
 |DASHBOARD_REFRESH_SECONDS |❌| Seconds between automatic dashboard refreshes. Default 2 |
 |DASHBOARD_REFRESH_DURATION |❌| Seconds the automatic dashboard refresh lasts. Default 60 |
@@ -190,6 +236,7 @@ torrent-controller-bot/
     │   ├── deluge_client.py
     │   ├── factory.py
     │   ├── qbittorrent_client.py
+    │   ├── synology_client.py
     │   └── transmission_client.py
     └── locale
         ├── en.json

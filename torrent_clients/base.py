@@ -25,6 +25,13 @@ class TorrentClientError(Exception):
 	pass
 
 
+class PermanentTorrentError(TorrentClientError):
+	"""Failure that retrying cannot fix, because the torrent manager will not
+	do what was asked no matter how many times it is told. Callers that retry
+	on TorrentClientError have to give up on this one right away"""
+	pass
+
+
 def sort_files(files):
 	"""Sorts a list of (path, size, completed) alphabetically by path,
 	so files inside a folder keep a predictable order"""
@@ -92,7 +99,11 @@ class SessionSummary:
 class TorrentClient(ABC):
 	"""Interface that every torrent manager implementation must fulfill"""
 
+	# Capabilities: implementations that lack a feature switch it off and the bot
+	# hides the buttons that would use it
 	supports_alt_speed = True  # Clients without a turtle mode set this to False
+	supports_rename = True  # Clients that cannot rename the content on disk
+	supports_verify = True  # Clients that cannot recheck the downloaded data
 
 	@abstractmethod
 	def test_connection(self):

@@ -38,4 +38,16 @@ def create_client(config):
 			protocol=config.TORRENT_CLIENT_PROTOCOL,
 		)
 
+	if client_name == "download_station":
+		from torrent_clients.synology_client import SynologyClient
+		default_port = 5001 if config.TORRENT_CLIENT_PROTOCOL == "https" else 5000
+		return SynologyClient(
+			host=config.TORRENT_CLIENT_HOST,
+			port=int(config.TORRENT_CLIENT_PORT or default_port),
+			username=config.TORRENT_CLIENT_USER,
+			password=config.TORRENT_CLIENT_PASSWORD,
+			protocol=config.TORRENT_CLIENT_PROTOCOL,
+			api_path=config.TORRENT_CLIENT_RPC_PATH or "/webapi",
+		)
+
 	raise TorrentClientError(f"Unsupported torrent client: {client_name}")

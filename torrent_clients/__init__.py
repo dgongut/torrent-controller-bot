@@ -1,4 +1,5 @@
 from torrent_clients.base import (
+	PermanentTorrentError,
 	TorrentClient,
 	TorrentClientError,
 	TorrentInfo,

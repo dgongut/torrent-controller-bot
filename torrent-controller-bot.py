@@ -17,11 +17,11 @@ from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue
 from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, suggest_file_name, suggest_name, validate_template
-from torrent_clients import TorrentClientError, TorrentStatus, create_client
+from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.2.6"
+VERSION = "1.3.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -692,12 +692,17 @@ def build_detail(torrent_id, filter_key, page):
 		toggle = InlineKeyboardButton(get_text("BUTTON_RESUME"), callback_data=build_call("resume", torrent.id, filter_key, page))
 	else:
 		toggle = InlineKeyboardButton(get_text("BUTTON_PAUSE"), callback_data=build_call("pause", torrent.id, filter_key, page))
-	markup.row(toggle, InlineKeyboardButton(get_text("BUTTON_VERIFY"), callback_data=build_call("verify", torrent.id, filter_key, page)))
-	markup.row(
-		InlineKeyboardButton(get_text(rename_key(torrent, "BUTTON_RENAME")), callback_data=build_call("rename", torrent.id, filter_key, page)),
-		InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)),
-	)
-	if show_files:
+	if client.supports_verify:
+		markup.row(toggle, InlineKeyboardButton(get_text("BUTTON_VERIFY"), callback_data=build_call("verify", torrent.id, filter_key, page)))
+	else:
+		markup.row(toggle)
+	action_row = []
+	if client.supports_rename:
+		action_row.append(InlineKeyboardButton(get_text(rename_key(torrent, "BUTTON_RENAME")), callback_data=build_call("rename", torrent.id, filter_key, page)))
+	action_row.append(InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)))
+	markup.row(*action_row)
+	# The file screen only exists to rename files one by one
+	if show_files and client.supports_rename:
 		files_ctx = new_nav_context(torrent.id, filter_key, page)
 		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES"), callback_data=build_call("files", files_ctx, 0)))
 	markup.row(InlineKeyboardButton(get_text("BUTTON_DELETE"), callback_data=build_call("delete", torrent.id, filter_key, page)))
@@ -988,6 +993,13 @@ def build_dir_markup(dir_call, write_call, cancel_call, page_parts=None, page=0)
 # SETTINGS
 # ---------------------------------------------------------------------------
 
+def auto_dir_label():
+	"""How the automatic download directory reads, or that the one of the
+	torrent manager is used when there is none set"""
+	auto_dir = bot_settings.get("auto_download_dir")
+	return f"<code>{html.escape(auto_dir)}</code>" if auto_dir else get_text("AUTO_DIR_CLIENT_DEFAULT")
+
+
 def build_settings():
 	settings = client.get_settings()
 
@@ -1003,9 +1015,7 @@ def build_settings():
 	lines.append(get_text("SETTINGS_DEFAULT_DIR", html.escape(settings["download_dir"])))
 	lines.append("")
 	lines.append(get_text("SETTINGS_BOT_TITLE"))
-	auto_dir = bot_settings.get("auto_download_dir")
-	auto_dir_label = f"<code>{html.escape(auto_dir)}</code>" if auto_dir else get_text("AUTO_DIR_CLIENT_DEFAULT")
-	lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label))
+	lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label()))
 
 	def toggle_button(setting_key, text_key, prefix=""):
 		state = "✅" if bot_settings.get(setting_key) else "❌"
@@ -1025,9 +1035,10 @@ def build_settings():
 	markup.add(toggle_button("auto_download", "BUTTON_SETTING_AUTO_DOWNLOAD"))
 	if bot_settings.get("auto_download"):
 		markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_DIR')}", callback_data=build_call("autoDirMenu", 0)))
-	markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
-	if bot_settings.get("auto_rename"):
-		markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
+	if client.supports_rename:
+		markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
+		if bot_settings.get("auto_rename"):
+			markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
 	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_FAV_DIRS"), callback_data=build_call("favDirsMenu")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TEMPLATES"), callback_data=build_call("tplMenu")))
@@ -1153,6 +1164,11 @@ def name_already_exists(name, exclude_id=None):
 	return False
 
 
+def auto_rename_enabled():
+	"""Auto-rename needs both the setting and a client able to rename"""
+	return client.supports_rename and bool(bot_settings.get("auto_rename"))
+
+
 def auto_rename_torrent(torrent):
 	"""Renames the torrent to its suggested name. Returns the new name, or None
 	when there is no suggestion or the rename is skipped"""
@@ -1219,7 +1235,7 @@ def perform_add_torrent(pending, download_dir):
 	(add + optional auto-rename + optional low space warning)"""
 	torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"], download_dir=download_dir)
 	lines = [get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir))]
-	if bot_settings.get("auto_rename"):
+	if auto_rename_enabled():
 		if torrent.files:
 			try:
 				renamed = auto_rename_torrent(torrent)
@@ -1568,6 +1584,11 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 		try:
 			client.move_torrents(ids, new_dir)
 			finish(success_text)
+			return
+		except PermanentTorrentError as e:
+			# The manager will not do it: retrying only delays the bad news
+			warning(f"Move order refused: {e}")
+			finish(get_text("MOVE_REFUSED", html.escape(str(e))))
 			return
 		except TorrentClientError as e:
 			err = str(e)
@@ -2151,7 +2172,8 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 				page=dir_page,
 			)
 			markup.keyboard.insert(0, [InlineKeyboardButton(get_text("BUTTON_AUTO_DIR_DEFAULT"), callback_data=build_call("autoDirDefault"))])
-			edit_message(chat_id, message_id, get_text("AUTO_DIR_ASK"), markup)
+			text = f"{get_text('AUTO_DIR_ASK')}\n\n{get_text('AUTO_DIR_CURRENT', auto_dir_label())}"
+			edit_message(chat_id, message_id, text, markup)
 
 		elif command == "autoDirSet":
 			new_dir = get_dir_by_id(args[0])
@@ -2258,7 +2280,10 @@ def torrent_monitor():
 				state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
 				prev = known.get(torrent.id)
 				if not first_run:
-					if state["finished"] and prev is not None and not prev["finished"] and bot_settings.get("notify_completed"):
+					# A torrent already finished the first time it is seen is a
+					# download that completed between two polls, not a leftover:
+					# the baseline built on the first poll is what covers restarts
+					if state["finished"] and (prev is None or not prev["finished"]) and bot_settings.get("notify_completed"):
 						notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
 					if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
 						notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))

@@ -37,7 +37,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Imagen multiarquitectura (amd64, arm64, armv7…) compatible con Raspberry Pi, NAS y servidores estándar
 - ✅ Soporte de idiomas (Spanish, English)
 
-Actualmente soporta **Transmission**, **qBittorrent** y **Deluge** como gestores de torrents. La arquitectura interna es agnóstica al cliente, por lo que en el futuro podrán añadirse otros gestores.
+Actualmente soporta **Transmission**, **qBittorrent**, **Deluge** y **Download Station de Synology** como gestores de torrents. La arquitectura interna es agnóstica al cliente, por lo que en el futuro podrán añadirse otros gestores. No todos ofrecen las mismas operaciones en su API: tienes el detalle en [qué puede hacer el bot con cada gestor](#qué-puede-hacer-el-bot-con-cada-gestor).
 
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/torrent-controller-bot)?
 
@@ -107,6 +107,52 @@ Detalles a tener en cuenta:
 - Solo funciona en `{temporada}` y `{episodio}`; en cualquier otro campo el bot rechaza la plantilla.
 - `{capitulo}` no se ve afectado: mantiene siempre su formato de dos dígitos (`1x03`, `T2`).
 
+## Qué puede hacer el bot con cada gestor
+
+La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mismas operaciones. El bot **oculta los botones** de lo que el gestor configurado no sabe hacer, así que no verás opciones que fueran a fallar.
+
+| | Transmission | qBittorrent | Deluge | Download Station |
+|:---|:---:|:---:|:---:|:---:|
+| Añadir por magnet o `.torrent` | ✅ | ✅ | ✅ | ✅ |
+| Pausar y reanudar | ✅ | ✅ | ✅ | ✅ |
+| Listados, búsqueda y filtros | ✅ | ✅ | ✅ | ✅ |
+| Filtrar por tracker | ✅ | ✅ | ✅ | ✅ |
+| Acciones masivas | ✅ | ✅ | ✅ | ✅ |
+| Notificaciones de completado y error | ✅ | ✅ | ✅ | ✅ |
+| Mover los datos a otra carpeta | ✅ | ✅ | ✅ | ✅ |
+| Borrar el torrent con sus datos | ✅ | ✅ | ✅ | ✅ |
+| Espacio libre y aviso de disco | ✅ | ✅ | ✅ | ✅ |
+| Límites de velocidad | ✅ | ✅ | ✅ | ✅ |
+| Velocidad alternativa (modo tortuga) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
+| Verificar los datos | ✅ | ✅ | ✅ | ❌ ² |
+| Renombrado inteligente, manual y automático | ✅ | ✅ | ✅ | ❌ ³ |
+
+¹ Ni Deluge ni Download Station tienen modo de velocidad alternativa. Los límites de velocidad normales sí funcionan en ambos.
+
+² Download Station no expone ninguna forma de volver a verificar los datos de una tarea.
+
+³ La API de Download Station no tiene ningún campo para el nombre de una tarea ni de los ficheros que contiene: lo único editable de una tarea es su destino. Se puede renombrar en disco con File Station, pero entonces la tarea deja de encontrar sus ficheros y se rompe en la siguiente verificación de DSM (un reinicio del NAS, del paquete, o una pausa y reanudación), así que el bot no lo hace. Es la misma limitación que tiene la propia interfaz de DSM, donde tampoco se puede renombrar una descarga.
+
+## Download Station de Synology
+
+Para usar Download Station (`TORRENT_CLIENT=download_station`) el bot se conecta a la API web de DSM con un usuario del NAS, el mismo tipo de cuenta con la que entras a DSM. Lo recomendable es **crear un usuario dedicado al bot**:
+
+1. En DSM, ve a `Panel de control` → `Usuario y grupo` → `Crear`.
+2. Ponle una contraseña y **no le actives la verificación en dos pasos**: la API de login la rechaza sin código TOTP y el bot no podrá arrancar.
+3. En los permisos de aplicaciones, dale acceso a **Download Station** y a **File Station**. File Station se usa para mover datos, borrarlos, crear carpetas de destino que aún no existen y consultar el espacio libre, cosas que la API de Download Station no sabe hacer.
+4. No hace falta que sea administrador ni que tenga acceso de escritura a más carpetas compartidas que las de descarga.
+
+Esos datos van en `TORRENT_CLIENT_USER` y `TORRENT_CLIENT_PASSWORD`. El puerto es el de DSM: 5000 en http o 5001 en https (si usas 5001 pon `TORRENT_CLIENT_PROTOCOL=https`).
+
+> [!NOTE]
+> Las rutas de descarga de Download Station son relativas a la carpeta compartida, no absolutas: se escriben `Downloads` o `video/pelis`, no `/volume1/Downloads`. El bot crea la carpeta que le escribas si aún no existe, salvo que sea una carpeta compartida, que solo puede crearse desde DSM.
+
+> [!NOTE]
+> El bot lista **todas** las tareas de Download Station, también las descargas HTTP o FTP que hayas añadido desde DSM. Con esas, Download Station considera la descarga cerrada en cuanto termina y ya no permite cambiarle el destino: si intentas moverla, el bot te lo dice y no toca los ficheros.
+
+> [!NOTE]
+> Mover un torrent que está compartiendo lo deja unos segundos en espera y con una verificación rápida antes de volver a compartir. Es el comportamiento normal de DSM al cambiarle el destino, no un error.
+
 ## Configuración en las variables del Docker Compose
 
 | CLAVE  | OBLIGATORIO | VALOR |
@@ -117,13 +163,13 @@ Detalles a tener en cuenta:
 |TELEGRAM_THREAD |❌| Thread del tema dentro de un supergrupo; valor numérico (2,3,4..). Por defecto 1. Se utiliza en conjunción con la variable TELEGRAM_GROUP |
 |TZ |✅| Timezone (Por ejemplo Europe/Madrid) |
 |LANGUAGE |❌| Idioma, puede ser ES / EN. Por defecto ES (Spanish) |
-|TORRENT_CLIENT |❌| Gestor de torrents: `transmission`, `qbittorrent` o `deluge`. Por defecto transmission |
+|TORRENT_CLIENT |❌| Gestor de torrents: `transmission`, `qbittorrent`, `deluge` o `download_station`. Por defecto transmission |
 |TORRENT_CLIENT_HOST |✅| Host o IP donde está el gestor de torrents |
-|TORRENT_CLIENT_PORT |❌| Puerto del gestor de torrents. Por defecto 9091 (Transmission), 8080 (qBittorrent) u 8112 (Deluge Web UI) |
+|TORRENT_CLIENT_PORT |❌| Puerto del gestor de torrents. Por defecto 9091 (Transmission), 8080 (qBittorrent), 8112 (Deluge Web UI) o 5000/5001 (DSM de Synology) |
 |TORRENT_CLIENT_USER |❌| Usuario del gestor de torrents, si tiene autenticación |
 |TORRENT_CLIENT_PASSWORD |❌| Contraseña del gestor de torrents, si tiene autenticación |
 |TORRENT_CLIENT_PROTOCOL |❌| Protocolo de conexión, http o https. Por defecto http |
-|TORRENT_CLIENT_RPC_PATH |❌| Ruta del RPC. Por defecto /transmission/rpc (Transmission) |
+|TORRENT_CLIENT_RPC_PATH |❌| Ruta del RPC. Por defecto /transmission/rpc (Transmission) o /webapi (Synology) |
 |TORRENTS_PER_PAGE |❌| Número de torrents por página en los listados. Por defecto 10 |
 |DASHBOARD_REFRESH_SECONDS |❌| Segundos entre refrescos automáticos del panel de control. Por defecto 2 |
 |DASHBOARD_REFRESH_DURATION |❌| Segundos que dura el refresco automático del panel de control. Por defecto 60 |
@@ -191,6 +237,7 @@ torrent-controller-bot/
     │   ├── deluge_client.py
     │   ├── factory.py
     │   ├── qbittorrent_client.py
+    │   ├── synology_client.py
     │   └── transmission_client.py
     └── locale
         ├── en.json
