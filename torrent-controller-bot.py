@@ -21,7 +21,7 @@ from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentSt
 import bot_settings
 import config as _config_module
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -185,7 +185,12 @@ def truncate_dir(path, length=30):
 
 
 def build_call(command, *args):
-	return "|".join([command] + [str(a) for a in args])
+	call = "|".join([command] + [str(a) for a in args])
+	# Telegram rejects the whole keyboard with BUTTON_DATA_INVALID over 64 bytes
+	size = len(call.encode("utf-8"))
+	if size > MAX_CALLBACK_DATA_BYTES:
+		warning(f"callback_data too long ({size} bytes), Telegram will reject the keyboard: {call}")
+	return call
 
 
 def pagination_row(page, pages, *base):
@@ -209,16 +214,57 @@ def is_authorized(user_id, chat_id):
 	return True
 
 
+_HTML_TAG = re.compile(r"<(/?)([a-z]+)[^>]*>")
+
+
+def _pending_close_tags(text):
+	"""The HTML a cut would leave open, as the closing tags it still needs"""
+	stack = []
+	for closing, tag in _HTML_TAG.findall(text):
+		if closing:
+			if stack and stack[-1] == tag:
+				stack.pop()
+		else:
+			stack.append(tag)
+	return "".join(f"</{tag}>" for tag in reversed(stack))
+
+
+def clamp_text(text):
+	"""A torrent or file name long enough to push a screen past the Telegram
+	limit would only get the message rejected, and the screen would silently
+	stay as it was, so it is cut here instead. The cut prefers a line boundary
+	because every line closes its own tags, and whatever is still open at the
+	cut is closed so Telegram can parse what is left"""
+	if len(text) <= MAX_MESSAGE_LENGTH:
+		return text
+	marker = f"\n{get_text('MESSAGE_TRUNCATED')}"
+	budget = MAX_MESSAGE_LENGTH - len(marker)
+	cut = text[:budget]
+	if "\n" in cut:
+		cut = cut[:cut.rindex("\n")]
+	closing = ""
+	# Making room for the closing tags can uncover another one, and the screens
+	# never nest HTML more than a couple of levels deep
+	for _ in range(8):
+		cut = re.sub(r"<[^>]*$", "", cut)  # Never leave half a tag behind
+		closing = _pending_close_tags(cut)
+		if len(cut) + len(closing) <= budget:
+			break
+		cut = cut[:budget - len(closing)]
+	warning(f"Message truncated: {len(text)} characters exceed the Telegram limit")
+	return cut + closing + marker
+
+
 def send_message(chat_id, text, reply_markup=None, thread_id=None):
 	kwargs = {"parse_mode": "HTML", "reply_markup": reply_markup, "disable_web_page_preview": True}
 	if thread_id and thread_id != 1:
 		kwargs["message_thread_id"] = thread_id
-	return message_queue.enqueue_and_wait(bot.send_message, chat_id, text, **kwargs)
+	return message_queue.enqueue_and_wait(bot.send_message, chat_id, clamp_text(text), **kwargs)
 
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
 	try:
-		return bot.edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
+		return bot.edit_message_text(clamp_text(text), chat_id, message_id, parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=True)
 	except Exception as e:
 		if "message is not modified" not in str(e):
 			warning(f"Cannot edit message {message_id}: {e}")
@@ -1901,14 +1947,23 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			if torrent is None:
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 			else:
+				# The torrent id does not always fit in callback_data alongside the
+				# filter (a tracker filter is longer), so the confirmation travels
+				# through a nav context like the files and move screens do
+				nav_ctx = new_nav_context(torrent_id, filter_key, page)
 				markup = InlineKeyboardMarkup(row_width=1)
-				markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmDelete", torrent_id, "0", filter_key, page)))
-				markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmDelete", torrent_id, "1", filter_key, page)))
+				markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmDelete", nav_ctx, "0")))
+				markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmDelete", nav_ctx, "1")))
 				markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("info", torrent_id, filter_key, page)))
 				edit_message(chat_id, message_id, get_text("DELETE_CONFIRM", html.escape(torrent.name)), markup)
 
 		elif command == "confirmDelete":
-			torrent_id, with_data, filter_key, page = args[0], args[1], args[2], args[3]
+			ctx = get_nav_context(args[0])
+			if ctx is None:
+				edit_message(chat_id, message_id, get_text("DELETE_EXPIRED"), back_close_markup())
+				return
+			torrent_id, filter_key, page = ctx
+			with_data = args[1]
 			torrent = client.get_torrent(torrent_id)
 			name = torrent.name if torrent else torrent_id
 			client.remove_torrents([torrent_id], delete_data=with_data == "1")
@@ -1922,9 +1977,12 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			else:
 				suggested = parse_name(torrent.name)
 				if suggested and suggested != torrent.name:
+					# Same as the delete confirmation: these commands are long and the
+					# torrent id plus a tracker filter would not fit in callback_data
+					nav_ctx = new_nav_context(torrent_id, filter_key, page)
 					markup = InlineKeyboardMarkup(row_width=1)
-					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_AUTO"), callback_data=build_call("renameAuto", torrent_id, filter_key, page)))
-					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_MANUAL"), callback_data=build_call("renameManual", torrent_id, filter_key, page)))
+					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_AUTO"), callback_data=build_call("renameAuto", nav_ctx)))
+					markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_MANUAL"), callback_data=build_call("renameManual", nav_ctx)))
 					markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("info", torrent_id, filter_key, page)))
 					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_SUGGEST"), html.escape(torrent.name), html.escape(suggested)), markup)
 				else:
@@ -1932,7 +1990,11 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 								message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
 
 		elif command == "renameAuto":
-			torrent_id, filter_key, page = args[0], args[1], args[2]
+			ctx = get_nav_context(args[0])
+			if ctx is None:
+				edit_message(chat_id, message_id, get_text("RENAME_EXPIRED"), back_close_markup())
+				return
+			torrent_id, filter_key, page = ctx
 			torrent = client.get_torrent(torrent_id)
 			if torrent is None:
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
@@ -1947,7 +2009,11 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_OK"), html.escape(suggested)), back_close_markup(build_call("info", torrent_id, filter_key, page)))
 
 		elif command == "renameManual":
-			torrent_id, filter_key, page = args[0], args[1], args[2]
+			ctx = get_nav_context(args[0])
+			if ctx is None:
+				edit_message(chat_id, message_id, get_text("RENAME_EXPIRED"), back_close_markup())
+				return
+			torrent_id, filter_key, page = ctx
 			torrent = client.get_torrent(torrent_id)
 			if torrent is None:
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
