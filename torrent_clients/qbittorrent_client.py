@@ -50,6 +50,8 @@ STATUS_MAP = {
 
 
 class QBittorrentClient(TorrentClient):
+	supports_categories = True
+
 	def __init__(self, host, port, username=None, password=None, protocol="http"):
 		self.base_url = f"{protocol}://{host}:{port}/api/v2"
 		self.username = username or ""
@@ -127,6 +129,8 @@ class QBittorrentClient(TorrentClient):
 			seeders=t.get("num_seeds", 0),
 			leechers=t.get("num_leechs", 0),
 			download_dir=t.get("save_path", "") or "",
+			category=t.get("category", "") or "",
+			auto_managed=bool(t.get("auto_tmm", False)),
 			error_message=error_message,
 			added_date=t.get("added_on", None),
 			files=files or [],
@@ -231,10 +235,15 @@ class QBittorrentClient(TorrentClient):
 			files = []
 		return self._to_info(t, files=files, trackers=self._tracker_hosts(torrent_id))
 
-	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None):
+	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		tag = f"{TEMP_TAG_PREFIX}{uuid.uuid4().hex[:8]}"  # Unique tag to find the new hash
 		data = {"tags": tag}
-		if download_dir:
+		if category:
+			# The category is what decides the location, and only a torrent under
+			# automatic management follows it, so a save path here would fight it
+			data["category"] = category
+			data["autoTMM"] = "true"
+		elif download_dir:
 			data["savepath"] = download_dir
 		try:
 			if magnet:
@@ -345,6 +354,35 @@ class QBittorrentClient(TorrentClient):
 				"hashes": "|".join(torrent_ids), "location": new_dir}, timeout=MOVE_RPC_TIMEOUT)
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error moving torrents: {e}")
+
+	def get_categories(self):
+		try:
+			categories = self._get("torrents/categories").json()
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error getting categories: {e}")
+		if not isinstance(categories, dict):
+			return []
+		result = [(name, (data or {}).get("savePath", "") or "") for name, data in categories.items()]
+		result.sort(key=lambda c: c[0].lower())
+		return result
+
+	def set_category(self, torrent_ids, category):
+		# An auto managed torrent is relocated by this call, so it blocks for as
+		# long as moving the data takes, exactly like setLocation does
+		try:
+			self._post("torrents/setCategory", data={
+				"hashes": "|".join(torrent_ids), "category": category or ""}, timeout=MOVE_RPC_TIMEOUT)
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting category: {e}")
+
+	def set_auto_managed(self, torrent_ids, enabled):
+		# Relocates the data to the category folder, so it blocks like a move
+		try:
+			self._post("torrents/setAutoManagement", data={
+				"hashes": "|".join(torrent_ids),
+				"enable": "true" if enabled else "false"}, timeout=MOVE_RPC_TIMEOUT)
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting automatic management: {e}")
 
 	def get_download_dirs(self):
 		try:

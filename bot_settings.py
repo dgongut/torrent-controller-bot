@@ -17,6 +17,7 @@ DEFAULTS = {
 	"notify_errors": True,
 	"auto_download": False,
 	"auto_download_dir": "",  # "" = torrent client default dir
+	"auto_category": "",  # "" = none; takes over the dir on clients with categories
 	"auto_rename": False,
 	"auto_rename_files": False,  # Only used when auto_rename is enabled
 	"low_space_warning": True,

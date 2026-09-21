@@ -73,6 +73,8 @@ class TorrentInfo:
 	seeders: int = 0  # connected peers that have the whole torrent
 	leechers: int = 0  # connected peers still downloading
 	download_dir: str = ""
+	category: str = ""  # Managers without categories leave it empty
+	auto_managed: bool = False  # The manager decides the location (qBittorrent auto_tmm)
 	error_message: str = ""
 	added_date: object = None  # datetime
 	files: list = field(default_factory=list)  # list of (path, size, completed)
@@ -104,6 +106,7 @@ class TorrentClient(ABC):
 	supports_alt_speed = True  # Clients without a turtle mode set this to False
 	supports_rename = True  # Clients that cannot rename the content on disk
 	supports_verify = True  # Clients that cannot recheck the downloaded data
+	supports_categories = False  # Clients with categories/labels bound to a save path
 
 	@abstractmethod
 	def test_connection(self):
@@ -128,10 +131,31 @@ class TorrentClient(ABC):
 		pass
 
 	@abstractmethod
-	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None):
+	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		"""Adds a torrent from a magnet link or the binary content of a
-		.torrent file. Returns the TorrentInfo of the added torrent"""
+		.torrent file. Returns the TorrentInfo of the added torrent.
+		category is only ever passed to clients with supports_categories, and
+		it replaces download_dir: the category is what decides the location"""
 		pass
+
+	def get_categories(self):
+		"""Returns [(name, save_path)] of the categories defined in the manager,
+		sorted by name. save_path may be empty when the category does not force
+		one. Only meaningful when supports_categories is True"""
+		return []
+
+	def set_auto_managed(self, torrent_ids, enabled):
+		"""Hands the location of the torrents over to the manager (or takes it
+		back). Enabling it relocates the data to the folder of the torrent's
+		category, or to the default one when it has no category, so it blocks
+		for as long as a move does"""
+		raise TorrentClientError("This torrent manager does not support automatic management")
+
+	def set_category(self, torrent_ids, category):
+		"""Assigns a category to the torrents, an empty string clears it.
+		On an auto managed torrent this physically moves its data, so it can
+		block for as long as a move does"""
+		raise TorrentClientError("This torrent manager does not support categories")
 
 	@abstractmethod
 	def remove_torrents(self, torrent_ids, delete_data=False):

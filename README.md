@@ -26,6 +26,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Renombrado de los archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
 - ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar o mover todos
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
+- ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
 - ✅ Notificaciones de descarga completada y de errores en torrents (activables desde los ajustes)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
@@ -126,10 +127,13 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Velocidad alternativa (modo tortuga) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Verificar los datos | ✅ | ✅ | ✅ | ❌ ² |
 | Renombrado inteligente, manual y automático | ✅ | ✅ | ✅ | ❌ ³ |
+| Categorías | ❌ ⁴ | ✅ | ❌ ⁴ | ❌ ⁴ |
 
 ¹ Ni Deluge ni Download Station tienen modo de velocidad alternativa. Los límites de velocidad normales sí funcionan en ambos.
 
 ² Download Station no expone ninguna forma de volver a verificar los datos de una tarea.
+
+⁴ Las categorías son un concepto de qBittorrent: cada una lleva asociada una carpeta, y un torrent en **gestión automática** (*Automatic Torrent Management*) saca su carpeta de su categoría, de modo que cambiársela mueve los ficheros. Por eso el bot no ofrece las dos cosas a la vez: en un torrent auto-gestionado el botón de mover se sustituye por el de categoría, y mover a mano queda disponible dentro de esa pantalla avisando de que el torrent pasa a modo manual. Transmission y Deluge tienen etiquetas, pero son etiquetas sueltas sin carpeta asociada (en Deluge hace falta además el plugin Label), así que el bot no las usa.
 
 ³ La API de Download Station no tiene ningún campo para el nombre de una tarea ni de los ficheros que contiene: lo único editable de una tarea es su destino. Se puede renombrar en disco con File Station, pero entonces la tarea deja de encontrar sus ficheros y se rompe en la siguiente verificación de DSM (un reinicio del NAS, del paquete, o una pausa y reanudación), así que el bot no lo hace. Es la misma limitación que tiene la propia interfaz de DSM, donde tampoco se puede renombrar una descarga.
 

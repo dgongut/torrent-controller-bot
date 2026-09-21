@@ -640,7 +640,7 @@ class SynologyClient(TorrentClient):
 			info = self.get_torrent(info.id) or info
 		return info
 
-	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None):
+	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		if not magnet and not torrent_data:
 			raise TorrentClientError("No magnet or torrent data provided")
 		known_ids = self._task_ids()

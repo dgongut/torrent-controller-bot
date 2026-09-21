@@ -21,7 +21,7 @@ from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentSt
 import bot_settings
 import config as _config_module
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -100,7 +100,7 @@ if TELEGRAM_GROUP is None or TELEGRAM_GROUP == '':
 		sys.exit(1)
 
 try:
-	TELEGRAM_THREAD = int(TELEGRAM_THREAD)
+	TELEGRAM_THREAD = int(str(TELEGRAM_THREAD).strip()) if str(TELEGRAM_THREAD).strip() else 1
 except:
 	error(f"The variable TELEGRAM_THREAD is the thread within a supergroup, it is a numeric value. It has been set to {TELEGRAM_THREAD}.")
 	sys.exit(1)
@@ -255,9 +255,20 @@ def clamp_text(text):
 	return cut + closing + marker
 
 
+def normalize_thread(thread_id):
+	"""Telegram addresses the General topic of a forum by omitting the thread,
+	so both it (thread 1) and a chat without topics normalize to None"""
+	try:
+		thread_id = int(thread_id)
+	except (TypeError, ValueError):
+		return None
+	return thread_id if thread_id > 1 else None
+
+
 def send_message(chat_id, text, reply_markup=None, thread_id=None):
 	kwargs = {"parse_mode": "HTML", "reply_markup": reply_markup, "disable_web_page_preview": True}
-	if thread_id and thread_id != 1:
+	thread_id = normalize_thread(thread_id)
+	if thread_id:
 		kwargs["message_thread_id"] = thread_id
 	return message_queue.enqueue_and_wait(bot.send_message, chat_id, clamp_text(text), **kwargs)
 
@@ -278,9 +289,14 @@ def delete_message(chat_id, message_id):
 		pass
 
 
-def notify(text):
-	"""Sends a bot-initiated notification to the configured destination:
-	the group (and thread) if set, otherwise the first admin"""
+def notify(text, chat_id=None, thread_id=None):
+	"""Sends a bot-initiated notification. A conversation that originated it
+	takes precedence, so the answer lands in the topic where it was asked;
+	otherwise it goes to the configured destination: the group (and its
+	TELEGRAM_THREAD) if set, or the first admin"""
+	if chat_id is not None:
+		send_message(chat_id, text, thread_id=thread_id)
+		return
 	target = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
 	send_message(target, text, thread_id=TELEGRAM_THREAD)
 
@@ -296,6 +312,9 @@ search_contexts = {}
 
 # Tracker filter contexts: short id -> {"tracker": str, "ts": float}
 tracker_contexts = {}
+
+# Category filter contexts: short id -> {"category": str, "ts": float}
+category_contexts = {}
 
 # Pending torrents waiting for a download dir: id -> {"magnet"/"data", "name", "ts"}
 pending_torrents = {}
@@ -313,7 +332,11 @@ pending_inputs = {}
 _dir_by_id = {}
 _dir_ids = {}
 
-# Active dashboards: chat_id -> {"message_id": int, "generation": int}
+# Short ids for categories (stable during runtime)
+_cat_by_id = {}
+_cat_ids = {}
+
+# Active dashboards: (chat_id, thread_id) -> {"message_id": int, "generation": int}
 dashboards = {}
 _dashboards_lock = threading.Lock()
 
@@ -330,6 +353,20 @@ def get_dir_id(path):
 def get_dir_by_id(dir_id):
 	with _contexts_lock:
 		return _dir_by_id.get(dir_id)
+
+
+def get_cat_id(category):
+	with _contexts_lock:
+		if category not in _cat_ids:
+			new_id = str(len(_cat_ids))
+			_cat_ids[category] = new_id
+			_cat_by_id[new_id] = category
+		return _cat_ids[category]
+
+
+def get_cat_by_id(cat_id):
+	with _contexts_lock:
+		return _cat_by_id.get(cat_id)
 
 
 def new_search_context(query):
@@ -359,6 +396,25 @@ def new_tracker_context(tracker):
 		ctx_id = uuid.uuid4().hex[:6]
 		tracker_contexts[ctx_id] = {"tracker": tracker, "ts": now}
 		return ctx_id
+
+
+def new_category_context(category):
+	with _contexts_lock:
+		now = time.time()
+		for key in [k for k, v in category_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del category_contexts[key]
+		ctx_id = uuid.uuid4().hex[:6]
+		category_contexts[ctx_id] = {"category": category, "ts": now}
+		return ctx_id
+
+
+def get_category_filter(ctx_id):
+	with _contexts_lock:
+		ctx = category_contexts.get(ctx_id)
+		if ctx:
+			ctx["ts"] = time.time()
+			return ctx["category"]
+		return None
 
 
 def get_tracker_filter(ctx_id):
@@ -463,6 +519,11 @@ def get_filter_label(filter_key):
 		if tracker is None:
 			raise ExpiredContext()
 		return get_text("TRACKER_RESULTS_TITLE", html.escape(tracker))
+	if not is_known_filter(filter_key) and filter_key.startswith("c"):
+		category = get_category_filter(filter_key[1:])
+		if category is None:
+			raise ExpiredContext()
+		return get_text("CATEGORY_RESULTS_TITLE", html.escape(category or get_text("CATEGORY_NONE")))
 	if filter_key == FILTER_ALL:
 		return get_text("STATUS_ALL")
 	if filter_key == FILTER_COMPLETED:
@@ -489,6 +550,12 @@ def get_filtered_torrents(filter_key):
 		if tracker is None:
 			raise ExpiredContext()
 		return [t for t in client.get_torrents() if tracker in t.trackers]
+	if not is_known_filter(filter_key) and filter_key.startswith("c"):
+		# An empty category is a real filter: the torrents with no category at all
+		category = get_category_filter(filter_key[1:])
+		if category is None:
+			raise ExpiredContext()
+		return [t for t in client.get_torrents() if t.category == category]
 	if filter_key == FILTER_ALL:
 		return client.get_torrents()
 	if filter_key == FILTER_COMPLETED:
@@ -550,6 +617,8 @@ def build_dashboard(refreshing):
 		InlineKeyboardButton(get_text("BUTTON_SEARCH"), callback_data=build_call("search")),
 		InlineKeyboardButton(get_text("BUTTON_TRACKERS"), callback_data=build_call("trackers")),
 	)
+	if client.supports_categories:
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CATEGORIES"), callback_data=build_call("categories")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTINGS"), callback_data=build_call("settings")))
 	bottom = []
 	if not refreshing:
@@ -560,12 +629,12 @@ def build_dashboard(refreshing):
 	return "\n".join(lines), markup
 
 
-def _dashboard_refresher(chat_id, message_id, generation):
+def _dashboard_refresher(chat_id, thread_id, message_id, generation):
 	iterations = max(1, DASHBOARD_REFRESH_DURATION // DASHBOARD_REFRESH_SECONDS)
 	for _ in range(iterations):
 		time.sleep(DASHBOARD_REFRESH_SECONDS)
 		with _dashboards_lock:
-			state = dashboards.get(chat_id)
+			state = dashboards.get((chat_id, thread_id))
 			if not state or state["message_id"] != message_id or state["generation"] != generation:
 				return
 		try:
@@ -574,7 +643,7 @@ def _dashboard_refresher(chat_id, message_id, generation):
 		except Exception as e:
 			warning(f"Dashboard refresh failed: {e}")
 	with _dashboards_lock:
-		state = dashboards.get(chat_id)
+		state = dashboards.get((chat_id, thread_id))
 		if not state or state["message_id"] != message_id or state["generation"] != generation:
 			return
 	try:
@@ -604,16 +673,17 @@ def show_dashboard(chat_id, message_id=None, thread_id=None):
 			return
 		message_id = sent.message_id
 
+	thread_id = normalize_thread(thread_id)
 	with _dashboards_lock:
-		state = dashboards.get(chat_id, {"generation": 0})
+		state = dashboards.get((chat_id, thread_id), {"generation": 0})
 		generation = state["generation"] + 1
-		dashboards[chat_id] = {"message_id": message_id, "generation": generation}
-	threading.Thread(target=_dashboard_refresher, args=(chat_id, message_id, generation), daemon=True).start()
+		dashboards[(chat_id, thread_id)] = {"message_id": message_id, "generation": generation}
+	threading.Thread(target=_dashboard_refresher, args=(chat_id, thread_id, message_id, generation), daemon=True).start()
 
 
-def stop_dashboard(chat_id, message_id):
+def stop_dashboard(chat_id, message_id, thread_id=None):
 	with _dashboards_lock:
-		state = dashboards.get(chat_id)
+		state = dashboards.get((chat_id, normalize_thread(thread_id)))
 		if state and state["message_id"] == message_id:
 			state["generation"] += 1
 
@@ -718,7 +788,14 @@ def build_detail(torrent_id, filter_key, page):
 		if len(torrent.trackers) > 1:
 			tracker_text += f" {get_text('INFO_TRACKER_AND_MORE', len(torrent.trackers) - 1)}"
 		lines.append(f"{get_text('INFO_TRACKER')}: {tracker_text}")
+	if client.supports_categories:
+		category_text = html.escape(torrent.category) if torrent.category else get_text("CATEGORY_NONE")
+		lines.append(f"{get_text('INFO_CATEGORY')}: {category_text}")
 	lines.append(f"{get_text('INFO_DIR')}: <code>{html.escape(torrent.download_dir)}</code>")
+	if client.supports_categories and torrent.auto_managed:
+		lines.append(get_text("INFO_AUTO_MANAGED"))
+	elif client.supports_categories and category_save_path(torrent.category) not in ("", torrent.download_dir.rstrip("/")):
+		lines.append(get_text("INFO_CATEGORY_IGNORED"))
 	if torrent.added_date:
 		added = datetime.fromtimestamp(torrent.added_date).strftime("%Y-%m-%d %H:%M")
 		lines.append(f"{get_text('INFO_ADDED')}: {added}")
@@ -745,8 +822,16 @@ def build_detail(torrent_id, filter_key, page):
 	action_row = []
 	if client.supports_rename:
 		action_row.append(InlineKeyboardButton(get_text(rename_key(torrent, "BUTTON_RENAME")), callback_data=build_call("rename", torrent.id, filter_key, page)))
-	action_row.append(InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)))
-	markup.row(*action_row)
+	# An auto managed torrent takes its directory from its category, and moving
+	# it by hand is what drops it out of automatic management: the category is
+	# the only control offered for it, with the move as an informed way out
+	if not (client.supports_categories and torrent.auto_managed):
+		action_row.append(InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)))
+	if action_row:
+		markup.row(*action_row)
+	if client.supports_categories:
+		cat_ctx = new_nav_context(torrent.id, filter_key, page)
+		markup.row(InlineKeyboardButton(get_text("BUTTON_CATEGORY"), callback_data=build_call("catMenu", cat_ctx)))
 	# The file screen only exists to rename files one by one
 	if show_files and client.supports_rename:
 		files_ctx = new_nav_context(torrent.id, filter_key, page)
@@ -992,6 +1077,130 @@ def build_trackers_menu():
 	return text, markup
 
 
+_categories_cache = {"value": [], "ts": 0.0}
+
+
+def get_known_categories():
+	"""Categories defined in the torrent manager, or an empty list when it has
+	none or does not support them. A single screen asks for them more than once
+	and they change about never, so the answer is held for a few seconds"""
+	if not client.supports_categories:
+		return []
+	with _contexts_lock:
+		if time.time() - _categories_cache["ts"] < CATEGORIES_CACHE_TTL:
+			return list(_categories_cache["value"])
+	try:
+		categories = client.get_categories()
+	except TorrentClientError as e:
+		warning(f"Cannot get categories: {e}")
+		return []
+	with _contexts_lock:
+		_categories_cache["value"] = list(categories)
+		_categories_cache["ts"] = time.time()
+	return categories
+
+
+def category_save_path(category):
+	"""The folder a category points at, or an empty string when it has none"""
+	if not category:
+		return ""
+	for name, save_path in get_known_categories():
+		if name == category:
+			return (save_path or "").rstrip("/")
+	return ""
+
+
+def build_categories_menu(page=0):
+	categories = get_known_categories()
+	counts = Counter()
+	for torrent in client.get_torrents():
+		counts[torrent.category] += 1
+	text = get_text("CATEGORIES_TITLE", len(categories))
+	if not categories:
+		text += f"\n\n{get_text('CATEGORIES_EMPTY')}"
+	markup = InlineKeyboardMarkup(row_width=1)
+	# A library organized by category easily has more of them than fit in one
+	# keyboard, and a truncated list makes the rest unreachable for good
+	pages = max(1, math.ceil(len(categories) / CATEGORIES_PER_PAGE))
+	page = max(0, min(int(page), pages - 1))
+	start = page * CATEGORIES_PER_PAGE
+	for name, save_path in categories[start:start + CATEGORIES_PER_PAGE]:
+		label = f"🏷️ {truncate(name)} ({counts.get(name, 0)})"
+		markup.add(InlineKeyboardButton(label, callback_data=build_call("list", f"c{new_category_context(name)}", 0)))
+	if pages > 1:
+		markup.row(*pagination_row(page, pages, "categories"))
+	# Torrents with no category are invisible in the list above and are exactly
+	# the ones a user organizing by category needs to find
+	if counts.get("", 0):
+		markup.add(InlineKeyboardButton(
+			f"🚫 {get_text('CATEGORY_NONE')} ({counts['']})",
+			callback_data=build_call("list", f"c{new_category_context('')}", 0)))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return text, markup
+
+
+def build_category_markup(cat_call, cancel_call, include_none=True, extra_rows=None, page_parts=None, page=0):
+	"""Keyboard with one button per category defined in the manager, paginated
+	the same way the directories are. Category names are free text, so they
+	travel as short ids like directories do.
+	page_parts is the callback prefix that receives the page as last arg"""
+	markup = InlineKeyboardMarkup(row_width=1)
+	categories = get_known_categories()
+	pages = max(1, math.ceil(len(categories) / CATEGORIES_PER_PAGE))
+	page = max(0, min(int(page), pages - 1))
+	start = page * CATEGORIES_PER_PAGE
+	for name, _save_path in categories[start:start + CATEGORIES_PER_PAGE]:
+		markup.add(InlineKeyboardButton(f"🏷️ {truncate(name)}", callback_data=cat_call(get_cat_id(name))))
+	if pages > 1 and page_parts:
+		markup.row(*pagination_row(page, pages, *page_parts))
+	if include_none:
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CATEGORY_NONE"), callback_data=cat_call(get_cat_id(""))))
+	for row in extra_rows or []:
+		markup.add(row)
+	markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=cancel_call))
+	return markup
+
+
+def build_torrent_category_screen(torrent, filter_key, page, cat_page=0):
+	"""The screen that changes the category of a torrent. On an auto managed
+	torrent this is what decides its directory, so the manual move is offered
+	here instead, spelling out that it gives up the automatic management"""
+	lines = [get_text("CATEGORY_ASK", html.escape(torrent.name))]
+	current = html.escape(torrent.category) if torrent.category else get_text("CATEGORY_NONE")
+	lines.append(get_text("CATEGORY_CURRENT", current))
+	if not get_known_categories():
+		lines.append("")
+		lines.append(get_text("CATEGORIES_EMPTY"))
+	if torrent.auto_managed:
+		lines.append("")
+		lines.append(get_text("CATEGORY_MOVES_WARNING"))
+	nav_ctx = new_nav_context(torrent.id, filter_key, page)
+	extra = []
+	if torrent.auto_managed:
+		extra.append(InlineKeyboardButton(
+			get_text("BUTTON_MOVE_MANUAL"),
+			callback_data=build_call("move", torrent.id, filter_key, page)))
+	elif torrent.category:
+		# Only with a category: without one the manager would drag the torrent
+		# to the default download folder, which nobody asked for
+		lines.append("")
+		lines.append(get_text("CATEGORY_AUTO_MANAGE_HINT", html.escape(category_save_path(torrent.category) or "?")))
+		extra.append(InlineKeyboardButton(
+			get_text("BUTTON_AUTO_MANAGE"),
+			callback_data=build_call("autoManage", nav_ctx)))
+	markup = build_category_markup(
+		cat_call=lambda cat_id: build_call("catSet", nav_ctx, cat_id),
+		cancel_call=build_call("info", torrent.id, filter_key, page),
+		extra_rows=extra,
+		page_parts=("catMenu", nav_ctx),
+		page=cat_page,
+	)
+	return "\n".join(lines), markup
+
+
 # ---------------------------------------------------------------------------
 # DIRECTORIES
 # ---------------------------------------------------------------------------
@@ -1046,6 +1255,25 @@ def auto_dir_label():
 	return f"<code>{html.escape(auto_dir)}</code>" if auto_dir else get_text("AUTO_DIR_CLIENT_DEFAULT")
 
 
+def auto_category():
+	"""The configured automatic category, or an empty string when there is none.
+	A category deleted in the manager since it was picked is not usable, and
+	silently adding torrents to a category that no longer exists is worse than
+	falling back to the directory"""
+	category = bot_settings.get("auto_category") or ""
+	if not category or not client.supports_categories:
+		return ""
+	if category not in [name for name, _ in get_known_categories()]:
+		warning(f"The automatic category '{category}' no longer exists in the torrent manager")
+		return ""
+	return category
+
+
+def auto_category_label():
+	category = bot_settings.get("auto_category")
+	return f"<b>{html.escape(category)}</b>" if category else get_text("AUTO_CATEGORY_NONE")
+
+
 def build_settings():
 	settings = client.get_settings()
 
@@ -1062,6 +1290,8 @@ def build_settings():
 	lines.append("")
 	lines.append(get_text("SETTINGS_BOT_TITLE"))
 	lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label()))
+	if client.supports_categories:
+		lines.append(get_text("SETTINGS_AUTO_CATEGORY", auto_category_label()))
 
 	def toggle_button(setting_key, text_key, prefix=""):
 		state = "✅" if bot_settings.get(setting_key) else "❌"
@@ -1081,6 +1311,8 @@ def build_settings():
 	markup.add(toggle_button("auto_download", "BUTTON_SETTING_AUTO_DOWNLOAD"))
 	if bot_settings.get("auto_download"):
 		markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_DIR')}", callback_data=build_call("autoDirMenu", 0)))
+		if client.supports_categories:
+			markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_CATEGORY')}", callback_data=build_call("autoCatMenu")))
 	if client.supports_rename:
 		markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
 		if bot_settings.get("auto_rename"):
@@ -1199,6 +1431,25 @@ def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None,
 		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 
 
+def ask_add_category(chat_id, pending_id, name, thread_id=None, message_id=None, cat_page=0):
+	"""On a manager with categories the category is what decides the directory,
+	so it is asked first; picking a folder by hand is still one button away"""
+	markup = build_category_markup(
+		cat_call=lambda cat_id: build_call("addCat", pending_id, cat_id),
+		cancel_call=build_call("cancelAdd", pending_id),
+		include_none=False,  # "no category" here is just "let me pick the folder"
+		extra_rows=[InlineKeyboardButton(get_text("BUTTON_ADD_CHOOSE_DIR"),
+					callback_data=build_call("addDirPage", pending_id, 0))],
+		page_parts=("addCatPage", pending_id),
+		page=cat_page,
+	)
+	text = get_text("ADD_ASK_CATEGORY", html.escape(name))
+	if message_id:
+		edit_message(chat_id, message_id, text, markup)
+	else:
+		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+
+
 def name_already_exists(name, exclude_id=None):
 	"""True when another torrent already has exactly that name"""
 	try:
@@ -1247,7 +1498,7 @@ def auto_rename_torrent_files(torrent_id):
 	return get_text("ADD_AUTO_RENAMED_FILES", done, build_plan_preview(plan))
 
 
-def deferred_auto_rename(torrent_id, original_name):
+def deferred_auto_rename(torrent_id, original_name, chat_id=None, thread_id=None):
 	"""A magnet has no metadata when it is added: the client only knows the
 	name hinted in the link and rejects renaming until the real one arrives.
 	Waits in background for the metadata and renames then"""
@@ -1269,18 +1520,24 @@ def deferred_auto_rename(torrent_id, original_name):
 			warning(f"Auto-rename failed for {torrent.name}: {e}")
 			return
 		if renamed:
-			notify(get_text("NOTIFY_AUTO_RENAMED", html.escape(original_name), html.escape(renamed)))
+			notify(get_text("NOTIFY_AUTO_RENAMED", html.escape(original_name), html.escape(renamed)), chat_id, thread_id)
 		if files_renamed:
-			notify(f"{get_text('NOTIFY_AUTO_RENAMED_FILES', html.escape(renamed or original_name))}\n{files_renamed}")
+			notify(f"{get_text('NOTIFY_AUTO_RENAMED_FILES', html.escape(renamed or original_name))}\n{files_renamed}", chat_id, thread_id)
 		return
 	warning(f"Auto-rename gave up for {original_name}: the metadata never arrived")
 
 
-def perform_add_torrent(pending, download_dir):
+def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, category=None):
 	"""Adds the torrent and returns the result text
 	(add + optional auto-rename + optional low space warning)"""
-	torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"], download_dir=download_dir)
+	torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"],
+							download_dir=download_dir, category=category or None)
+	# With a category the directory is not known until the manager has resolved
+	# it, so the one it reports back is the only accurate one
+	download_dir = torrent.download_dir or download_dir or ""
 	lines = [get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir))]
+	if category:
+		lines.append(get_text("ADD_OK_CATEGORY", html.escape(category)))
 	if auto_rename_enabled():
 		if torrent.files:
 			try:
@@ -1295,7 +1552,7 @@ def perform_add_torrent(pending, download_dir):
 				warning(f"Auto-rename failed for {torrent.name}: {e}")
 		else:
 			lines.append(get_text("ADD_AUTO_RENAME_PENDING"))
-			threading.Thread(target=deferred_auto_rename, args=(torrent.id, torrent.name), daemon=True).start()
+			threading.Thread(target=deferred_auto_rename, args=(torrent.id, torrent.name, chat_id, thread_id), daemon=True).start()
 	if bot_settings.get("low_space_warning"):
 		space_warning = build_low_space_warning(torrent.total_size, download_dir)
 		if space_warning:
@@ -1316,33 +1573,38 @@ def build_low_space_warning(total_size, download_dir):
 	return get_text("LOW_SPACE_WARNING", sizeof_fmt(total_size), sizeof_fmt(free))
 
 
-def do_add_torrent(chat_id, message_id, pending_id, download_dir):
+def do_add_torrent(chat_id, message_id, pending_id, download_dir, thread_id=None, category=None):
 	pending = pop_pending_torrent(pending_id)
 	if pending is None:
 		edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
 		return
 	try:
-		text = perform_add_torrent(pending, download_dir)
+		text = perform_add_torrent(pending, download_dir, chat_id, thread_id, category)
 	except TorrentClientError as e:
 		text = get_text("ADD_ERROR", html.escape(str(e)))
 	edit_message(chat_id, message_id, text)
 
 
 def start_add_flow(chat_id, name, magnet=None, data=None, thread_id=None):
-	"""Entry point when receiving a torrent: asks for the download dir, or adds it
-	directly to the automatic directory when auto download is enabled"""
+	"""Entry point when receiving a torrent: asks for the category or the download
+	dir, or adds it directly when auto download is enabled"""
 	if bot_settings.get("auto_download"):
+		category = auto_category()
 		download_dir = bot_settings.get("auto_download_dir")
 		try:
-			if not download_dir:
+			if not category and not download_dir:
 				download_dir = client.get_default_download_dir()
-			text = perform_add_torrent({"name": name, "magnet": magnet, "data": data}, download_dir)
+			text = perform_add_torrent({"name": name, "magnet": magnet, "data": data},
+									download_dir, chat_id, thread_id, category)
 		except TorrentClientError as e:
 			text = get_text("ADD_ERROR", html.escape(str(e)))
 		send_message(chat_id, text, thread_id=thread_id)
 		return
 	pending_id = new_pending_torrent(name, magnet=magnet, data=data)
-	ask_download_dir(chat_id, pending_id, name, thread_id=thread_id)
+	if get_known_categories():
+		ask_add_category(chat_id, pending_id, name, thread_id=thread_id)
+	else:
+		ask_download_dir(chat_id, pending_id, name, thread_id=thread_id)
 
 
 def extract_magnet_name(magnet):
@@ -1485,7 +1747,7 @@ def pop_pending_input(chat_id, user_id):
 
 def handle_pending_input(message, pending):
 	chat_id = message.chat.id
-	thread_id = message.message_thread_id
+	thread_id = normalize_thread(message.message_thread_id)
 	text = message.text.strip()
 	action = pending["action"]
 
@@ -1609,11 +1871,16 @@ def handle_pending_input(message, pending):
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 
 
-def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None):
+def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None, apply=None, target=None):
 	"""Show a progress message and deliver the move order in a background thread
 	(the RPC blocks until the physical move is finished). The message is updated
 	with the final result. If the daemon does not answer (e.g. busy relocating
-	large amounts of data), keep retrying until it is delivered."""
+	large amounts of data), keep retrying until it is delivered.
+	apply overrides what is delivered, for the operations that also relocate the
+	data and block the same way (assigning a category to an auto managed
+	torrent); it must be safe to call again on a retry."""
+	deliver = apply or (lambda: client.move_torrents(ids, new_dir))
+	target = target or new_dir  # What the logs call the destination
 	if message_id is not None:
 		edit_message(chat_id, message_id, progress_text)
 	else:
@@ -1628,7 +1895,7 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 
 	def worker():
 		try:
-			client.move_torrents(ids, new_dir)
+			deliver()
 			finish(success_text)
 			return
 		except PermanentTorrentError as e:
@@ -1648,8 +1915,8 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 		for _ in range(MOVE_RETRY_ATTEMPTS):
 			time.sleep(MOVE_RETRY_DELAY)
 			try:
-				client.move_torrents(ids, new_dir)
-				debug(f"Move order delivered after retrying: {len(ids)} torrents -> {new_dir}")
+				deliver()
+				debug(f"Move order delivered after retrying: {len(ids)} torrents -> {target}")
 				finish(success_text)
 				return
 			except TorrentClientError as e:
@@ -1902,12 +2169,15 @@ def handle_callback(call):
 	except Exception:
 		pass
 
-	stop_dashboard(chat_id, message_id)
-	dispatch_callback(chat_id, message_id, call.from_user.id, call.data)
+	thread_id = normalize_thread(call.message.message_thread_id)
+	stop_dashboard(chat_id, message_id, thread_id)
+	dispatch_callback(chat_id, message_id, call.from_user.id, call.data, thread_id=thread_id)
 
 
-def dispatch_callback(chat_id, message_id, user_id, data):
-	"""Runs the action encoded in a callback_data string, editing message_id"""
+def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
+	"""Runs the action encoded in a callback_data string, editing message_id.
+	thread_id is the topic the button was pressed in: the screens that answer by
+	sending a new message instead of editing must stay in that same topic"""
 	parts = data.split("|")
 	command = parts[0]
 	args = parts[1:]
@@ -1920,11 +2190,11 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			delete_message(chat_id, message_id)
 
 		elif command == "dashboard" or command == "refreshDashboard":
-			show_dashboard(chat_id, message_id=message_id)
+			show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)
 
 		elif command == "list":
 			filter_key, page = args[0], args[1]
-			render_list(chat_id, message_id, filter_key, page)
+			render_list(chat_id, message_id, filter_key, page, thread_id=thread_id)
 
 		elif command == "info":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -1987,7 +2257,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 					edit_message(chat_id, message_id, get_text(rename_key(torrent, "RENAME_SUGGEST"), html.escape(torrent.name), html.escape(suggested)), markup)
 				else:
 					ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)),
-								message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
+								thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
 
 		elif command == "renameAuto":
 			ctx = get_nav_context(args[0])
@@ -2019,7 +2289,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 			else:
 				ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)),
-							message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
+							thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
 
 		elif command in ("files", "file", "fileAuto", "fileManual", "filesAll", "filesAllOk"):
 			ctx = get_nav_context(args[0])
@@ -2047,7 +2317,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 					edit_message(chat_id, message_id, text, markup)
 				elif command == "fileManual":
 					ask_for_input(chat_id, user_id, "renameFile", get_text("FILE_RENAME_ASK", html.escape(file_basename(entry[0]))),
-								message_id=message_id, torrent_id=torrent_id, file_path=entry[0], back_call=file_back_call)
+								thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, file_path=entry[0], back_call=file_back_call)
 				else:
 					plan, collisions = build_rename_plan(torrent, only_path=entry[0])
 					if collisions:
@@ -2117,7 +2387,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 				else:
 					progress_text = get_text("MOVING", html.escape(name), html.escape(new_dir))
 					success_text = get_text("MOVE_OK", html.escape(name), html.escape(new_dir))
-					deliver_move_order(chat_id, [torrent_id], new_dir, progress_text, success_text, message_id=message_id, reply_markup=back_close_markup(back_call))
+					deliver_move_order(chat_id, [torrent_id], new_dir, progress_text, success_text, thread_id=thread_id, message_id=message_id, reply_markup=back_close_markup(back_call))
 			else:
 				name = torrent.name if torrent else ""
 				prompt = get_text("MOVE_NEW_DIR_ASK")
@@ -2125,14 +2395,60 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 					prompt = f"{current_dirs_text([torrent.download_dir])}\n{prompt}"
 				if name:
 					prompt = f"{get_text('MOVE_ASK_DIR', html.escape(name))}\n\n{prompt}"
-				ask_for_input(chat_id, user_id, "move", prompt, message_id=message_id, torrent_id=torrent_id, name=name, back_call=back_call)
+				ask_for_input(chat_id, user_id, "move", prompt, thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, name=name, back_call=back_call)
 
 		elif command == "search":
-			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), message_id=message_id)
+			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), thread_id=thread_id, message_id=message_id)
 
 		elif command == "trackers":
 			text, markup = build_trackers_menu()
 			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "categories":
+			text, markup = build_categories_menu(int(args[0]) if args else 0)
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "catMenu":
+			ctx = get_nav_context(args[0])
+			if ctx is None:
+				edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
+				return
+			torrent_id, filter_key, page = ctx
+			cat_page = int(args[1]) if len(args) > 1 else 0
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			else:
+				text, markup = build_torrent_category_screen(torrent, filter_key, page, cat_page)
+				edit_message(chat_id, message_id, text, markup)
+
+		elif command == "catSet":
+			ctx = get_nav_context(args[0])
+			category = get_cat_by_id(args[1])
+			if ctx is None or category is None:
+				edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
+				return
+			torrent_id, filter_key, page = ctx
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			elif torrent.auto_managed:
+				# Relocates the data: same blocking call and same progress and
+				# retry treatment as a move, or the screen would just hang
+				back_call = build_call("info", torrent_id, filter_key, page)
+				label = html.escape(category) if category else get_text("CATEGORY_NONE")
+				deliver_move_order(
+					chat_id, [torrent_id], "",
+					get_text("CATEGORY_CHANGING", html.escape(torrent.name), label),
+					get_text("CATEGORY_DONE", html.escape(torrent.name), label),
+					message_id=message_id, thread_id=thread_id,
+					reply_markup=back_close_markup(back_call),
+					apply=lambda: client.set_category([torrent_id], category),
+					target=f"category '{category}'" if category else "no category")
+			else:
+				client.set_category([torrent_id], category)
+				time.sleep(0.5)
+				render_detail(chat_id, message_id, torrent_id, filter_key, page)
 
 		elif command == "addTo":
 			pending_id, dir_id = args[0], args[1]
@@ -2140,7 +2456,46 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			if download_dir is None:
 				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
 			else:
-				do_add_torrent(chat_id, message_id, pending_id, download_dir)
+				do_add_torrent(chat_id, message_id, pending_id, download_dir, thread_id=thread_id)
+
+		elif command == "autoManage":
+			ctx = get_nav_context(args[0])
+			if ctx is None:
+				edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
+				return
+			torrent_id, filter_key, page = ctx
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			else:
+				# Handing the location over relocates the data to the category
+				# folder, so it blocks exactly like a move does
+				back_call = build_call("info", torrent_id, filter_key, page)
+				destination = category_save_path(torrent.category) or "?"
+				deliver_move_order(
+					chat_id, [torrent_id], "",
+					get_text("AUTO_MANAGE_CHANGING", html.escape(torrent.name), html.escape(destination)),
+					get_text("AUTO_MANAGE_DONE", html.escape(torrent.name), html.escape(destination)),
+					message_id=message_id, thread_id=thread_id,
+					reply_markup=back_close_markup(back_call),
+					apply=lambda: client.set_auto_managed([torrent_id], True),
+					target=f"automatic management -> {destination}")
+
+		elif command == "addCatPage":
+			pending_id, cat_page = args[0], int(args[1])
+			pending = get_pending_torrent(pending_id)
+			if pending is None:
+				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
+			else:
+				ask_add_category(chat_id, pending_id, pending["name"], message_id=message_id, cat_page=cat_page)
+
+		elif command == "addCat":
+			pending_id, cat_id = args[0], args[1]
+			category = get_cat_by_id(cat_id)
+			if category is None or get_pending_torrent(pending_id) is None:
+				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
+			else:
+				do_add_torrent(chat_id, message_id, pending_id, None, thread_id=thread_id, category=category)
 
 		elif command == "addNewDir":
 			pending_id = args[0]
@@ -2152,12 +2507,12 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 				name = pending_torrent.get("name")
 				if name:
 					prompt = f"{get_text('ADD_ASK_DIR', html.escape(name))}\n\n{prompt}"
-				ask_for_input(chat_id, user_id, "addDir", prompt, message_id=message_id, pending_id=pending_id,
+				ask_for_input(chat_id, user_id, "addDir", prompt, thread_id=thread_id, message_id=message_id, pending_id=pending_id,
 							back_call=build_call("dashboard"))
 
 		elif command == "cancelAdd":
 			pop_pending_torrent(args[0])
-			show_dashboard(chat_id, message_id=message_id)
+			show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)
 
 		elif command == "addDirPage":
 			pending_id, dir_page = args[0], int(args[1])
@@ -2165,7 +2520,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			if pending is None:
 				edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
 			else:
-				ask_download_dir(chat_id, pending_id, pending["name"], message_id=message_id, dir_page=dir_page)
+				ask_download_dir(chat_id, pending_id, pending["name"], thread_id=thread_id, message_id=message_id, dir_page=dir_page)
 
 		elif command == "mass":
 			action, filter_key = args[0], args[1]
@@ -2182,7 +2537,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			if new_dir is None:
 				edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
 			else:
-				do_mass_move_to(chat_id, filter_key, new_dir, message_id=message_id)
+				do_mass_move_to(chat_id, filter_key, new_dir, thread_id=thread_id, message_id=message_id)
 
 		elif command == "massMoveNew":
 			filter_key = args[0]
@@ -2194,7 +2549,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 					prompt = f"{dirs_text}\n{prompt}"
 			except (ExpiredContext, TorrentClientError):
 				pass
-			ask_for_input(chat_id, user_id, "massMove", prompt, message_id=message_id, filter_key=filter_key,
+			ask_for_input(chat_id, user_id, "massMove", prompt, thread_id=thread_id, message_id=message_id, filter_key=filter_key,
 						back_call=build_call("list", filter_key, 0))
 
 		elif command == "settings":
@@ -2214,11 +2569,11 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			render_settings(chat_id, message_id)
 
 		elif command == "setDownLimit":
-			ask_for_input(chat_id, user_id, "downLimit", get_text("SETTINGS_ASK_DOWN_LIMIT"), message_id=message_id,
+			ask_for_input(chat_id, user_id, "downLimit", get_text("SETTINGS_ASK_DOWN_LIMIT"), thread_id=thread_id, message_id=message_id,
 						back_call=build_call("settings"))
 
 		elif command == "setUpLimit":
-			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), message_id=message_id,
+			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), thread_id=thread_id, message_id=message_id,
 						back_call=build_call("settings"))
 
 		elif command == "toggleSetting":
@@ -2252,14 +2607,32 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			render_settings(chat_id, message_id)
 
 		elif command == "autoDirNew":
-			ask_for_input(chat_id, user_id, "autoDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id,
+			ask_for_input(chat_id, user_id, "autoDir", get_text("MOVE_NEW_DIR_ASK"), thread_id=thread_id, message_id=message_id,
 						back_call=build_call("settings"))
+
+		elif command == "autoCatMenu":
+			markup = build_category_markup(
+				cat_call=lambda cat_id: build_call("autoCatSet", cat_id),
+				cancel_call=build_call("settings"),
+				include_none=False,
+				page_parts=("autoCatMenu",),
+				page=int(args[0]) if args else 0,
+			)
+			markup.keyboard.insert(0, [InlineKeyboardButton(get_text("BUTTON_AUTO_CATEGORY_NONE"), callback_data=build_call("autoCatSet", get_cat_id("")))])
+			text = f"{get_text('AUTO_CATEGORY_ASK')}\n\n{get_text('AUTO_CATEGORY_CURRENT', auto_category_label())}"
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "autoCatSet":
+			category = get_cat_by_id(args[0])
+			if category is not None:
+				bot_settings.set("auto_category", category)
+			render_settings(chat_id, message_id)
 
 		elif command == "favDirsMenu":
 			render_favorite_dirs_menu(chat_id, message_id)
 
 		elif command == "favDirAdd":
-			ask_for_input(chat_id, user_id, "favDir", get_text("MOVE_NEW_DIR_ASK"), message_id=message_id,
+			ask_for_input(chat_id, user_id, "favDir", get_text("MOVE_NEW_DIR_ASK"), thread_id=thread_id, message_id=message_id,
 						back_call=build_call("favDirsMenu"))
 
 		elif command == "favDirDel":
@@ -2281,7 +2654,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			current_block = get_text("TPL_ASK_CURRENT", html.escape(current), html.escape(parse_name(example) or "-"))
 			prompt_key = {"movie": "TPL_ASK_MOVIE", "series": "TPL_ASK_SERIES", "season": "TPL_ASK_SEASON"}[kind]
 			prompt = get_text(prompt_key, f"{current_block}\n\n{get_text('TPL_FIELDS_HELP')}")
-			ask_for_input(chat_id, user_id, "template", prompt, message_id=message_id, kind=kind,
+			ask_for_input(chat_id, user_id, "template", prompt, thread_id=thread_id, message_id=message_id, kind=kind,
 						back_call=build_call("tplMenu"))
 
 		elif command == "tplReset":
@@ -2296,7 +2669,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			if base is None:
 				edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
 			else:
-				ask_for_input(chat_id, user_id, "gotoPage", get_text("GOTO_PAGE_ASK", pages),
+				ask_for_input(chat_id, user_id, "gotoPage", get_text("GOTO_PAGE_ASK", pages), thread_id=thread_id,
 							back_call=f"{base}|{page}", target_message_id=message_id, base=base, pages=pages)
 
 		elif command == "cancelInput":
@@ -2305,7 +2678,7 @@ def dispatch_callback(chat_id, message_id, user_id, data):
 			if back_call:
 				edit_message(chat_id, message_id, get_text("INPUT_CANCELLED"), back_close_markup(back_call))
 			else:
-				show_dashboard(chat_id, message_id=message_id)
+				show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)
 
 		else:
 			debug(f"Unknown callback: {data}")

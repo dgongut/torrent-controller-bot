@@ -209,7 +209,7 @@ class DelugeClient(TorrentClient):
 			return None
 		return self._to_info(torrent_id, t, full=True)
 
-	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None):
+	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		options = {}
 		if download_dir:
 			options["download_location"] = download_dir

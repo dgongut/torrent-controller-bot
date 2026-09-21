@@ -1,6 +1,6 @@
 FROM alpine:3.23.5
 
-ARG VERSION=1.3.1
+ARG VERSION=1.4.0
 
 ENV TZ=UTC
 

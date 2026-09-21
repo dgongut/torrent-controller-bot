@@ -35,6 +35,8 @@ MONITOR_INTERVAL_SECONDS = 30  # Seconds between torrent monitor polls (complete
 AUTO_RENAME_WAIT_DELAY = 5  # Seconds between checks while a magnet downloads its metadata
 AUTO_RENAME_WAIT_ATTEMPTS = 60  # Checks before giving up on the deferred auto-rename
 MAX_TRACKER_BUTTONS = 25  # Max trackers listed in the tracker filter menu
+CATEGORIES_PER_PAGE = 10  # Categories listed per page in the category screens
+CATEGORIES_CACHE_TTL = 10  # Seconds the category list is reused before asking again
 FILES_PER_PAGE = 8  # Files listed per page in the torrent files screen
 MAX_PLAN_PREVIEW_LINES = 12  # Renames shown in the batch rename preview
 URL_DOWNLOAD_TIMEOUT = 10  # Seconds before aborting a .torrent URL download
@@ -52,52 +54,3 @@ FILTER_QUEUED = "qu"
 FILTER_CHECKING = "ck"
 FILTER_ERROR = "er"
 
-CALL_PATTERNS = {
-	"dashboard": [],
-	"refreshDashboard": [],
-	"list": ["filterKey", "page"],
-	"noop": [],
-	"info": ["torrentId", "filterKey", "page"],
-	"pause": ["torrentId", "filterKey", "page"],
-	"resume": ["torrentId", "filterKey", "page"],
-	"verify": ["torrentId", "filterKey", "page"],
-	"delete": ["torrentId", "filterKey", "page"],
-	"confirmDelete": ["torrentId", "withData", "filterKey", "page"],
-	"rename": ["torrentId", "filterKey", "page"],
-	"renameAuto": ["torrentId", "filterKey", "page"],
-	"renameManual": ["torrentId", "filterKey", "page"],
-	"files": ["filesCtxId", "filePage"],
-	"file": ["filesCtxId", "filePage", "fileIndex"],
-	"fileAuto": ["filesCtxId", "filePage", "fileIndex"],
-	"fileManual": ["filesCtxId", "filePage", "fileIndex"],
-	"filesAll": ["filesCtxId", "filePage"],
-	"filesAllOk": ["filesCtxId", "filePage"],
-	"move": ["torrentId", "filterKey", "page"],
-	"moveToDir": ["torrentId", "dirId"],
-	"moveNewDir": ["torrentId"],
-	"search": [],
-	"trackers": [],
-	"addTo": ["pendingId", "dirId"],
-	"addNewDir": ["pendingId"],
-	"cancelAdd": ["pendingId"],
-	"mass": ["action", "filterKey"],
-	"confirmMass": ["action", "filterKey", "extra"],
-	"massMoveDir": ["filterKey", "dirId"],
-	"massMoveNew": ["filterKey"],
-	"settings": [],
-	"toggleAltSpeed": [],
-	"toggleDownLimit": [],
-	"toggleUpLimit": [],
-	"setDownLimit": [],
-	"setUpLimit": [],
-	"toggleSetting": ["settingKey"],
-	"autoDirMenu": ["dirPage"],
-	"autoDirSet": ["dirId"],
-	"autoDirDefault": [],
-	"autoDirNew": [],
-	"favDirsMenu": [],
-	"favDirAdd": [],
-	"favDirDel": ["dirId"],
-	"cancelInput": [],
-	"cerrar": [],
-}

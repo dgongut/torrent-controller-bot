@@ -26,6 +26,7 @@ Control your torrent client from a single place.
 - ✅ Renaming the files inside a torrent, one by one or in batch, dragging their subtitles along
 - ✅ Mass actions over a filter or search: resume, pause, delete or move all
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
+- ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits
 - ✅ Notifications for completed downloads and torrent errors (can be toggled from the settings)
 - ✅ Automatic download without asking for the path, with a configurable directory
@@ -125,10 +126,13 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 | Alternative speed (turtle mode) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Verify the data | ✅ | ✅ | ✅ | ❌ ² |
 | Smart, manual and automatic renaming | ✅ | ✅ | ✅ | ❌ ³ |
+| Categories | ❌ ⁴ | ✅ | ❌ ⁴ | ❌ ⁴ |
 
 ¹ Neither Deluge nor Download Station has an alternative speed mode. Regular speed limits do work on both.
 
 ² Download Station exposes no way to re-check the data of a task.
+
+⁴ Categories are a qBittorrent concept: each one carries a folder, and a torrent under **Automatic Torrent Management** takes its folder from its category, so changing the category moves the files. That is why the bot never offers both at once: on an auto managed torrent the move button is replaced by the category one, and moving by hand stays available inside that screen, stating that the torrent switches to manual mode. Transmission and Deluge have labels, but they are plain labels with no folder attached (and Deluge needs the Label plugin on top), so the bot does not use them.
 
 ³ The Download Station API has no field for the name of a task or of the files it contains: the only editable thing about a task is its destination. The content can be renamed on disk with File Station, but then the task no longer finds its files and breaks on the next check DSM makes (a reboot of the NAS, of the package, or a pause and resume), so the bot does not do it. It is the same limitation the DSM interface itself has, where a download cannot be renamed either.
 

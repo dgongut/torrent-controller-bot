@@ -194,7 +194,7 @@ class TransmissionClient(TorrentClient):
 			raise TorrentClientError(f"Error getting torrent {torrent_id}: {e}")
 		return self._to_info(torrent, full=True)
 
-	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None):
+	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		try:
 			kwargs = {}
 			if download_dir:
