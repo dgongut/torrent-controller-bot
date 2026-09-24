@@ -21,7 +21,7 @@ from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentSt
 import bot_settings
 import config as _config_module
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
