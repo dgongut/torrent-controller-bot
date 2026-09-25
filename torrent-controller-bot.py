@@ -1,6 +1,7 @@
 import html
 import json
 import math
+import os
 import re
 import requests
 import sys
@@ -15,13 +16,13 @@ from telebot.types import ForceReply
 from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
-from message_queue import MessageQueue
+from message_queue import MessageQueue, describe_error
 from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, suggest_file_name, suggest_name, validate_template
 from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentStatus, create_client
 import bot_settings
 import config as _config_module
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -2089,6 +2090,28 @@ def ask_for_input(chat_id, user_id, action, prompt, thread_id=None, message_id=N
 	set_pending_input(chat_id, user_id, action, prompt_message_id=prompt_message_id, **extra)
 
 
+def download_telegram_file(file_id):
+	"""Downloads a file sent to the bot. Telegram's servers sometimes stop
+	answering for a while, so a network failure is retried: both requests only
+	read, repeating them is harmless. An error answered by Telegram itself
+	(file too big, expired...) is final and raised straight away.
+	bot.download_file is not used because it sets no timeout: a stalled
+	download would hang the handler forever"""
+	for attempt in range(1, TELEGRAM_DOWNLOAD_ATTEMPTS + 1):
+		try:
+			file_info = bot.get_file(file_id)
+			response = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}",
+									timeout=(telebot.apihelper.CONNECT_TIMEOUT, telebot.apihelper.READ_TIMEOUT))
+			if response.status_code != 200:
+				raise telebot.apihelper.ApiHTTPException("Download file", response)
+			return response.content
+		except requests.exceptions.RequestException as e:
+			if attempt == TELEGRAM_DOWNLOAD_ATTEMPTS:
+				raise
+			warning(f"Cannot download file from Telegram (attempt {attempt}/{TELEGRAM_DOWNLOAD_ATTEMPTS}), retrying: {describe_error(e)}")
+			time.sleep(TELEGRAM_DOWNLOAD_RETRY_DELAY)
+
+
 @bot.message_handler(content_types=["document"])
 def handle_document(message):
 	if not check_auth(message):
@@ -2101,10 +2124,9 @@ def handle_document(message):
 		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message.message_thread_id)
 		return
 	try:
-		file_info = bot.get_file(document.file_id)
-		data = bot.download_file(file_info.file_path)
+		data = download_telegram_file(document.file_id)
 	except Exception as e:
-		send_message(message.chat.id, get_text("ADD_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
+		send_message(message.chat.id, get_text("ADD_ERROR", html.escape(describe_error(e))), thread_id=message.message_thread_id)
 		return
 	name = document.file_name[:-len(".torrent")]
 	start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
@@ -2734,6 +2756,23 @@ def torrent_monitor():
 		time.sleep(MONITOR_INTERVAL_SECONDS)
 
 
+def track_polling_heartbeat():
+	"""Touches HEARTBEAT_PATH every time Telegram answers a poll. infinity_polling
+	swallows every error and retries forever, so a bot that serves nobody (no
+	network, or a 409 because another instance uses the same token) keeps the
+	process alive; the Docker HEALTHCHECK looks at how old this file is instead"""
+	get_updates = bot.get_updates
+	def get_updates_with_heartbeat(*args, **kwargs):
+		updates = get_updates(*args, **kwargs)
+		try:
+			with open(HEARTBEAT_PATH, "a"):
+				os.utime(HEARTBEAT_PATH)
+		except OSError as e:
+			warning(f"Cannot update heartbeat file {HEARTBEAT_PATH}: {e}")
+		return updates
+	bot.get_updates = get_updates_with_heartbeat
+
+
 if __name__ == "__main__":
 	debug(f"torrent-controller-bot {VERSION} started. Connected to {client_version}")
 	send_startup_message()
@@ -2752,4 +2791,5 @@ if __name__ == "__main__":
 		])
 	except Exception as e:
 		warning(f"Cannot set bot commands: {e}")
+	track_polling_heartbeat()
 	bot.infinity_polling(timeout=60)

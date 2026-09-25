@@ -41,6 +41,9 @@ FILES_PER_PAGE = 8  # Files listed per page in the torrent files screen
 MAX_PLAN_PREVIEW_LINES = 12  # Renames shown in the batch rename preview
 URL_DOWNLOAD_TIMEOUT = 10  # Seconds before aborting a .torrent URL download
 URL_DOWNLOAD_MAX_BYTES = 10 * 1024 * 1024  # A .torrent bigger than this is rejected
+TELEGRAM_DOWNLOAD_ATTEMPTS = 3  # Tries to fetch a .torrent sent to the bot before giving up
+TELEGRAM_DOWNLOAD_RETRY_DELAY = 3  # Seconds between those tries
+HEARTBEAT_PATH = "/tmp/torrent-controller-bot.heartbeat"  # Touched on every successful poll, read by the Docker HEALTHCHECK (keep both in sync)
 
 # TORRENT STATUS FILTER CODES (short to fit in callback_data)
 FILTER_ALL = "al"

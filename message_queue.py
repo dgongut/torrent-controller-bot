@@ -29,7 +29,7 @@ def _retry_after(e):
 	return None
 
 
-def _describe(e):
+def describe_error(e):
 	"""Error text for the log, without the bot token that request URLs carry"""
 	return re.sub(r"/bot[^/\s]+/", "/bot<token>/", str(e))
 
@@ -96,16 +96,16 @@ class MessageQueue:
 						time.sleep(retry_after)
 					elif _not_delivered(e) and not last_attempt:
 						wait_time = 1 * (attempt + 1)
-						debug(f"Error sending message (attempt {attempt + 1}/{self.max_retries}): {_describe(e)}. Retrying in {wait_time}s...")
+						debug(f"Error sending message (attempt {attempt + 1}/{self.max_retries}): {describe_error(e)}. Retrying in {wait_time}s...")
 						time.sleep(wait_time)
 					elif retry_after is not None or _not_delivered(e):
-						error(f"Final error sending message after {self.max_retries} attempts: {_describe(e)}")
+						error(f"Final error sending message after {self.max_retries} attempts: {describe_error(e)}")
 						break
 					elif isinstance(e, ApiTelegramException):
-						error(f"Error sending message: {_describe(e)}")
+						error(f"Error sending message: {describe_error(e)}")
 						break
 					else:
-						warning(f"Error sending message, not retried because it may have been delivered: {_describe(e)}")
+						warning(f"Error sending message, not retried because it may have been delivered: {describe_error(e)}")
 						break
 		except Exception as e:
 			error(f"Error processing message queue: {str(e)}")

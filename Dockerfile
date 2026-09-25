@@ -1,6 +1,6 @@
-FROM alpine:3.23.5
+FROM alpine:3.24.2
 
-ARG VERSION=1.4.1
+ARG VERSION=1.4.2
 
 ENV TZ=UTC
 
@@ -24,8 +24,9 @@ RUN apk add --no-cache python3 py3-pip tzdata curl unzip && \
     export PIP_BREAK_SYSTEM_PACKAGES=1 && \
     pip3 install --no-cache-dir -Ur /app/requirements.txt
 
-# Health check
+# Health check: unhealthy when Telegram has not answered a poll for 2 minutes
+# (the bot touches the file on every poll, see HEARTBEAT_PATH in config.py)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python3 -c "import sys; sys.exit(0)" || exit 1
+    CMD python3 -c "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/torrent-controller-bot.heartbeat') > 120)"
 
 ENTRYPOINT ["python3", "torrent-controller-bot.py"]
