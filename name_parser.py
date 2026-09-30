@@ -674,28 +674,49 @@ _INHERITABLE_FIELDS = (
 )
 
 
+def _inherit_from_parents(fields, parents, keys):
+	"""Fills the fields the name lacks from its parents, nearest parent first:
+	the season folder a file sits in knows its season better than a torrent
+	named after the whole series (S01-S07)"""
+	for key in keys:
+		if fields[key]:
+			continue
+		for parent in parents:
+			if parent[key]:
+				fields[key] = parent[key]
+				break
+
+
+def _parents_title(parents):
+	"""Title for a name that has no year of its own: its own title is just the
+	leftovers of the name (numbers, tags...). The torrent, the last parent, is
+	the most reliable one"""
+	for parent in reversed(parents):
+		if parent["title"]:
+			return parent["title"]
+	return ""
+
+
 def suggest_file_name(filename, parent_name=None, single_video=False, template_movie=None,
-						template_series=None, template_season=None, season_prefix="T"):
+						template_series=None, template_season=None, season_prefix="T", folder_name=None):
 	"""Suggests a name for a single video file inside a torrent. parent_name is
 	the torrent name, used as context: the fields missing in the file are
 	inherited from it (the season included, never the episode), so files named
-	just '01.mkv' inside a season pack can still be renamed. single_video tells
-	whether the torrent holds just one video, which is what allows a file with
-	no metadata of its own to take the whole torrent name.
+	just '01.mkv' inside a season pack can still be renamed. folder_name is the
+	folder holding the file when it is not the torrent folder itself (a season
+	folder of a complete series), and is looked at before the torrent name.
+	single_video tells whether the torrent holds just one video, which is what
+	allows a file with no metadata of its own to take the whole torrent name.
 	Returns None when the file cannot be identified"""
-	parent = parse_metadata(parent_name, season_prefix=season_prefix) if parent_name else None
-	parent_is_series = bool(parent and parent["is_series"])
+	parents = [parse_metadata(name, season_prefix=season_prefix) for name in (folder_name, parent_name) if name]
+	parent_is_series = any(parent["is_series"] for parent in parents)
 	fields = parse_metadata(filename, season_prefix=season_prefix, allow_bare_episode=parent_is_series)
 	own_year = fields["year"]
 
-	if parent:
-		for key in _INHERITABLE_FIELDS:
-			if not fields[key] and parent[key]:
-				fields[key] = parent[key]
-		# Without a year of its own the file title is just the leftovers of the
-		# file name (numbers, tags...), so the torrent title is more reliable
-		if not own_year and parent["title"]:
-			fields["title"] = parent["title"]
+	if parents:
+		_inherit_from_parents(fields, parents, _INHERITABLE_FIELDS)
+		if not own_year and _parents_title(parents):
+			fields["title"] = _parents_title(parents)
 		if parent_is_series:
 			fields["is_series"] = True
 		if not fields["chapter"] and fields["season"] and "-" not in fields["season"]:
@@ -718,6 +739,39 @@ def suggest_file_name(filename, parent_name=None, single_video=False, template_m
 
 	template = _pick_template(fields, template_movie, template_series, template_season)
 	return _render(template, fields, filename)
+
+
+def suggest_folder_name(folder_name, parent_name=None, template_movie=None, template_series=None,
+						template_season=None, season_prefix="T"):
+	"""Suggests a name for a folder inside a torrent, not the torrent folder
+	itself. parent_name is the torrent name, which lends the title, year,
+	resolution... the folder lacks ('Temporada 2' inside 'Mad Men (2007)').
+	Only folders that identify something of their own are renamed: a season
+	(the season pack template), an episode (the series template) or a movie
+	with its year (the movie template). Anything else ('Extras', 'Subs') is
+	left alone, so this returns None"""
+	fields = parse_metadata(folder_name, season_prefix=season_prefix)
+	own_year = fields["year"]
+	# A folder name never carries an extension, whatever the dots suggest
+	fields["extension"] = ""
+	if fields["is_series"]:
+		if not fields["season"] and not fields["episode_number"]:
+			return None
+	elif not own_year:
+		return None
+
+	if parent_name:
+		parent = parse_metadata(parent_name, season_prefix=season_prefix)
+		# The season is what tells two season folders apart: never inherited
+		_inherit_from_parents(fields, [parent], [k for k in _INHERITABLE_FIELDS if k != "season"])
+		if not own_year and parent["title"]:
+			fields["title"] = parent["title"]
+	if not fields["title"]:
+		return None
+
+	_drop_series_title_from_episode_title(fields)
+	template = _pick_template(fields, template_movie, template_series, template_season)
+	return _render(template, fields, folder_name)
 
 
 def companion_subtitle_name(subtitle_name, video_name, new_video_name):

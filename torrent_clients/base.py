@@ -58,7 +58,7 @@ def content_root(paths, fallback=""):
 
 @dataclass
 class TorrentInfo:
-	id: str
+	id: str  # Must survive client restarts: it travels in buttons and the monitor tracks torrents by it
 	name: str
 	status: str
 	progress: float = 0.0  # 0-100
@@ -184,6 +184,13 @@ class TorrentClient(ABC):
 		"""Renames a single file inside the torrent. old_path is the path as
 		reported in TorrentInfo.files and new_name is only the new file name,
 		the file stays in the same folder"""
+		pass
+
+	@abstractmethod
+	def rename_folder(self, torrent_id, old_path, new_name):
+		"""Renames a folder inside the torrent, never the top level one (that is
+		rename_torrent). old_path is the folder path as it shows in the paths of
+		TorrentInfo.files and new_name is only the new folder name"""
 		pass
 
 	@abstractmethod

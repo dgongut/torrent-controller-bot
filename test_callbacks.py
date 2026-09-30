@@ -85,6 +85,15 @@ EXTREME_NAME = ("Some.Absurdly.Long.Series.Name.With.Everything.S01.COMPLETE.216
 EXTREME_FILES = [(f"{EXTREME_NAME}/{EXTREME_NAME[:200]}.S01E{n:02d}.mkv", 1024, True)
 				for n in range(1, 21)]
 
+# A complete series with a folder per season, the case that needs to browse
+# folders: the episodes are two levels deep and the season folders have names
+# of their own to fix, next to a folder with nothing to suggest
+SERIES_NAME = "Mad.Men.2007.COMPLETE.1080p.NF.WEB-DL"
+SERIES_FILES = ([(f"{SERIES_NAME}/Mad.Men.2007.S{s:02d}.NF.WEB-DL.1080P.AV1-Txv2/Mad.Men.S{s:02d}E{e:02d}.1080p.mkv", 1024, True)
+				for s in (1, 2) for e in range(1, 13)]
+				+ [(f"{SERIES_NAME}/Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2/Mad.Men.S01E01.1080p.es.srt", 16, True),
+				(f"{SERIES_NAME}/Extras/Making.of.mkv", 512, True)])
+
 CATEGORIES = [("Peliculas", "/mnt/user/media/peliculas"), ("Series", "/mnt/user/media/series"),
 			("Documentales", "/mnt/user/media/documentales")]
 
@@ -172,6 +181,9 @@ class FakeClient:
 
 	def rename_file(self, torrent_id, old_path, new_name):
 		CALLS.append(("rename_file", torrent_id, old_path, new_name))
+
+	def rename_folder(self, torrent_id, old_path, new_name):
+		CALLS.append(("rename_folder", torrent_id, old_path, new_name))
 
 	def move_torrents(self, torrent_ids, new_dir):
 		CALLS.append(("move_torrents", list(torrent_ids), new_dir))
@@ -344,6 +356,7 @@ PROFILES = {
 	# qBittorrent relocating by itself: the move button is gone and the category
 	# screen is the one that decides where the data lives
 	"auto managed torrents": {"name": None, "files": None, "auto_managed": True},
+	"complete series with season folders": {"name": SERIES_NAME, "files": SERIES_FILES, "auto_managed": False},
 }
 
 crawled = 0
@@ -362,8 +375,10 @@ for label, profile in PROFILES.items():
 	for command in ("list", "info", "delete", "confirmDelete", "rename", "renameAuto", "renameManual",
 					"move", "moveToDir", "files", "file", "fileAuto", "mass", "confirmMass",
 					"settings", "toggleSetting", "favDirsMenu", "tplMenu", "trackers", "goto",
-					"categories", "catMenu", "catSet"):
+					"categories", "catMenu", "catSet", "folder", "folderManual", "filesAll", "filesAllOk"):
 		check(f"[{label}] the crawler reached the {command} screen", command in reached, True)
+	if profile["files"] is SERIES_FILES:
+		check(f"[{label}] the crawler reached the folder suggestion", "folderAuto" in reached, True)
 
 PROFILE.update(PROFILES["plain names"])
 PROFILE["auto_managed"] = False
@@ -429,6 +444,75 @@ if screen is not None:
 	press(callbacks_of(screen[1])[0])  # Automatic rename
 	check("automatic rename reaches the client",
 		[c[:2] for c in CALLS if c[0] == "rename_torrent"], [("rename_torrent", TORRENT_ID)])
+
+# ---------------------------------------------------------------------------
+# 4b. COMPLETE SERIES: the folders in between are renamed too, in an order
+#     where every planned path still exists when its turn comes
+# ---------------------------------------------------------------------------
+
+PROFILE.update({"name": SERIES_NAME, "files": SERIES_FILES})
+bot_module.nav_contexts.clear()
+EDITS.clear()
+CALLS.clear()
+screen = press(bot_module.build_call("rename", TORRENT_ID, config.FILTER_ALL, 0))
+check("the full rename screen lists the season folders", "Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2" in (screen or ("",))[0], True)
+press(callbacks_of(screen[1])[0])
+renames = [c for c in CALLS if c[0] in ("rename_file", "rename_folder", "rename_torrent")]
+kinds = [c[0] for c in renames]
+check("every episode and its subtitle are renamed", kinds.count("rename_file"), 25)
+check("both season folders are renamed, the extras folder is not",
+	sorted(c[3] for c in renames if c[0] == "rename_folder"), ["T1 - Mad Men - 1080p", "T2 - Mad Men - 1080p"])
+check("files go before folders and the torrent goes last",
+	kinds, sorted(kinds, key=["rename_file", "rename_folder", "rename_torrent"].index))
+check("the torrent is renamed as well", kinds[-1], "rename_torrent")
+check("an episode takes the season of its folder",
+	("rename_file", TORRENT_ID, f"{SERIES_NAME}/Mad.Men.2007.S02.NF.WEB-DL.1080P.AV1-Txv2/Mad.Men.S02E03.1080p.mkv",
+		"2x03 - Mad Men - 1080p.mkv") in renames, True)
+check("the subtitle follows its episode",
+	("rename_file", TORRENT_ID, f"{SERIES_NAME}/Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2/Mad.Men.S01E01.1080p.es.srt",
+		"1x01 - Mad Men - 1080p.es.srt") in renames, True)
+
+# Browsing: the torrent folder opens first, a season folder can be entered and left
+torrent = fake_torrent()
+folders = bot_module.torrent_folders(torrent)
+ctx = bot_module.new_nav_context(TORRENT_ID, config.FILTER_ALL, 0)
+root_screen = press(bot_module.build_call("files", ctx, folders.index(SERIES_NAME), 0))
+root_buttons = callbacks_of(root_screen[1])
+check("the torrent folder shows its three subfolders", sum(b.startswith("files|") and b.endswith("|0") and b.count("|") == 3
+	for b in root_buttons[:3]), 3)
+check("the torrent folder cannot go further up", bot_module.get_text("BUTTON_FOLDER_UP", "/") in
+	[b.text for row in root_screen[1].keyboard for b in row], False)
+season = f"{SERIES_NAME}/Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2"
+season_screen = press(bot_module.build_call("files", ctx, folders.index(season), 0))
+season_texts = [b.text for row in season_screen[1].keyboard for b in row]
+check("a season folder lists its episodes", sum(t.startswith("🎬") for t in season_texts), bot_module.FILES_PER_PAGE)
+up = [b.callback_data for row in season_screen[1].keyboard for b in row if b.text.startswith("⬆️")]
+check("a season folder can go up to the torrent folder",
+	up, [bot_module.build_call("files", ctx, folders.index(SERIES_NAME), 0)])
+
+# Renaming the season folder being browsed leaves the torrent and its files alone
+CALLS.clear()
+press(bot_module.build_call("folderAuto", ctx, folders.index(season), 0))
+check("renaming a season folder only renames that folder",
+	CALLS, [("rename_folder", TORRENT_ID, season, "T1 - Mad Men - 1080p")])
+CALLS.clear()
+press(bot_module.build_call("folderAuto", ctx, folders.index(f"{SERIES_NAME}/Extras"), 0))
+check("a folder with nothing to suggest is not renamed", CALLS, [])
+
+# Everything inside one season, and nothing outside it
+CALLS.clear()
+press(bot_module.build_call("filesAllOk", ctx, folders.index(season), 0))
+check("renaming everything in a season stays inside that season",
+	all(season in c[2] for c in CALLS), True)
+check("renaming everything in a season renames its episodes", len(CALLS), 13)
+
+# Renaming a folder never moves the index of the folder holding it
+renamed = [(p.replace("Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2", "T1 - Mad Men - 1080p"), s, c) for p, s, c in SERIES_FILES]
+after = bot_module.torrent_folders(fake_torrent().__class__(**{**fake_torrent().__dict__, "files": renamed}))
+check("the torrent folder keeps its index after a season is renamed",
+	after.index(SERIES_NAME), folders.index(SERIES_NAME))
+
+PROFILE.update(PROFILES["plain names"])
 
 # ---------------------------------------------------------------------------
 # 5. WORST CASE: longest filter key and a three digit page

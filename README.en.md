@@ -23,14 +23,15 @@ Control your torrent client from a single place.
 - ✅ Pause, resume, verify and delete torrents (with or without their data)
 - ✅ Move torrents to another directory with a notice when the move finishes
 - ✅ Renaming with automatic suggestion for movies and series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
-- ✅ Renaming the files inside a torrent, one by one or in batch, dragging their subtitles along
+- ✅ Renaming the folders and files inside a torrent, one by one or in batch, dragging their subtitles along
+- ✅ Complete series: renames the folder, the season subfolders and the episodes in one go
 - ✅ Mass actions over a filter or search: resume, pause, delete or move all
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
 - ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits
 - ✅ Notifications for completed downloads and torrent errors (can be toggled from the settings)
 - ✅ Automatic download without asking for the path, with a configurable directory
-- ✅ Automatic rename when adding a torrent, optionally including the files it contains (can be toggled from the settings)
+- ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains (can be toggled from the settings)
 - ✅ Warning if the torrent you add may not fit on the disk
 - ✅ Bot settings persist across restarts (`/config` volume)
 - ✅ Notification to the administrator when the bot starts
@@ -77,9 +78,22 @@ When pressing ✏️ Rename on a torrent, the bot tries to generate a clean name
 
 If no suggestion can be generated, you can always type the name manually.
 
+### Complete series
+
+On a torrent that is a folder, ✏️ Rename folder renames everything in one go, with a preview before confirming: the main folder, the season subfolders and the episodes.
+
+```
+Mad.Men.2007.COMPLETE.1080p.NF.WEB-DL/                  Mad Men (2007) - 1080p/
+├── Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2/    →    ├── S1 - Mad Men - 1080p/
+│   └── Mad.Men.S01E01.1080p.mkv                        │   └── 1x01 - Mad Men - 1080p.mkv
+└── Extras/                                             └── Extras/
+```
+
+Subfolders use the season pack template (or the series or movie one when the folder is an episode or a movie with its year) and take from the torrent whatever they lack, so `Season 2` or `S04` get renamed too. Folders that identify nothing, like `Extras` or `Subs`, are left as they are.
+
 ### Files inside the torrent
 
-From a torrent's detail, the 🗂️ Files button lists the files it contains and lets you rename them one by one or all at once (with a preview before confirming). Files inherit from the torrent name whatever they do not carry themselves (title, year and season, never the episode), so a bare episode like `01.mkv` inside `Show.Name.S02.1080p` becomes `2x01 - Show Name - 1080p.mkv`. Subtitles next to a video are renamed along with it so they keep matching, and everything goes through the torrent client, so seeding is preserved.
+From a torrent's detail, the 🗂️ Files button lets you browse its folders (enter a subfolder, ⬆️ go up to the previous one) and rename the folder you are in, each file one by one or everything in that folder at once (with a preview before confirming). Files inherit from their season folder and the torrent name whatever they do not carry themselves (title, year and season, never the episode), so a bare episode like `01.mkv` inside `Show.Name.S02.1080p` becomes `2x01 - Show Name - 1080p.mkv`. Subtitles next to a video are renamed along with it so they keep matching, and everything goes through the torrent client, so seeding is preserved.
 
 ### Episode title
 

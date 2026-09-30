@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import transmission_rpc
 
 from torrent_clients.base import (
+	PermanentTorrentError,
 	SessionSummary,
 	TorrentClient,
 	TorrentClientError,
@@ -19,13 +20,13 @@ from torrent_clients.base import (
 LIGHT_FIELDS = [
 	"id", "name", "status", "error", "errorString", "percentDone",
 	"sizeWhenDone", "rateDownload", "rateUpload", "downloadDir", "addedDate",
-	"trackers",
+	"trackers", "hashString",
 ]
 
 FULL_FIELDS = LIGHT_FIELDS + [
 	"totalSize", "downloadedEver", "uploadedEver", "uploadRatio", "eta",
 	"peersConnected", "peersSendingToUs", "peersGettingFromUs",
-	"files", "hashString", "isFinished",
+	"files", "isFinished",
 	# get_files() combines these three: without them it raises KeyError
 	"fileStats", "priorities", "wanted",
 ]
@@ -46,6 +47,27 @@ STATUS_MAP = {
 	"seed pending": TorrentStatus.QUEUED,
 	"seeding": TorrentStatus.SEEDING,
 }
+
+
+HEX_DIGITS = set("0123456789abcdefABCDEF")
+
+
+def is_info_hash(torrent_id):
+	return isinstance(torrent_id, str) and len(torrent_id) == 40 and not set(torrent_id) - HEX_DIGITS
+
+
+def rpc_id(torrent_id):
+	"""The info hash is the id handed to the bot, never the numeric id:
+	Transmission renumbers those every time the daemon starts, and a button
+	pressed after a restart would act on whichever torrent took that number.
+	Anything else is an id from before this change, which cannot be trusted"""
+	if not is_info_hash(torrent_id):
+		raise PermanentTorrentError(f"Torrent not found: {torrent_id}")
+	return torrent_id
+
+
+def rpc_ids(torrent_ids):
+	return [rpc_id(i) for i in torrent_ids]
 
 
 class TransmissionClient(TorrentClient):
@@ -93,7 +115,7 @@ class TransmissionClient(TorrentClient):
 				trackers.append(host)
 		eta = self._raw(torrent, "eta", -1)
 		info = TorrentInfo(
-			id=str(torrent.id),
+			id=self._raw(torrent, "hashString", "") or "",
 			name=torrent.name,
 			status=self._normalize_status(torrent),
 			progress=round(self._raw(torrent, "percentDone", 0) * 100, 2),
@@ -186,8 +208,10 @@ class TransmissionClient(TorrentClient):
 		return result
 
 	def get_torrent(self, torrent_id):
+		if not is_info_hash(torrent_id):
+			return None
 		try:
-			torrent = self.client.get_torrent(int(torrent_id), arguments=FULL_FIELDS)
+			torrent = self.client.get_torrent(torrent_id, arguments=FULL_FIELDS)
 		except KeyError:
 			return None
 		except Exception as e:
@@ -205,7 +229,7 @@ class TransmissionClient(TorrentClient):
 				torrent = self.client.add_torrent(torrent_data, **kwargs)
 			else:
 				raise TorrentClientError("No magnet or torrent data provided")
-			return self.get_torrent(torrent.id) or self._to_info(torrent)
+			return self.get_torrent(torrent.hashString) or self._to_info(torrent)
 		except TorrentClientError:
 			raise
 		except Exception as e:
@@ -213,31 +237,39 @@ class TransmissionClient(TorrentClient):
 
 	def remove_torrents(self, torrent_ids, delete_data=False):
 		try:
-			self.client.remove_torrent([int(i) for i in torrent_ids], delete_data=delete_data)
+			self.client.remove_torrent(rpc_ids(torrent_ids), delete_data=delete_data)
+		except PermanentTorrentError:
+			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error removing torrents: {e}")
 
 	def pause_torrents(self, torrent_ids):
 		try:
-			self.client.stop_torrent([int(i) for i in torrent_ids])
+			self.client.stop_torrent(rpc_ids(torrent_ids))
+		except PermanentTorrentError:
+			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error pausing torrents: {e}")
 
 	def resume_torrents(self, torrent_ids):
 		try:
-			self.client.start_torrent([int(i) for i in torrent_ids])
+			self.client.start_torrent(rpc_ids(torrent_ids))
+		except PermanentTorrentError:
+			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error resuming torrents: {e}")
 
 	def verify_torrent(self, torrent_id):
 		try:
-			self.client.verify_torrent(int(torrent_id))
+			self.client.verify_torrent(rpc_id(torrent_id))
+		except PermanentTorrentError:
+			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error verifying torrent {torrent_id}: {e}")
 
 	def rename_torrent(self, torrent_id, new_name):
 		try:
-			torrent = self.client.get_torrent(int(torrent_id), arguments=["id", "name", "files"])
+			torrent = self.client.get_torrent(rpc_id(torrent_id), arguments=["id", "name", "files"])
 			paths = [f.get("name", "") for f in (self._raw(torrent, "files", []) or [])]
 			# The path has to come from the file list: Transmission only accepts
 			# a path it really has on disk, which is not always the torrent name
@@ -245,19 +277,33 @@ class TransmissionClient(TorrentClient):
 			if not location:
 				# Single file at top level: the path to rename is the file itself
 				location = paths[0] if len(paths) == 1 else torrent.name
-			self.client.rename_torrent_path(int(torrent_id), location=location, name=new_name)
+			self.client.rename_torrent_path(rpc_id(torrent_id), location=location, name=new_name)
+		except PermanentTorrentError:
+			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error renaming torrent {torrent_id}: {e}")
 
 	def rename_file(self, torrent_id, old_path, new_name):
 		try:
-			self.client.rename_torrent_path(int(torrent_id), location=old_path, name=new_name)
+			self.client.rename_torrent_path(rpc_id(torrent_id), location=old_path, name=new_name)
+		except PermanentTorrentError:
+			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error renaming file {old_path}: {e}")
 
+	def rename_folder(self, torrent_id, old_path, new_name):
+		try:
+			self.client.rename_torrent_path(rpc_id(torrent_id), location=old_path, name=new_name)
+		except PermanentTorrentError:
+			raise
+		except Exception as e:
+			raise TorrentClientError(f"Error renaming folder {old_path}: {e}")
+
 	def move_torrents(self, torrent_ids, new_dir):
 		try:
-			self.client.move_torrent_data([int(i) for i in torrent_ids], location=new_dir, timeout=MOVE_RPC_TIMEOUT)
+			self.client.move_torrent_data(rpc_ids(torrent_ids), location=new_dir, timeout=MOVE_RPC_TIMEOUT)
+		except PermanentTorrentError:
+			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error moving torrents: {e}")
 

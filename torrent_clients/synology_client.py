@@ -756,6 +756,9 @@ class SynologyClient(TorrentClient):
 	def rename_file(self, torrent_id, old_path, new_name):
 		raise PermanentTorrentError("Download Station cannot rename files inside a task")
 
+	def rename_folder(self, torrent_id, old_path, new_name):
+		raise PermanentTorrentError("Download Station cannot rename folders inside a task")
+
 	def move_torrents(self, torrent_ids, new_dir):
 		"""Changing the destination of a task only tells Download Station where
 		the data still to come has to go: whatever is already on disk stays

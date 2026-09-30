@@ -23,14 +23,15 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Pausar, reanudar, verificar y borrar torrents (con o sin sus datos)
 - ✅ Mover torrents de directorio con aviso al terminar el movimiento
 - ✅ Renombrado con sugerencia automática para películas y series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
-- ✅ Renombrado de los archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
+- ✅ Renombrado de las carpetas y archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
+- ✅ Series completas: renombra de una vez la carpeta, las subcarpetas de temporada y los episodios
 - ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar o mover todos
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
 - ✅ Notificaciones de descarga completada y de errores en torrents (activables desde los ajustes)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
-- ✅ Renombrado automático al añadir un torrent, opcionalmente también de los archivos que contiene (activable desde los ajustes)
+- ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene (activable desde los ajustes)
 - ✅ Aviso si el torrent que añades puede no caber en el disco
 - ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
 - ✅ Notificación al administrador al arrancar el bot
@@ -78,9 +79,22 @@ Al pulsar ✏️ Renombrar sobre un torrent, el bot intenta generar una sugerenc
 
 Si no puede generar sugerencia, siempre puedes escribir el nombre manualmente.
 
+### Series completas
+
+En un torrent que es una carpeta, ✏️ Renombrar carpeta lo renombra todo de una vez, con previsualización antes de confirmar: la carpeta principal, las subcarpetas de temporada y los episodios.
+
+```
+Mad.Men.2007.COMPLETE.1080p.NF.WEB-DL/                  Mad Men (2007) - 1080p/
+├── Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2/    →    ├── T1 - Mad Men - 1080p/
+│   └── Mad.Men.S01E01.1080p.mkv                        │   └── 1x01 - Mad Men - 1080p.mkv
+└── Extras/                                             └── Extras/
+```
+
+Las subcarpetas usan la plantilla de temporada (o la de series o películas si la carpeta es un episodio o una película con su año) y toman del torrent lo que les falta, así que `Temporada 2` o `S04` también se renombran. Las carpetas que no identifican nada, como `Extras` o `Subs`, se quedan como están.
+
 ### Archivos dentro del torrent
 
-Desde el detalle de un torrent, el botón 🗂️ Archivos lista los ficheros que contiene y permite renombrarlos uno a uno o todos de golpe (con previsualización antes de confirmar). Los archivos heredan del nombre del torrent lo que no llevan encima (título, año y temporada, nunca el episodio), así que un episodio suelto como `01.mkv` dentro de `Show.Name.S02.1080p` se convierte en `2x01 - Show Name - 1080p.mkv`. Los subtítulos que acompañan a un vídeo se renombran con él para no romper el emparejamiento, y todo se hace a través del gestor de torrents, por lo que el seeding se mantiene.
+Desde el detalle de un torrent, el botón 🗂️ Archivos permite navegar por sus carpetas (entrar en una subcarpeta, ⬆️ subir a la anterior) y renombrar la carpeta en la que estás, cada archivo uno a uno o todo lo que hay en la carpeta de golpe (con previsualización antes de confirmar). Los archivos heredan de su carpeta de temporada y del nombre del torrent lo que no llevan encima (título, año y temporada, nunca el episodio), así que un episodio suelto como `01.mkv` dentro de `Show.Name.S02.1080p` se convierte en `2x01 - Show Name - 1080p.mkv`. Los subtítulos que acompañan a un vídeo se renombran con él para no romper el emparejamiento, y todo se hace a través del gestor de torrents, por lo que el seeding se mantiene.
 
 ### Título del episodio
 

@@ -1,6 +1,6 @@
 """Test battery for name_parser.py. Run with: python3 test_name_parser.py"""
 
-from name_parser import (companion_subtitle_name, parse_metadata, render_template, suggest_file_name,
+from name_parser import (companion_subtitle_name, parse_metadata, render_template, suggest_file_name, suggest_folder_name,
 						suggest_name, validate_template, TemplateError, _PLATFORM_TAGS, CANONICAL_FIELDS)
 
 FAILED = []
@@ -453,6 +453,39 @@ check("episode title starting like the series is kept",
 	suggest_file_name("1x02 - Succession Day.mkv", parent_name="Succession - Temporada 1",
 		template_series=EPISODE_TITLE_TEMPLATE),
 	"1x02 - Succession - Succession Day.mkv")
+
+# --- suggest_folder_name: folders inside a complete series --------------------
+SERIES = "Mad Men (2007) - 1080p"
+check("season folder with a release name",
+	suggest_folder_name("Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1.ESP.AAC 2.0.ING.EAC3 5.1-Txv2", SERIES),
+	"T1 - Mad Men - 1080p")
+check("bare season folder takes the title from the torrent", suggest_folder_name("Temporada 2", SERIES),
+	"T2 - Mad Men - 1080p")
+check("english season folder", suggest_folder_name("Season 3", SERIES), "T3 - Mad Men - 1080p")
+check("short season folder", suggest_folder_name("S04", SERIES), "T4 - Mad Men - 1080p")
+check("season folder with the english prefix", suggest_folder_name("Season 3", SERIES, season_prefix="S"),
+	"S3 - Mad Men - 1080p")
+check("season folder follows the season template",
+	suggest_folder_name("Temporada 2", SERIES, template_season="{title} - Temporada {season.2}"),
+	"Mad Men - Temporada 02")
+check("episode folder uses the series template without extension",
+	suggest_folder_name("Mad.Men.S05E01.1080p.WEB-DL", SERIES), "5x01 - Mad Men - 1080p")
+check("movie folder of a saga", suggest_folder_name("El.Padrino.1972.1080p.BluRay", "Trilogia El Padrino"),
+	"El Padrino (1972) - 1080p")
+check("a dotted folder name is not an extension",
+	suggest_folder_name("Show.S01.mkv", "Show (2020) - 1080p"), "T1 - Show - 1080p")
+check("extras folder is left alone", suggest_folder_name("Extras", SERIES), None)
+check("subtitles folder is left alone", suggest_folder_name("Subs", SERIES), None)
+check("an already renamed folder gives no suggestion", suggest_folder_name("T1 - Mad Men - 1080p", SERIES), None)
+check("a season folder without any title anywhere", suggest_folder_name("Temporada 2"), None)
+
+# The season folder knows the season better than a torrent named after all of them
+check("the season comes from the folder, not the S01-S07 torrent",
+	suggest_file_name("01.mkv", parent_name="Mad Men S01-S07 1080p", folder_name="Temporada 3"),
+	"3x01 - Mad Men - 1080p.mkv")
+check("the title still comes from the torrent",
+	suggest_file_name("01.mkv", parent_name="Mad Men (2007) - 1080p", folder_name="Temporada 3"),
+	"3x01 - Mad Men - 1080p.mkv")
 
 # --- companion_subtitle_name -------------------------------------------------
 check("subtitle keeps language suffix",
