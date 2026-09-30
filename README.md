@@ -81,7 +81,7 @@ Si no puede generar sugerencia, siempre puedes escribir el nombre manualmente.
 
 ### Series completas
 
-En un torrent que es una carpeta, ✏️ Renombrar carpeta lo renombra todo de una vez, con previsualización antes de confirmar: la carpeta principal, las subcarpetas de temporada y los episodios.
+En un torrent que es una carpeta, 🪄 Renombrar lo renombra todo de una vez, con previsualización antes de confirmar: la carpeta principal, las subcarpetas de temporada y los episodios.
 
 ```
 Mad.Men.2007.COMPLETE.1080p.NF.WEB-DL/                  Mad Men (2007) - 1080p/

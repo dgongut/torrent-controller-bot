@@ -62,7 +62,7 @@
 	"BUTTON_RESUME": "▶️ Reanudar",
 	"BUTTON_DELETE": "🗑️ Borrar",
 	"BUTTON_RENAME": "✏️ Renombrar",
-	"BUTTON_RENAME_FOLDER": "✏️ Renombrar carpeta",
+	"BUTTON_RENAME_FOLDER": "🪄 Renombrar",
 	"BUTTON_MOVE": "📦 Mover",
 	"BUTTON_VERIFY": "🔬 Verificar",
 	"DELETE_CONFIRM": "¿Seguro que quieres borrar <b>$1</b>?",

@@ -80,7 +80,7 @@ If no suggestion can be generated, you can always type the name manually.
 
 ### Complete series
 
-On a torrent that is a folder, ✏️ Rename folder renames everything in one go, with a preview before confirming: the main folder, the season subfolders and the episodes.
+On a torrent that is a folder, 🪄 Rename renames everything in one go, with a preview before confirming: the main folder, the season subfolders and the episodes.
 
 ```
 Mad.Men.2007.COMPLETE.1080p.NF.WEB-DL/                  Mad Men (2007) - 1080p/

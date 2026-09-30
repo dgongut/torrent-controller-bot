@@ -62,7 +62,7 @@
 	"BUTTON_RESUME": "▶️ Resume",
 	"BUTTON_DELETE": "🗑️ Delete",
 	"BUTTON_RENAME": "✏️ Rename",
-	"BUTTON_RENAME_FOLDER": "✏️ Rename folder",
+	"BUTTON_RENAME_FOLDER": "🪄 Rename",
 	"BUTTON_MOVE": "📦 Move",
 	"BUTTON_VERIFY": "🔬 Verify",
 	"DELETE_CONFIRM": "Are you sure you want to delete <b>$1</b>?",
