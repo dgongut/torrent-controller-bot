@@ -895,6 +895,70 @@ _text, markup = bot_module.build_categories_menu(0)
 check("a handful of categories shows no pagination",
 	any(b.text in ("⬅️", "➡️") for row in markup.keyboard for b in row), False)
 
+# ---------------------------------------------------------------------------
+# 11. SEVERAL BOTS IN A GROUP: /command@OtherBot is not for this bot
+# ---------------------------------------------------------------------------
+# telebot strips the @mention when matching commands without checking whose it
+# is, so real updates go through the real dispatcher here, filters included
+
+import telebot
+
+GROUP_ID = -1001234567890
+STRANGER_ID = 999  # Not in TELEGRAM_ADMIN
+update_ids = iter(range(1, 10_000))
+
+
+def group_update(text, user_id=1):
+	entity_length = len(text.split(maxsplit=1)[0])
+	return telebot.types.Update.de_json({
+		"update_id": next(update_ids),
+		"message": {
+			"message_id": next(update_ids),
+			"date": int(time.time()),
+			"chat": {"id": GROUP_ID, "type": "supergroup", "title": "Group"},
+			"from": {"id": user_id, "is_bot": False, "first_name": "User"},
+			"text": text,
+			"entities": [{"type": "bot_command", "offset": 0, "length": entity_length}],
+		},
+	})
+
+
+listed = []
+_real_render_list = bot_module.render_list
+bot_module.render_list = lambda chat_id, *a, **k: listed.append(chat_id)
+bot_module.bot.get_me = lambda: telebot.types.User(id=42, is_bot=True, first_name="Own", username="OwnBot")
+bot_module.bot.threaded = False  # Run the handlers inline so they can be asserted
+bot_module._bot_username = None
+
+
+def send_command(text, user_id=1):
+	listed.clear()
+	SENDS.clear()
+	bot_module.bot.process_new_updates([group_update(text, user_id)])
+	return len(listed), len(SENDS)
+
+
+check("/list is answered", send_command("/list")[0], 1)
+check("/list@OwnBot is answered", send_command("/list@OwnBot")[0], 1)
+check("/list@ownbot is answered (case-insensitive)", send_command("/list@ownbot")[0], 1)
+check("/list@OtherBot is ignored", send_command("/list@OtherBot"), (0, 0))
+check("an unauthorized /start@OtherBot gets no reply", send_command("/start@OtherBot", STRANGER_ID), (0, 0))
+check("an unauthorized /start@OwnBot is still refused", send_command("/start@OwnBot", STRANGER_ID)[1], 1)
+
+# A command for another bot must not cancel nor answer a pending text input
+bot_module.set_pending_input(GROUP_ID, 1, "search")
+send_command("/list@OtherBot")
+check("/list@OtherBot keeps the pending input", bot_module.pop_pending_input(GROUP_ID, 1), {"action": "search"})
+
+# When Telegram cannot say who this bot is, every command is taken as its own
+def unreachable():
+	raise ConnectionError("Telegram unreachable")
+bot_module.bot.get_me = unreachable
+bot_module._bot_username = None
+check("without a known username /list@OtherBot is answered", send_command("/list@OtherBot")[0], 1)
+
+bot_module.render_list = _real_render_list
+
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
 	print("\n\n".join(FAILED))

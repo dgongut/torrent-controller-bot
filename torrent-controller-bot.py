@@ -22,7 +22,7 @@ from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentSt
 import bot_settings
 import config as _config_module
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -2230,6 +2230,38 @@ def do_mass_move_to(chat_id, filter_key, new_dir, thread_id=None, message_id=Non
 # COMMAND HANDLERS
 # ---------------------------------------------------------------------------
 
+_bot_username = None
+
+
+def bot_username():
+	"""Username of this bot, asked to Telegram once. None while it cannot be
+	known, and then every command is taken as addressed to this bot"""
+	global _bot_username
+	if _bot_username is None:
+		try:
+			_bot_username = bot.get_me().username.lower()
+		except Exception as e:
+			warning(f"Cannot get the bot username: {describe_error(e)}")
+	return _bot_username
+
+
+def is_for_another_bot(message):
+	"""True for /command@OtherBot. telebot drops the @mention when matching
+	commands, so in a group with several bots every one of them would answer"""
+	if not message.text or not message.text.startswith("/"):
+		return False
+	command = message.text.split(maxsplit=1)[0]
+	if "@" not in command:
+		return False
+	mentioned = command.split("@", 1)[1].lower()
+	own = bot_username()
+	return own is not None and mentioned != own
+
+
+def for_me(message):
+	return not is_for_another_bot(message)
+
+
 def check_auth(message):
 	if not is_authorized(message.from_user.id, message.chat.id):
 		warning(f"Unauthorized access attempt: user {message.from_user.id} in chat {message.chat.id}")
@@ -2238,7 +2270,7 @@ def check_auth(message):
 	return True
 
 
-@bot.message_handler(commands=["start"])
+@bot.message_handler(func=for_me, commands=["start"])
 def command_start(message):
 	if not check_auth(message):
 		return
@@ -2246,7 +2278,7 @@ def command_start(message):
 	show_dashboard(message.chat.id, thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["help"])
+@bot.message_handler(func=for_me, commands=["help"])
 def command_help(message):
 	if not check_auth(message):
 		return
@@ -2254,7 +2286,7 @@ def command_help(message):
 	send_message(message.chat.id, get_text("START_MESSAGE"), thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["list"])
+@bot.message_handler(func=for_me, commands=["list"])
 def command_list(message):
 	if not check_auth(message):
 		return
@@ -2262,7 +2294,7 @@ def command_list(message):
 	render_list(message.chat.id, None, FILTER_ALL, 0, thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["find"])
+@bot.message_handler(func=for_me, commands=["find"])
 def command_find(message):
 	if not check_auth(message):
 		return
@@ -2275,7 +2307,7 @@ def command_find(message):
 		ask_for_input(message.chat.id, message.from_user.id, "search", get_text("SEARCH_ASK"), thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["add"])
+@bot.message_handler(func=for_me, commands=["add"])
 def command_add(message):
 	if not check_auth(message):
 		return
@@ -2283,7 +2315,7 @@ def command_add(message):
 	send_message(message.chat.id, get_text("ADD_USAGE"), thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["settings"])
+@bot.message_handler(func=for_me, commands=["settings"])
 def command_settings(message):
 	if not check_auth(message):
 		return
@@ -2296,7 +2328,7 @@ def command_settings(message):
 	send_message(message.chat.id, text, reply_markup=markup, thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["version"])
+@bot.message_handler(func=for_me, commands=["version"])
 def command_version(message):
 	if not check_auth(message):
 		return
@@ -2308,7 +2340,7 @@ def command_version(message):
 	send_message(message.chat.id, get_text("VERSION_TEXT", VERSION, connected_to), thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["donate"])
+@bot.message_handler(func=for_me, commands=["donate"])
 def command_donate(message):
 	if not check_auth(message):
 		return
@@ -2316,7 +2348,7 @@ def command_donate(message):
 	send_message(message.chat.id, get_text("DONATE"), thread_id=message.message_thread_id)
 
 
-@bot.message_handler(commands=["donors"])
+@bot.message_handler(func=for_me, commands=["donors"])
 def command_donors(message):
 	if not check_auth(message):
 		return
@@ -2416,6 +2448,9 @@ def handle_document(message):
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
 	if not message.text:
+		return
+	# Before the pending input: a command for another bot must not consume it
+	if is_for_another_bot(message):
 		return
 	if not is_authorized(message.from_user.id, message.chat.id):
 		return
