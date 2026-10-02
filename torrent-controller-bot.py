@@ -22,7 +22,7 @@ from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentSt
 import bot_settings
 import config as _config_module
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1723,16 +1723,18 @@ def auto_rename_enabled():
 
 
 def auto_rename_torrent(torrent):
-	"""Renames the torrent to its suggested name. Returns the new name, or None
-	when there is no suggestion or the rename is skipped"""
+	"""Renames the torrent to its suggested name. Returns (new name, duplicate):
+	new name is None when there is no suggestion or the rename is skipped, and
+	duplicate is the suggested name when it was skipped because another
+	torrent already has it, so the user can be told why"""
 	suggested = parse_name(torrent.name)
 	if not suggested or suggested == torrent.name:
-		return None
+		return None, None
 	if name_already_exists(suggested, exclude_id=torrent.id):
 		warning(f"Auto-rename skipped for {torrent.name}: a torrent named '{suggested}' already exists")
-		return None
+		return None, suggested
 	client.rename_torrent(torrent.id, suggested)
-	return suggested
+	return suggested, None
 
 
 def auto_rename_torrent_files(torrent):
@@ -1775,12 +1777,14 @@ def deferred_auto_rename(torrent_id, original_name, chat_id=None, thread_id=None
 			continue
 		try:
 			files_renamed = auto_rename_torrent_files(torrent) if bot_settings.get("auto_rename_files") else None
-			renamed = auto_rename_torrent(torrent)
+			renamed, duplicate = auto_rename_torrent(torrent)
 		except TorrentClientError as e:
 			warning(f"Auto-rename failed for {torrent.name}: {e}")
 			return
 		if renamed:
 			notify(get_text("NOTIFY_AUTO_RENAMED", html.escape(original_name), html.escape(renamed)), chat_id, thread_id)
+		if duplicate:
+			notify(get_text("NOTIFY_AUTO_RENAME_DUPLICATE", html.escape(original_name), html.escape(duplicate)), chat_id, thread_id)
 		if files_renamed:
 			notify(f"{get_text('NOTIFY_AUTO_RENAMED_FILES', html.escape(renamed or original_name))}\n{files_renamed}", chat_id, thread_id)
 		return
@@ -1806,9 +1810,11 @@ def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, cat
 			try:
 				# The contents go first, see auto_rename_torrent_files
 				files_renamed = auto_rename_torrent_files(torrent) if bot_settings.get("auto_rename_files") else None
-				renamed = auto_rename_torrent(torrent)
+				renamed, duplicate = auto_rename_torrent(torrent)
 				if renamed:
 					lines.append(get_text("ADD_AUTO_RENAMED", html.escape(renamed)))
+				if duplicate:
+					lines.append(get_text("ADD_AUTO_RENAME_DUPLICATE", html.escape(duplicate)))
 				if files_renamed:
 					lines.append(files_renamed)
 			except TorrentClientError as e:
