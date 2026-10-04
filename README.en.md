@@ -29,9 +29,9 @@ Control your torrent client from a single place.
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
 - ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits
-- ✅ Notifications for completed downloads and torrent errors (can be toggled from the settings)
+- ✅ Notifications for completed downloads, torrent errors and torrents added outside the bot (can be toggled from the settings)
 - ✅ Automatic download without asking for the path, with a configurable directory
-- ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains (can be toggled from the settings)
+- ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains and the torrents added outside the bot (can be toggled from the settings)
 - ✅ Warning if the torrent you add may not fit on the disk
 - ✅ Bot settings persist across restarts (`/config` volume)
 - ✅ Notification to the administrator when the bot starts
@@ -132,7 +132,7 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 | Listings, search and filters | ✅ | ✅ | ✅ | ✅ |
 | Filter by tracker | ✅ | ✅ | ✅ | ✅ |
 | Mass actions | ✅ | ✅ | ✅ | ✅ |
-| Completed and error notifications | ✅ | ✅ | ✅ | ✅ |
+| Completed, error and external add notifications | ✅ | ✅ | ✅ | ✅ |
 | Move the data to another folder | ✅ | ✅ | ✅ | ✅ |
 | Delete the torrent along with its data | ✅ | ✅ | ✅ | ✅ |
 | Free space and low disk warning | ✅ | ✅ | ✅ | ✅ |

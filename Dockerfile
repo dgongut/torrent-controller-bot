@@ -1,6 +1,6 @@
 FROM alpine:3.24.2
 
-ARG VERSION=1.5.3
+ARG VERSION=1.6.0
 
 # Without it Python buffers stdout when there is no tty and docker logs stays empty
 ENV TZ=UTC \

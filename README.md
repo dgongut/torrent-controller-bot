@@ -29,9 +29,9 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
-- ✅ Notificaciones de descarga completada y de errores en torrents (activables desde los ajustes)
+- ✅ Notificaciones de descarga completada, de errores en torrents y de torrents añadidos fuera del bot (activables desde los ajustes)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
-- ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene (activable desde los ajustes)
+- ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene y de los torrents añadidos fuera del bot (activable desde los ajustes)
 - ✅ Aviso si el torrent que añades puede no caber en el disco
 - ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
 - ✅ Notificación al administrador al arrancar el bot
@@ -133,7 +133,7 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Listados, búsqueda y filtros | ✅ | ✅ | ✅ | ✅ |
 | Filtrar por tracker | ✅ | ✅ | ✅ | ✅ |
 | Acciones masivas | ✅ | ✅ | ✅ | ✅ |
-| Notificaciones de completado y error | ✅ | ✅ | ✅ | ✅ |
+| Notificaciones de completado, error y añadidos externos | ✅ | ✅ | ✅ | ✅ |
 | Mover los datos a otra carpeta | ✅ | ✅ | ✅ | ✅ |
 | Borrar el torrent con sus datos | ✅ | ✅ | ✅ | ✅ |
 | Espacio libre y aviso de disco | ✅ | ✅ | ✅ | ✅ |

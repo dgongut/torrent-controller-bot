@@ -22,7 +22,7 @@ from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentSt
 import bot_settings
 import config as _config_module
 
-VERSION = "1.5.3"
+VERSION = "1.6.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1530,6 +1530,16 @@ def auto_category_label():
 	return f"<b>{html.escape(category)}</b>" if category else get_text("AUTO_CATEGORY_NONE")
 
 
+def auto_rename_label():
+	"""What the automatic rename touches, so the two options under it read as
+	what they are: independent scopes that add up"""
+	if not bot_settings.get("auto_rename"):
+		return get_text("DISABLED")
+	scope = get_text("AUTO_RENAME_SCOPE_FILES" if bot_settings.get("auto_rename_files") else "AUTO_RENAME_SCOPE_TORRENT")
+	source = get_text("AUTO_RENAME_SOURCE_ALL" if bot_settings.get("auto_rename_external") else "AUTO_RENAME_SOURCE_BOT")
+	return get_text("SETTINGS_AUTO_RENAME_ON", scope, source)
+
+
 def build_settings():
 	settings = client.get_settings()
 
@@ -1548,6 +1558,8 @@ def build_settings():
 	lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label()))
 	if client.supports_categories:
 		lines.append(get_text("SETTINGS_AUTO_CATEGORY", auto_category_label()))
+	if client.supports_rename:
+		lines.append(get_text("SETTINGS_AUTO_RENAME", auto_rename_label()))
 
 	def toggle_button(setting_key, text_key, prefix=""):
 		state = "✅" if bot_settings.get(setting_key) else "❌"
@@ -1564,6 +1576,7 @@ def build_settings():
 	)
 	markup.add(toggle_button("notify_completed", "BUTTON_SETTING_NOTIFY_COMPLETED"))
 	markup.add(toggle_button("notify_errors", "BUTTON_SETTING_NOTIFY_ERRORS"))
+	markup.add(toggle_button("notify_external_added", "BUTTON_SETTING_NOTIFY_EXTERNAL"))
 	markup.add(toggle_button("auto_download", "BUTTON_SETTING_AUTO_DOWNLOAD"))
 	if bot_settings.get("auto_download"):
 		markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_DIR')}", callback_data=build_call("autoDirMenu", 0)))
@@ -1573,6 +1586,7 @@ def build_settings():
 		markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
 		if bot_settings.get("auto_rename"):
 			markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
+			markup.add(toggle_button("auto_rename_external", "BUTTON_SETTING_AUTO_RENAME_EXTERNAL", prefix="↳ "))
 	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_FAV_DIRS"), callback_data=build_call("favDirsMenu")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TEMPLATES"), callback_data=build_call("tplMenu")))
@@ -1791,34 +1805,61 @@ def deferred_auto_rename(torrent_id, original_name, chat_id=None, thread_id=None
 	warning(f"Auto-rename gave up for {original_name}: the metadata never arrived")
 
 
+def auto_rename_lines(torrent):
+	"""Auto-renames a torrent whose metadata is already known and returns the
+	lines that tell what was done"""
+	lines = []
+	try:
+		# The contents go first, see auto_rename_torrent_files
+		files_renamed = auto_rename_torrent_files(torrent) if bot_settings.get("auto_rename_files") else None
+		renamed, duplicate = auto_rename_torrent(torrent)
+		if renamed:
+			lines.append(get_text("ADD_AUTO_RENAMED", html.escape(renamed)))
+		if duplicate:
+			lines.append(get_text("ADD_AUTO_RENAME_DUPLICATE", html.escape(duplicate)))
+		if files_renamed:
+			lines.append(files_renamed)
+	except TorrentClientError as e:
+		warning(f"Auto-rename failed for {torrent.name}: {e}")
+	return lines
+
+
+# Torrents added through the bot that the monitor has not seen yet: id -> ts.
+# The lock is held for the whole add, so the monitor can never classify as
+# external a torrent the manager already lists but the bot has not registered
+_bot_adds_lock = threading.Lock()
+_bot_added_ids = {}
+BOT_ADDED_TTL = 3600  # Seconds an unseen id is kept (torrent deleted before the next poll)
+
+
+def add_torrent_from_bot(**kwargs):
+	with _bot_adds_lock:
+		torrent = client.add_torrent(**kwargs)
+		now = time.time()
+		for torrent_id, ts in list(_bot_added_ids.items()):
+			if now - ts > BOT_ADDED_TTL:
+				del _bot_added_ids[torrent_id]
+		_bot_added_ids[str(torrent.id)] = now
+	return torrent
+
+
 def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, category=None):
 	"""Adds the torrent and returns the result text
 	(add + optional auto-rename + optional low space warning)"""
-	torrent = client.add_torrent(magnet=pending["magnet"], torrent_data=pending["data"],
+	torrent = add_torrent_from_bot(magnet=pending["magnet"], torrent_data=pending["data"],
 							download_dir=download_dir, category=category or None)
 	# With a category the directory is not known until the manager has resolved
 	# it, so the one it reports back is the only accurate one
 	download_dir = torrent.download_dir or download_dir or ""
 	lines = [get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir))]
 	# A magnet has no size until its metadata arrives
-	if torrent.total_size:
+	if torrent.total_size and torrent.total_size > 0:
 		lines.append(get_text("ADD_OK_SIZE", sizeof_fmt(torrent.total_size)))
 	if category:
 		lines.append(get_text("ADD_OK_CATEGORY", html.escape(category)))
 	if auto_rename_enabled():
 		if torrent.files:
-			try:
-				# The contents go first, see auto_rename_torrent_files
-				files_renamed = auto_rename_torrent_files(torrent) if bot_settings.get("auto_rename_files") else None
-				renamed, duplicate = auto_rename_torrent(torrent)
-				if renamed:
-					lines.append(get_text("ADD_AUTO_RENAMED", html.escape(renamed)))
-				if duplicate:
-					lines.append(get_text("ADD_AUTO_RENAME_DUPLICATE", html.escape(duplicate)))
-				if files_renamed:
-					lines.append(files_renamed)
-			except TorrentClientError as e:
-				warning(f"Auto-rename failed for {torrent.name}: {e}")
+			lines.extend(auto_rename_lines(torrent))
 		else:
 			lines.append(get_text("ADD_AUTO_RENAME_PENDING"))
 			threading.Thread(target=deferred_auto_rename, args=(torrent.id, torrent.name, chat_id, thread_id), daemon=True).start()
@@ -2951,8 +2992,9 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 		elif command == "toggleSetting":
 			enabled = bot_settings.toggle(args[0])
 			if args[0] == "auto_rename" and not enabled:
-				# The file rename depends on the torrent rename: never leave it active but hidden
+				# Both depend on the torrent rename: never leave them active but hidden
 				bot_settings.set("auto_rename_files", False)
+				bot_settings.set("auto_rename_external", False)
 			render_settings(chat_id, message_id)
 
 		elif command == "autoDirMenu":
@@ -3077,30 +3119,83 @@ def send_startup_message():
 	notify(text)
 
 
+def handle_external_torrent(torrent_id):
+	"""A torrent the bot did not add (another app, the manager's own UI...).
+	Tells about it and auto-renames it, depending on the settings"""
+	try:
+		torrent = client.get_torrent(torrent_id)
+	except TorrentClientError as e:
+		warning(f"Cannot read the externally added torrent {torrent_id}: {e}")
+		return
+	if torrent is None:
+		return
+	lines = [get_text("NOTIFY_EXTERNAL_ADDED", html.escape(torrent.name), html.escape(torrent.download_dir or ""))]
+	if torrent.total_size and torrent.total_size > 0:
+		lines.append(get_text("ADD_OK_SIZE", sizeof_fmt(torrent.total_size)))
+	renamed = []
+	if auto_rename_enabled() and bot_settings.get("auto_rename_external"):
+		if torrent.files:
+			renamed = auto_rename_lines(torrent)
+		else:
+			# Its own notifications tell the outcome once the metadata arrives
+			lines.append(get_text("ADD_AUTO_RENAME_PENDING"))
+			threading.Thread(target=deferred_auto_rename, args=(torrent.id, torrent.name), daemon=True).start()
+	# With the add notification off, a rename is still worth telling: the
+	# torrent changed its name without anyone in the chat asking for it
+	if bot_settings.get("notify_external_added") or renamed:
+		notify("\n".join(lines + renamed))
+
+
+def poll_torrents(states):
+	"""One pass of the monitor. states holds the last state of every torrent
+	seen since the bot started (None on the first poll, which only builds the
+	baseline). Torrents that drop out of the list are remembered too, so a
+	manager that is restarting and lists them bit by bit never makes them look
+	new or freshly completed. Returns the updated states"""
+	baseline = states is None
+	states = {} if baseline else states
+	torrents = client.get_torrents()
+	new_ids = [str(t.id) for t in torrents if str(t.id) not in states]
+	external = set()
+	if new_ids and not baseline:
+		watch = bot_settings.get("notify_external_added") or (auto_rename_enabled() and bot_settings.get("auto_rename_external"))
+		# Waits for any add in progress: the bot registers what it added
+		with _bot_adds_lock:
+			for torrent_id in new_ids:
+				if _bot_added_ids.pop(torrent_id, None) is None and watch:
+					external.add(torrent_id)
+	for torrent in torrents:
+		torrent_id = str(torrent.id)
+		state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
+		prev = states.get(torrent_id)
+		if not baseline:
+			if torrent_id in external:
+				# Inline, so it is told before a completion seen in this same poll.
+				# A failure must not stop it from being recorded as seen, or the
+				# next poll would handle it again
+				try:
+					handle_external_torrent(torrent.id)
+				except Exception as e:
+					warning(f"Cannot handle the externally added torrent {torrent.name}: {e}")
+			# A torrent already finished the first time it is seen is a
+			# download that completed between two polls, not a leftover:
+			# the baseline built on the first poll is what covers restarts
+			if state["finished"] and (prev is None or not prev["finished"]) and bot_settings.get("notify_completed"):
+				notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
+			if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
+				notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
+		states[torrent_id] = state
+	return states
+
+
 def torrent_monitor():
-	"""Background loop that detects finished/errored torrents and notifies.
-	The first poll only builds the baseline, so restarting the bot never
-	re-notifies torrents that were already finished or errored"""
-	known = {}
-	first_run = True
+	"""Background loop that detects finished/errored/externally added torrents
+	and notifies. The first poll only builds the baseline, so restarting the
+	bot never re-notifies torrents that were already there"""
+	states = None
 	while True:
 		try:
-			torrents = client.get_torrents()
-			new_known = {}
-			for torrent in torrents:
-				state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
-				prev = known.get(torrent.id)
-				if not first_run:
-					# A torrent already finished the first time it is seen is a
-					# download that completed between two polls, not a leftover:
-					# the baseline built on the first poll is what covers restarts
-					if state["finished"] and (prev is None or not prev["finished"]) and bot_settings.get("notify_completed"):
-						notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
-					if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
-						notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
-				new_known[torrent.id] = state
-			known = new_known
-			first_run = False
+			states = poll_torrents(states)
 		except Exception as e:
 			warning(f"Torrent monitor: {e}")
 		time.sleep(MONITOR_INTERVAL_SECONDS)

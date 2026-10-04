@@ -15,11 +15,13 @@ SETTINGS_FILE = os.path.join(CONFIG_PATH, "settings.json")
 DEFAULTS = {
 	"notify_completed": True,
 	"notify_errors": True,
+	"notify_external_added": False,  # Torrents added outside the bot (other apps, the manager's UI...)
 	"auto_download": False,
 	"auto_download_dir": "",  # "" = torrent client default dir
 	"auto_category": "",  # "" = none; takes over the dir on clients with categories
 	"auto_rename": False,
 	"auto_rename_files": False,  # Only used when auto_rename is enabled
+	"auto_rename_external": False,  # Only used when auto_rename is enabled
 	"low_space_warning": True,
 	"favorite_dirs": [],  # Extra dirs offered as buttons when adding/moving torrents
 	"template_movie": "",  # "" = built-in default template
