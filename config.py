@@ -19,6 +19,17 @@ TORRENT_CLIENT_PASSWORD = os.environ.get("TORRENT_CLIENT_PASSWORD")
 TORRENT_CLIENT_PROTOCOL = os.environ.get("TORRENT_CLIENT_PROTOCOL", "http")
 TORRENT_CLIENT_RPC_PATH = os.environ.get("TORRENT_CLIENT_RPC_PATH")  # Default depends on the client
 
+# Anonymous usage statistics. On by default, turned off from /settings or with
+# TELEMETRY=false, which telemetry.py reads itself: it is the same variable in
+# every project that shares that client.
+# Development only, not documented: sends a minute after every start instead
+# of once a day. Debug pings go to a server on the same machine unless told
+# otherwise, never to the real one, where they would count as installations.
+TELEMETRY_DEBUG = os.environ.get("TELEMETRY_DEBUG", "0").strip().lower() in ("1", "true", "yes")
+TELEMETRY_ENDPOINT = os.environ.get(
+	"TELEMETRY_ENDPOINT",
+	"http://host.docker.internal:8000/v1/ping" if TELEMETRY_DEBUG else "https://telemetry.dgongut.com/v1/ping")
+
 # CONSTANTS
 ANONYMOUS_USER_ID = "1087968824"
 DONORS_URL = "https://donate.dgongut.com/donors.json"

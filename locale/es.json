@@ -260,5 +260,15 @@
 	"CATEGORY_AUTO_MANAGE_HINT": "⚙️ Este torrent está en modo manual, por eso sigue donde está. Puedes dejar que el gestor lo lleve a la carpeta de su categoría (<code>$1</code>) y lo mantenga ahí.",
 	"BUTTON_AUTO_MANAGE": "⚙️ Gestión automática según la categoría",
 	"AUTO_MANAGE_CHANGING": "⚙️ Pasando <b>$1</b> a gestión automática y moviéndolo a <code>$2</code>...\n⏳ Te avisaré cuando termine.",
-	"AUTO_MANAGE_DONE": "⚙️ <b>$1</b> está en gestión automática, en <code>$2</code>"
+	"AUTO_MANAGE_DONE": "⚙️ <b>$1</b> está en gestión automática, en <code>$2</code>",
+	"SETTINGS_TELEMETRY": "📊 Estadísticas anónimas: $1",
+	"BUTTON_SETTING_TELEMETRY": "📊 Estadísticas anónimas",
+	"BUTTON_TELEMETRY_TOGGLE": "Enviar estadísticas anónimas",
+	"BUTTON_TELEMETRY_SHOW": "🔍 Ver qué se envía",
+	"TELEMETRY_TITLE": "📊 <b>Estadísticas anónimas</b>",
+	"TELEMETRY_HELP": "Una vez al día el bot envía cifras anónimas para saber cuánta gente lo usa, con qué gestor de torrents y qué funciones se usan más. Nunca nombres de torrents, rutas, IDs ni direcciones.\n\nLas estadísticas son públicas y de todos: <a href=\"https://stats.dgongut.com/torrent-controller-bot\">puedes verlas aquí</a>, junto con <a href=\"https://stats.dgongut.com/torrent-controller-bot/privacy\">qué se recoge exactamente</a>.",
+	"TELEMETRY_FORCED_VOLUME": "⚠️ Desactivadas: <code>$1</code> no está mapeado como volumen, y sin él cada vez que se recreara el contenedor contaría como una instalación nueva.",
+	"TELEMETRY_FORCED_ENV": "⚠️ Desactivadas con la variable <code>$1</code>.",
+	"TELEMETRY_PREVIEW": "📊 <b>Esto es lo que se enviaría ahora</b>\nEl identificador se crea en el primer envío. <a href=\"https://stats.dgongut.com/torrent-controller-bot/privacy\">Qué significa cada campo</a>.",
+	"TELEMETRY_PREVIEW_TRUNCATED": "<i>…y $1 contadores más.</i>"
 }

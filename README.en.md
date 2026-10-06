@@ -190,6 +190,7 @@ Those credentials go into `TORRENT_CLIENT_USER` and `TORRENT_CLIENT_PASSWORD`. T
 |TORRENTS_PER_PAGE |❌| Number of torrents per page in the lists. Default 10 |
 |DASHBOARD_REFRESH_SECONDS |❌| Seconds between automatic dashboard refreshes. Default 2 |
 |DASHBOARD_REFRESH_DURATION |❌| Seconds the automatic dashboard refresh lasts. Default 60 |
+|TELEMETRY |❌| `false` to turn the [anonymous statistics](#anonymous-statistics) off without going through `/settings`. Turning them off from `/settings` is the usual way; this is for those who prefer to pin it in the compose file |
 
 ## Docker-Compose example for normal execution
 
@@ -215,6 +216,18 @@ services:
         volumes:
             - /path/of/your/choice:/config # Persistent bot settings
 ```
+
+## Anonymous statistics
+
+Since 1.7.0 the bot sends a few anonymous figures once a day to know how many people use it, with which torrent manager and which features are used the most. That tells me where to put the effort. The statistics are public: [stats.dgongut.com/torrent-controller-bot](https://stats.dgongut.com/torrent-controller-bot).
+
+**What is sent:** the manager and its major version, how many torrents it manages, which settings are on, the bot version, the architecture, how many times a day each command and button was used, and how torrents reach the bot (file, magnet or URL). The full list, field by field, is on [the privacy page](https://stats.dgongut.com/torrent-controller-bot/privacy). The server drops anything that is not on it. From `/settings` → *Anonymous statistics* → *See what is sent* you can see exactly what the next report would carry.
+
+**What is never sent:** torrent names, paths, categories, trackers, manager addresses, Telegram IDs or anything you type. Your IP is not stored.
+
+**How to turn it off:** from `/settings` → *Anonymous statistics*, or with `TELEMETRY=false`. Turning them off also deletes the installation's identifier.
+
+They are on by default. Nothing is sent until the bot has been running for at least 10 minutes. Nothing is sent either if `/config` is not on a volume, because without one every recreate of the container would count as a new installation.
 
 ## Notes
 > [!NOTE]

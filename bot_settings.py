@@ -27,6 +27,7 @@ DEFAULTS = {
 	"template_movie": "",  # "" = built-in default template
 	"template_series": "",
 	"template_season": "",  # Season packs (series without episode)
+	"telemetry": True,  # Anonymous usage statistics, see the TELEMETRY section of the bot
 }
 
 _lock = threading.Lock()

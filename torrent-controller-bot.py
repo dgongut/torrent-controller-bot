@@ -21,8 +21,9 @@ from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT
 from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentStatus, content_root, create_client
 import bot_settings
 import config as _config_module
+import telemetry
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1560,6 +1561,7 @@ def build_settings():
 		lines.append(get_text("SETTINGS_AUTO_CATEGORY", auto_category_label()))
 	if client.supports_rename:
 		lines.append(get_text("SETTINGS_AUTO_RENAME", auto_rename_label()))
+	lines.append(get_text("SETTINGS_TELEMETRY", get_text("ENABLED") if telemetry_on() else get_text("DISABLED")))
 
 	def toggle_button(setting_key, text_key, prefix=""):
 		state = "✅" if bot_settings.get(setting_key) else "❌"
@@ -1590,6 +1592,7 @@ def build_settings():
 	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_FAV_DIRS"), callback_data=build_call("favDirsMenu")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TEMPLATES"), callback_data=build_call("tplMenu")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TELEMETRY"), callback_data=build_call("telemetryMenu")))
 	markup.row(
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
@@ -1616,6 +1619,160 @@ def send_settings_menu(chat_id, thread_id=None, prefix=None):
 	if prefix:
 		text = f"{prefix}\n\n{text}"
 	send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+
+
+# ---------------------------------------------------------------------------
+# ANONYMOUS STATISTICS
+# ---------------------------------------------------------------------------
+# Once a day, a snapshot of the settings and how many times each command and
+# button was used, sent to telemetry.dgongut.com. Numbers, yes/no and values
+# from closed lists only: never a torrent, a directory, a category or an id.
+# What may be sent is declared in projects/torrent-controller-bot.yaml of the
+# telemetry repo, whose server drops anything else, and is listed on
+# https://stats.dgongut.com/torrent-controller-bot/privacy
+#
+# On by default, with no notice asking first. Nothing is counted or sent unless
+# CONFIG_PATH is a volume, TELEMETRY=false is not set and the setting is on.
+# Without a volume the install id would be new on every recreate, so one
+# installation would count as many, and turning it off would not survive the
+# next update.
+
+TELEMETRY_PROJECT = "torrent-controller-bot"
+TELEMETRY_PREVIEW_USAGE_KEYS = 25  # Shown instead of the whole list when it would not fit a message
+_config_persistent = None
+
+
+def config_is_persistent():
+	"""Whether CONFIG_PATH survives a container recreate. os.path.ismount
+	compares device ids, which is enough for the volumes Docker creates, but
+	/proc/mounts is read too. Worked out once: it cannot change while running"""
+	global _config_persistent
+	if _config_persistent is None:
+		path = os.path.abspath(_config_module.CONFIG_PATH)
+		persistent = False
+		try:
+			persistent = os.path.ismount(path)
+		except OSError:
+			pass
+		if not persistent:
+			try:
+				with open("/proc/mounts", "r", encoding="utf-8") as mounts:
+					persistent = any(len(fields) > 1 and fields[1] == path for fields in (line.split() for line in mounts))
+			except OSError:
+				pass
+		_config_persistent = persistent
+	return _config_persistent
+
+
+def telemetry_forced_off():
+	"""Why the statistics are off whatever the setting says: "TELEMETRY" when
+	the variable turned them off, "volume" when the settings would not survive
+	a recreate, or None when nothing overrides the setting"""
+	if telemetry.disabled_by_environment():
+		return "TELEMETRY"
+	if not config_is_persistent():
+		return "volume"
+	return None
+
+
+def telemetry_on():
+	return telemetry_forced_off() is None and bool(bot_settings.get("telemetry"))
+
+
+def collect_telemetry_metrics():
+	"""The snapshot sent with each ping, on the telemetry thread. Every key has
+	to be declared in the manifest, or the server drops it. What needs the
+	torrent manager is left out, rather than sent as zero, when it does not answer"""
+	client_name = (TORRENT_CLIENT or "transmission").lower()
+	metrics = {
+		"client": client_name,
+		"language": LANGUAGE.lower(),
+		"admins": len([admin for admin in ADMIN_IDS if admin]),
+		"telegram_group": bool(TELEGRAM_GROUP),
+		"torrents_per_page": TORRENTS_PER_PAGE,
+		"notify_completed": bool(bot_settings.get("notify_completed")),
+		"notify_errors": bool(bot_settings.get("notify_errors")),
+		"notify_external_added": bool(bot_settings.get("notify_external_added")),
+		"auto_download": bool(bot_settings.get("auto_download")),
+		"auto_download_dir": bool(bot_settings.get("auto_download_dir")),
+		"auto_category": bool(bot_settings.get("auto_category")),
+		"auto_rename": auto_rename_enabled(),
+		"auto_rename_files": auto_rename_enabled() and bool(bot_settings.get("auto_rename_files")),
+		"auto_rename_external": auto_rename_enabled() and bool(bot_settings.get("auto_rename_external")),
+		"low_space_warning": bool(bot_settings.get("low_space_warning")),
+		"favorite_dirs": len(bot_settings.get("favorite_dirs") or []),
+		"custom_templates": sum(1 for key in ("template_movie", "template_series", "template_season") if bot_settings.get(key)),
+	}
+	try:
+		match = re.search(r"(\d+)\.", client.test_connection())
+		if match:
+			metrics[f"{client_name}_major"] = int(match.group(1))
+	except Exception as e:
+		debug(f"Telemetry could not read the torrent manager version: {e}")
+	try:
+		metrics["torrents"] = len(client.get_torrents())
+	except Exception as e:
+		debug(f"Telemetry could not count the torrents: {e}")
+	return metrics
+
+
+telemetry_client = telemetry.Telemetry(
+	project=TELEMETRY_PROJECT,
+	version=VERSION,
+	state_path=os.path.join(_config_module.CONFIG_PATH, "telemetry.json"),
+	metrics=collect_telemetry_metrics,
+	enabled=telemetry_on,
+	endpoint=TELEMETRY_ENDPOINT,
+	log=debug,
+	debug=TELEMETRY_DEBUG,
+)
+
+
+def count_usage(key):
+	"""Counts one use of key for the next ping. Never raises into the caller"""
+	try:
+		telemetry_client.count(key)
+	except Exception as e:
+		debug(f"Telemetry could not count {key}: {e}")
+
+
+def build_telemetry_settings():
+	"""What the statistics are, the switch and what they send. When something
+	outside the menu turned them off there is no switch, only the reason,
+	because pressing it would change nothing"""
+	forced = telemetry_forced_off()
+	lines = [get_text("TELEMETRY_TITLE"), "", get_text("TELEMETRY_HELP")]
+	markup = InlineKeyboardMarkup(row_width=1)
+	if forced == "volume":
+		lines += ["", get_text("TELEMETRY_FORCED_VOLUME", html.escape(_config_module.CONFIG_PATH))]
+	elif forced:
+		lines += ["", get_text("TELEMETRY_FORCED_ENV", forced)]
+	else:
+		state = "✅" if bot_settings.get("telemetry") else "❌"
+		markup.add(InlineKeyboardButton(f"{state} {get_text('BUTTON_TELEMETRY_TOGGLE')}", callback_data=build_call("toggleTelemetry")))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TELEMETRY_SHOW"), callback_data=build_call("telemetryShow")))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("settings")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
+
+
+def build_telemetry_preview():
+	"""Exactly what the next ping would carry. The usage counters are cut to
+	the most used ones when the whole list would not fit in a message"""
+	payload = telemetry_client.preview()
+	usage = payload.get("usage") or {}
+	hidden = 0
+	if len(usage) > TELEMETRY_PREVIEW_USAGE_KEYS:
+		ranked = sorted(usage.items(), key=lambda item: (-item[1], item[0]))
+		payload["usage"] = dict(ranked[:TELEMETRY_PREVIEW_USAGE_KEYS])
+		hidden = len(usage) - TELEMETRY_PREVIEW_USAGE_KEYS
+	body = html.escape(json.dumps(payload, indent=1, ensure_ascii=False, sort_keys=True))
+	text = f"{get_text('TELEMETRY_PREVIEW')}\n\n<pre>{body}</pre>"
+	if hidden:
+		text += f"\n{get_text('TELEMETRY_PREVIEW_TRUNCATED', hidden)}"
+	return text, close_markup()
 
 
 def build_favorite_dirs_menu():
@@ -1748,6 +1905,7 @@ def auto_rename_torrent(torrent):
 		warning(f"Auto-rename skipped for {torrent.name}: a torrent named '{suggested}' already exists")
 		return None, suggested
 	client.rename_torrent(torrent.id, suggested)
+	count_usage("auto_rename")
 	return suggested, None
 
 
@@ -2315,6 +2473,7 @@ def check_auth(message):
 def command_start(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_start")
 	delete_message(message.chat.id, message.message_id)
 	show_dashboard(message.chat.id, thread_id=message.message_thread_id)
 
@@ -2323,6 +2482,7 @@ def command_start(message):
 def command_help(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_help")
 	delete_message(message.chat.id, message.message_id)
 	send_message(message.chat.id, get_text("START_MESSAGE"), thread_id=message.message_thread_id)
 
@@ -2331,6 +2491,7 @@ def command_help(message):
 def command_list(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_list")
 	delete_message(message.chat.id, message.message_id)
 	render_list(message.chat.id, None, FILTER_ALL, 0, thread_id=message.message_thread_id)
 
@@ -2339,6 +2500,7 @@ def command_list(message):
 def command_find(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_find")
 	delete_message(message.chat.id, message.message_id)
 	parts = message.text.split(maxsplit=1)
 	if len(parts) > 1 and parts[1].strip():
@@ -2352,6 +2514,7 @@ def command_find(message):
 def command_add(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_add")
 	delete_message(message.chat.id, message.message_id)
 	send_message(message.chat.id, get_text("ADD_USAGE"), thread_id=message.message_thread_id)
 
@@ -2360,6 +2523,7 @@ def command_add(message):
 def command_settings(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_settings")
 	delete_message(message.chat.id, message.message_id)
 	try:
 		text, markup = build_settings()
@@ -2373,6 +2537,7 @@ def command_settings(message):
 def command_version(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_version")
 	delete_message(message.chat.id, message.message_id)
 	try:
 		connected_to = client.test_connection()
@@ -2385,6 +2550,7 @@ def command_version(message):
 def command_donate(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_donate")
 	delete_message(message.chat.id, message.message_id)
 	send_message(message.chat.id, get_text("DONATE"), thread_id=message.message_thread_id)
 
@@ -2393,6 +2559,7 @@ def command_donate(message):
 def command_donors(message):
 	if not check_auth(message):
 		return
+	count_usage("cmd_donors")
 	delete_message(message.chat.id, message.message_id)
 	donors = get_donors_online()
 	if donors:
@@ -2483,6 +2650,7 @@ def handle_document(message):
 		send_message(message.chat.id, get_text("ADD_ERROR", html.escape(describe_error(e))), thread_id=message.message_thread_id)
 		return
 	name = document.file_name[:-len(".torrent")]
+	count_usage("add_file")
 	start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
 
 
@@ -2504,6 +2672,7 @@ def handle_text(message):
 	text = message.text.strip()
 	if text.lower().startswith("magnet:"):
 		name = extract_magnet_name(text)
+		count_usage("add_magnet")
 		start_add_flow(message.chat.id, name, magnet=text, thread_id=message.message_thread_id)
 	elif text.lower().startswith(("http://", "https://")) and " " not in text:
 		# In groups, ignore invalid links silently (the bot may live with other
@@ -2521,6 +2690,7 @@ def handle_text(message):
 			if is_private:
 				send_message(message.chat.id, get_text("ADD_URL_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
 			return
+		count_usage("add_url")
 		start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
 
 
@@ -2548,6 +2718,8 @@ def handle_callback(call):
 	except Exception:
 		pass
 
+	if command != "noop":
+		count_usage(f"btn_{command}")
 	thread_id = normalize_thread(call.message.message_thread_id)
 	stop_dashboard(chat_id, message_id, thread_id)
 	dispatch_callback(chat_id, message_id, call.from_user.id, call.data, thread_id=thread_id)
@@ -2989,6 +3161,23 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), thread_id=thread_id, message_id=message_id,
 						back_call=build_call("settings"))
 
+		elif command == "telemetryMenu":
+			text, markup = build_telemetry_settings()
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "toggleTelemetry":
+			if not bot_settings.toggle("telemetry"):
+				# The id goes too, so turning them back on later starts as a new
+				# installation instead of stitching the two periods together
+				telemetry_client.forget()
+			text, markup = build_telemetry_settings()
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "telemetryShow":
+			# A message of its own, so the screen it was pressed on stays as it was
+			text, markup = build_telemetry_preview()
+			send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+
 		elif command == "toggleSetting":
 			enabled = bot_settings.toggle(args[0])
 			if args[0] == "auto_rename" and not enabled:
@@ -3143,6 +3332,7 @@ def handle_external_torrent(torrent_id):
 	# With the add notification off, a rename is still worth telling: the
 	# torrent changed its name without anyone in the chat asking for it
 	if bot_settings.get("notify_external_added") or renamed:
+		count_usage("auto_notify_external")
 		notify("\n".join(lines + renamed))
 
 
@@ -3181,8 +3371,10 @@ def poll_torrents(states):
 			# download that completed between two polls, not a leftover:
 			# the baseline built on the first poll is what covers restarts
 			if state["finished"] and (prev is None or not prev["finished"]) and bot_settings.get("notify_completed"):
+				count_usage("auto_notify_completed")
 				notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
 			if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
+				count_usage("auto_notify_error")
 				notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
 		states[torrent_id] = state
 	return states
@@ -3222,6 +3414,9 @@ if __name__ == "__main__":
 	debug(f"torrent-controller-bot {VERSION} started. Connected to {client_version}")
 	send_startup_message()
 	threading.Thread(target=torrent_monitor, daemon=True).start()
+	if TELEMETRY_DEBUG:
+		warning(f"TELEMETRY_DEBUG is on: statistics go to {TELEMETRY_ENDPOINT} a minute after every start")
+	telemetry_client.start()
 	try:
 		bot.set_my_commands([
 			telebot.types.BotCommand("/start", get_text("MENU_START")),

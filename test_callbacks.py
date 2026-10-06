@@ -959,6 +959,108 @@ check("without a known username /list@OtherBot is answered", send_command("/list
 
 bot_module.render_list = _real_render_list
 
+# ---------------------------------------------------------------------------
+# ANONYMOUS STATISTICS
+# ---------------------------------------------------------------------------
+
+import json
+import types
+
+TELEMETRY_STATE = os.path.join(config.CONFIG_PATH, "telemetry.json")
+
+
+def telemetry_screen():
+	EDITS.clear()
+	press(bot_module.build_call("telemetryMenu"))
+	return EDITS[-1]
+
+
+def pending_usage():
+	return bot_module.telemetry_client.preview()["usage"]
+
+
+def press_button(data):
+	"""A real press, through the handler that counts it, not only the dispatcher"""
+	message = types.SimpleNamespace(chat=types.SimpleNamespace(id=CHAT_ID), message_id=MESSAGE_ID, message_thread_id=None)
+	bot_module.handle_callback(types.SimpleNamespace(id="1", data=data, message=message, from_user=types.SimpleNamespace(id=1)))
+
+
+bot_module.bot.answer_callback_query = lambda *a, **k: True
+
+# The test config dir is not a volume: off, no switch, and nothing is counted
+check("a config that is not a volume turns the statistics off", bot_module.telemetry_on(), False)
+text, markup = telemetry_screen()
+check("the screen says why they are off", bot_module.get_text("TELEMETRY_FORCED_VOLUME", config.CONFIG_PATH) in text, True)
+check("without a volume there is no switch", "toggleTelemetry" in callbacks_of(markup), False)
+press_button(bot_module.build_call("list", config.FILTER_ALL, 0))
+check("without a volume nothing is counted", pending_usage(), {})
+
+bot_module._config_persistent = True
+check("on a volume they are on by default", bot_module.telemetry_on(), True)
+text, markup = telemetry_screen()
+check("on a volume the switch is there", "toggleTelemetry" in callbacks_of(markup), True)
+
+# The variable wins over the setting, whatever it is spelled
+for value in ("false", "0", "no"):
+	os.environ["TELEMETRY"] = value
+	check(f"TELEMETRY={value} turns them off", bot_module.telemetry_on(), False)
+	text, markup = telemetry_screen()
+	check(f"TELEMETRY={value} is shown as the reason", bot_module.get_text("TELEMETRY_FORCED_ENV", "TELEMETRY") in text, True)
+for value in ("true", ""):
+	os.environ["TELEMETRY"] = value
+	check(f"TELEMETRY={value!r} leaves them on", bot_module.telemetry_on(), True)
+del os.environ["TELEMETRY"]
+
+# Presses and commands are counted by name, page labels are not
+press_button(bot_module.build_call("list", config.FILTER_ALL, 0))
+press_button(bot_module.build_call("list", config.FILTER_ALL, 0))
+press_button(bot_module.build_call("noop"))
+check("a button press is counted", pending_usage().get("btn_list"), 2)
+check("the page label is not a button", "btn_noop" in pending_usage(), False)
+send_command("/version")
+check("a command is counted", pending_usage().get("cmd_version"), 1)
+send_command("/version", STRANGER_ID)
+check("an unauthorized command is not counted", pending_usage().get("cmd_version"), 1)
+
+# Only declared, closed values: no torrent, path or category ever leaves
+metrics = bot_module.collect_telemetry_metrics()
+check("the metrics are exactly the declared ones", sorted(metrics), sorted([
+	"client", "language", "admins", "telegram_group", "torrents_per_page", "notify_completed",
+	"notify_errors", "notify_external_added", "auto_download", "auto_download_dir", "auto_category",
+	"auto_rename", "auto_rename_files", "auto_rename_external", "low_space_warning", "favorite_dirs",
+	"custom_templates", "torrents", "transmission_major"]))
+check("the torrent count goes as a number, so the server can add them up", metrics["torrents"], len(bot_module.client.get_torrents()))
+for name, version, expected in (("qbittorrent", "qBittorrent 5.2.4", 5), ("transmission", "Transmission 4.1.3 (abc)", 4), ("deluge", "Deluge 2.2.0", 2)):
+	_real_test_connection, _real_client_name = bot_module.client.test_connection, bot_module.TORRENT_CLIENT
+	bot_module.client.test_connection = lambda version=version: version
+	bot_module.TORRENT_CLIENT = name
+	check(f"{name} reports its major version", bot_module.collect_telemetry_metrics().get(f"{name}_major"), expected)
+	bot_module.client.test_connection, bot_module.TORRENT_CLIENT = _real_test_connection, _real_client_name
+text, _ = bot_module.build_telemetry_preview()
+check("the preview carries no torrent name", any(t.name in text for t in [fake_torrent()]), False)
+check("the preview carries no directory", any(d in text for d in DIRS), False)
+
+# The preview fits a message however many buttons were pressed
+for n in range(40):
+	bot_module.count_usage(f"btn_fake{n}")
+text, _ = bot_module.build_telemetry_preview()
+check("a long preview is cut and says so", bot_module.get_text("TELEMETRY_PREVIEW_TRUNCATED", 17)[:10] in text, True)
+check("a long preview fits a message", len(text) <= TEXT_LIMIT, True)
+
+# Turning them off forgets the installation and stops counting
+bot_module.telemetry_client._state["install_id"] = "3f0c8f7e-5b1a-4b8e-9d57-2a9e0c1d4b6f"
+press(bot_module.build_call("toggleTelemetry"))
+check("the switch turns them off", bot_module.bot_settings.get("telemetry"), False)
+with open(TELEMETRY_STATE, encoding="utf-8") as handle:
+	stored = json.load(handle)
+check("turning them off deletes the install id", stored["install_id"], None)
+check("turning them off drops the pending counters", stored["pending"], {})
+press_button(bot_module.build_call("list", config.FILTER_ALL, 0))
+check("once off nothing is counted", pending_usage(), {})
+press(bot_module.build_call("toggleTelemetry"))
+check("the switch turns them back on", bot_module.telemetry_on(), True)
+bot_module._config_persistent = None
+
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
 	print("\n\n".join(FAILED))

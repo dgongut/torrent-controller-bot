@@ -191,6 +191,7 @@ Esos datos van en `TORRENT_CLIENT_USER` y `TORRENT_CLIENT_PASSWORD`. El puerto e
 |TORRENTS_PER_PAGE |❌| Número de torrents por página en los listados. Por defecto 10 |
 |DASHBOARD_REFRESH_SECONDS |❌| Segundos entre refrescos automáticos del panel de control. Por defecto 2 |
 |DASHBOARD_REFRESH_DURATION |❌| Segundos que dura el refresco automático del panel de control. Por defecto 60 |
+|TELEMETRY |❌| `false` para desactivar las [estadísticas anónimas](#estadísticas-anónimas) sin pasar por `/settings`. Lo normal es desactivarlas desde `/settings`; esto es para quien prefiera dejarlo fijado en el compose |
 
 ## Ejemplo de Docker-Compose para su ejecución normal
 
@@ -216,6 +217,18 @@ services:
         volumes:
             - /ruta/de/tu/eleccion:/config # Ajustes persistentes del bot
 ```
+
+## Estadísticas anónimas
+
+Desde la 1.7.0 el bot envía una vez al día unas cifras anónimas para saber cuánta gente lo usa, con qué gestor de torrents y qué funciones se usan más. Así sé dónde poner el esfuerzo. Las estadísticas son públicas: [stats.dgongut.com/torrent-controller-bot](https://stats.dgongut.com/torrent-controller-bot).
+
+**Qué se envía:** el gestor y su versión principal, cuántos torrents gestiona, qué ajustes están activados, la versión del bot, la arquitectura, cuántas veces al día se ha usado cada comando y cada botón, y cómo le llegan los torrents (fichero, magnet o URL). La lista completa, campo a campo, está en [la página de privacidad](https://stats.dgongut.com/torrent-controller-bot/privacy). El servidor descarta cualquier dato que no esté en ella. Desde `/settings` → *Estadísticas anónimas* → *Ver qué se envía* puedes ver exactamente lo que saldría en el siguiente envío.
+
+**Qué no se envía nunca:** nombres de torrents, rutas, categorías, trackers, direcciones del gestor, IDs de Telegram ni nada de lo que escribes. Tu IP no se guarda.
+
+**Cómo se desactiva:** desde `/settings` → *Estadísticas anónimas*, o con `TELEMETRY=false`. Al desactivarlas se borra también el identificador de la instalación.
+
+Están activadas por defecto. Nada se envía hasta que el bot lleva al menos 10 minutos en marcha. Tampoco se envía si `/config` no está en un volumen, porque sin él cada vez que se recreara el contenedor contaría como una instalación nueva.
 
 ## Anotaciones
 > [!NOTE]
