@@ -1,3 +1,4 @@
 requests==2.34.2
 pyTelegramBotAPI==4.37.0
 transmission-rpc==7.0.12
+dgongut-telemetry @ https://github.com/dgongut/telemetry/archive/refs/tags/client-v1.0.0.zip#subdirectory=clients/python

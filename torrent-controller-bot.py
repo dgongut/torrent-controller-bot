@@ -23,7 +23,7 @@ import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")

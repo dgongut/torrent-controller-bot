@@ -18,6 +18,5 @@ services:
             - ./logger.py:/app/logger.py
             - ./message_queue.py:/app/message_queue.py
             - ./name_parser.py:/app/name_parser.py
-            - ./telemetry.py:/app/telemetry.py
             - ./torrent_clients:/app/torrent_clients
             - ./locale:/app/locale
