@@ -32,6 +32,7 @@ Control your torrent client from a single place.
 - ✅ Notifications for completed downloads, torrent errors and torrents added outside the bot (can be toggled from the settings)
 - ✅ Automatic download without asking for the path, with a configurable directory
 - ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains and the torrents added outside the bot (can be toggled from the settings)
+- ✅ Series folder: a new episode is offered (or sent straight, if you turn it on) to the folder where the previous ones already are
 - ✅ Warning if the torrent you add may not fit on the disk
 - ✅ Bot settings persist across restarts (`/config` volume)
 - ✅ Notification to the administrator when the bot starts
@@ -120,6 +121,16 @@ Things to keep in mind:
 - Ranges are padded on each side, so `S01-S08` with `{season.2}` gives `01-08`.
 - It only works on `{season}` and `{episode}`; on any other field the bot rejects the template.
 - `{chapter}` is unaffected: it always keeps its two-digit format (`1x03`, `T2`).
+
+## Series folder
+
+When an episode or a season pack arrives, the bot looks among the torrents in the manager for others of the same series and offers their folder. Two names are the same series when their titles match ignoring case, accents and punctuation (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` and `chicago fire s14e02` are the same series), and when both carry a year it has to be the same one. It never matches partially: `Chicago Fire` and `Chicago Med` are different series, and a movie such as *El Camino: A Breaking Bad Movie* is not an episode of anything, so no folder is looked for.
+
+- **When picking the folder** (adding or moving a torrent), the series folder comes first, marked with ✨, however many favorites you have.
+- **With automatic download**, the torrent added message ends with a 💡 that offers the folder, with buttons to move it or dismiss it. Moving it edits that same message so it shows the new folder.
+- **With "Series straight to their folder"** (under automatic download, off by default), when there is no doubt the torrent is added straight into the series folder instead of the automatic one, and the message carries an ↩️ Undo button. It only happens when there is a single folder named after the series; in doubt (two possible folders, or a shared one such as `/media/series`) it is offered instead of decided for you. It can also apply to torrents added outside the bot, which are then really moved, since they are already in the manager.
+
+If you keep seasons in subfolders (`Mad Men/Season 01`), an episode of the next season is offered `Mad Men/Season 02` with the same format, even if that folder does not exist yet. The default download folder and the automatic download one are never offered unless they are named after the series. An auto managed qBittorrent torrent is left alone: its category decides the folder.
 
 ## What the bot can do with each client
 

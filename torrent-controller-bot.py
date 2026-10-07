@@ -17,13 +17,13 @@ from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue, describe_error
-from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, suggest_file_name, suggest_folder_name, suggest_name, validate_template
+from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
 from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentStatus, content_root, create_client
 import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -305,16 +305,16 @@ def delete_message(chat_id, message_id):
 		pass
 
 
-def notify(text, chat_id=None, thread_id=None):
+def notify(text, chat_id=None, thread_id=None, reply_markup=None):
 	"""Sends a bot-initiated notification. A conversation that originated it
 	takes precedence, so the answer lands in the topic where it was asked;
 	otherwise it goes to the configured destination: the group (and its
 	TELEGRAM_THREAD) if set, or the first admin"""
 	if chat_id is not None:
-		send_message(chat_id, text, thread_id=thread_id)
+		send_message(chat_id, text, reply_markup=reply_markup, thread_id=thread_id)
 		return
 	target = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
-	send_message(target, text, thread_id=TELEGRAM_THREAD)
+	send_message(target, text, reply_markup=reply_markup, thread_id=TELEGRAM_THREAD)
 
 
 # ---------------------------------------------------------------------------
@@ -1399,12 +1399,15 @@ def build_categories_menu(page=0):
 	return text, markup
 
 
-def build_category_markup(cat_call, cancel_call, include_none=True, extra_rows=None, page_parts=None, page=0):
+def build_category_markup(cat_call, cancel_call, include_none=True, extra_rows=None, page_parts=None, page=0, lead_rows=None):
 	"""Keyboard with one button per category defined in the manager, paginated
 	the same way the directories are. Category names are free text, so they
 	travel as short ids like directories do.
-	page_parts is the callback prefix that receives the page as last arg"""
+	page_parts is the callback prefix that receives the page as last arg.
+	lead_rows go above the categories, extra_rows below them"""
 	markup = InlineKeyboardMarkup(row_width=1)
+	for row in lead_rows or []:
+		markup.add(row)
 	categories = get_known_categories()
 	pages = max(1, math.ceil(len(categories) / CATEGORIES_PER_PAGE))
 	page = max(0, min(int(page), pages - 1))
@@ -1483,22 +1486,174 @@ def get_known_dirs():
 	return dirs
 
 
-def build_dir_markup(dir_call, write_call, cancel_call, page_parts=None, page=0):
+def build_dir_markup(dir_call, write_call, cancel_call, page_parts=None, page=0, suggested=()):
 	"""Keyboard with one button per known dir (paginated) + write path + cancel.
 	dir_call receives the dir_id and must return the callback_data.
-	page_parts is the callback prefix that receives the page as last arg"""
+	page_parts is the callback prefix that receives the page as last arg.
+	suggested are the folders of the series (see series_dirs): they go first,
+	so they are on the first page whatever the number of favorites"""
 	markup = InlineKeyboardMarkup(row_width=1)
-	dirs = get_known_dirs()
+	dirs = list(suggested) + [d for d in get_known_dirs() if d not in suggested]
 	pages = max(1, math.ceil(len(dirs) / MAX_DIR_BUTTONS))
 	page = max(0, min(int(page), pages - 1))
 	start = page * MAX_DIR_BUTTONS
 	for directory in dirs[start:start + MAX_DIR_BUTTONS]:
-		markup.add(InlineKeyboardButton(f"📂 {truncate_dir(directory)}", callback_data=dir_call(get_dir_id(directory))))
+		icon = "✨" if directory in suggested else "📂"
+		markup.add(InlineKeyboardButton(f"{icon} {truncate_dir(directory)}", callback_data=dir_call(get_dir_id(directory))))
 	if pages > 1 and page_parts:
 		markup.row(*pagination_row(page, pages, *page_parts))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_WRITE_DIR"), callback_data=write_call))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=cancel_call))
 	return markup
+
+
+# ---------------------------------------------------------------------------
+# SERIES FOLDERS
+# ---------------------------------------------------------------------------
+# A new episode is offered the folder where the rest of its series already is,
+# found through the other torrents of the manager (see name_parser)
+
+SERIES_SUGGESTIONS_MAX = 2  # Folders offered at most: more would only be noise
+
+# Texts that open the block about the series folder at the end of an add
+# message: the buttons under it rebuild the message without that block
+SERIES_BLOCK_KEYS = ("SERIES_SUGGEST_ONE", "SERIES_SUGGEST_MANY", "SERIES_PLACED", "SERIES_MOVING")
+
+
+def series_candidates(name, exclude_id=None, current_dir=None):
+	"""Folders the series of name already lives in, best first, as (dir, named).
+	Empty when name is not a series or the manager has nothing of it"""
+	if series_identity(name) is None:
+		return []
+	try:
+		torrents = client.get_torrents()
+	except TorrentClientError as e:
+		warning(f"Cannot look for the series folder of {name}: {e}")
+		return []
+	others = []
+	for torrent in torrents:
+		if str(torrent.id) == str(exclude_id) or not torrent.download_dir:
+			continue
+		try:
+			added = torrent.added_date.timestamp() if torrent.added_date else 0
+		except (AttributeError, OverflowError, OSError, ValueError):
+			added = 0
+		others.append((torrent.name, torrent.download_dir, added))
+	generic = [bot_settings.get("auto_download_dir")]
+	try:
+		generic.append(client.get_default_download_dir())
+	except TorrentClientError:
+		pass
+	return series_dir_candidates(name, others, known_dirs=bot_settings.get("favorite_dirs") or [],
+								current_dir=current_dir, generic_dirs=generic)
+
+
+def series_dirs(name, exclude_id=None, current_dir=None):
+	"""The folders worth offering for name, see series_candidates"""
+	return [d for d, _named in series_candidates(name, exclude_id, current_dir)][:SERIES_SUGGESTIONS_MAX]
+
+
+def series_hint(name, suggested):
+	"""The line that explains the ✨ buttons of a folder picker"""
+	identity = series_identity(name)
+	if not suggested or identity is None:
+		return ""
+	return get_text("SERIES_DIR_HINT", html.escape(identity["title"]))
+
+
+def auto_move_series_enabled(external=False):
+	"""The series go straight to their folder only when the bot adds without
+	asking: when it asks, the folder is offered first and that is enough"""
+	if not bot_settings.get("auto_download") or not bot_settings.get("auto_move_series"):
+		return False
+	return bool(bot_settings.get("auto_move_series_external")) if external else True
+
+
+def series_auto_target(pending, current_dir=None):
+	"""The folder a torrent about to be added goes to without asking: the one
+	of its series, when the automatic move is on and there is no doubt"""
+	if not auto_move_series_enabled():
+		return None
+	return series_auto_dir(series_candidates(pending_series_name(pending), current_dir=current_dir))
+
+
+def series_suggestion(torrent, current_dir):
+	"""The block that offers the series folder to a torrent that was added
+	somewhere else, with its buttons: (text, markup), or (None, None) when
+	there is nothing to offer. An auto managed torrent takes its folder from
+	its category, and moving it by hand would drop it out of that"""
+	if torrent.auto_managed:
+		return None, None
+	identity = series_identity(torrent.name)
+	if identity is None:
+		return None, None
+	dirs = series_dirs(torrent.name, exclude_id=torrent.id, current_dir=current_dir)
+	if not dirs:
+		return None, None
+	title = html.escape(identity["title"])
+	if len(dirs) == 1:
+		text = get_text("SERIES_SUGGEST_ONE", html.escape(dirs[0]), title)
+	else:
+		text = get_text("SERIES_SUGGEST_MANY", title)
+	markup = InlineKeyboardMarkup(row_width=1)
+	for directory in dirs:
+		markup.add(InlineKeyboardButton(get_text("BUTTON_SERIES_MOVE", truncate_dir(directory)),
+										callback_data=build_call("serMove", torrent.id, get_dir_id(directory))))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("serDrop")))
+	count_usage("auto_series_suggestion")
+	return text, markup
+
+
+def series_placed(torrent_id, title, previous_dir):
+	"""The block that tells a torrent went straight to the folder of its
+	series, with the button that sends it where it would have gone instead"""
+	text = get_text("SERIES_PLACED", html.escape(title))
+	markup = None
+	if previous_dir:
+		markup = InlineKeyboardMarkup(row_width=1)
+		markup.add(InlineKeyboardButton(get_text("BUTTON_SERIES_UNDO"), callback_data=build_call("serUndo", torrent_id, get_dir_id(previous_dir))))
+	return text, markup
+
+
+def without_series_block(message_html):
+	"""The add message without its block about the series folder (the text
+	of the buttons being pressed), read back from what Telegram shows"""
+	message_html = message_html or ""
+	cut = -1
+	for key in SERIES_BLOCK_KEYS:
+		prefix = get_text(key).split("$", 1)[0]
+		if prefix:
+			cut = max(cut, message_html.rfind(f"\n\n{prefix}"))
+	return message_html[:cut] if cut >= 0 else message_html
+
+
+_DIR_LINE = re.compile(r"📂 <code>[^<]*</code>")
+
+
+def with_dir_line(message_html, new_dir):
+	"""The add message with its 📂 line pointing at new_dir: the message
+	always tells where the torrent is, never how it got there"""
+	return _DIR_LINE.sub(lambda _match: f"📂 <code>{html.escape(new_dir, quote=False)}</code>", message_html, count=1)
+
+
+def place_series_from_message(chat_id, message_id, message_html, torrent_id, dir_id):
+	"""A button under an add message sends the torrent to dir_id: the message
+	itself is updated, showing the new folder in its 📂 line"""
+	base = without_series_block(message_html)
+
+	def wrap(text):
+		return f"{base}\n\n{text}" if base else text
+
+	new_dir = get_dir_by_id(dir_id)
+	if new_dir is None:
+		edit_message(chat_id, message_id, wrap(get_text("SERIES_EXPIRED")))
+		return
+	if client.get_torrent(torrent_id) is None:
+		edit_message(chat_id, message_id, wrap(get_text("TORRENT_NOT_FOUND")))
+		return
+	progress_text = wrap(get_text("SERIES_MOVING", html.escape(new_dir)))
+	success_text = with_dir_line(base, new_dir) if base else get_text("SERIES_MOVED", html.escape(new_dir))
+	deliver_move_order(chat_id, [torrent_id], new_dir, progress_text, success_text, message_id=message_id, wrap=wrap)
 
 
 # ---------------------------------------------------------------------------
@@ -1541,32 +1696,94 @@ def auto_rename_label():
 	return get_text("SETTINGS_AUTO_RENAME_ON", scope, source)
 
 
-def build_settings():
+def auto_move_series_label():
+	"""Whether the series go straight to their folder, and which torrents"""
+	if not auto_move_series_enabled():
+		return get_text("DISABLED")
+	source = get_text("AUTO_RENAME_SOURCE_ALL" if auto_move_series_enabled(external=True) else "AUTO_RENAME_SOURCE_BOT")
+	return get_text("SETTINGS_AUTO_MOVE_SERIES_ON", source)
+
+
+# The settings are a main screen with one row per section and a screen per
+# section, all painted on the same message: every screen ends with a way
+# back to the one it came from and a way out
+
+# Screen each toggle lives in, so pressing it repaints that same screen
+SETTING_SCREENS = {
+	"notify_completed": "notify", "notify_errors": "notify", "notify_external_added": "notify",
+	"low_space_warning": "notify",
+	"auto_download": "add", "auto_move_series": "add", "auto_move_series_external": "add",
+	"auto_rename": "rename", "auto_rename_files": "rename", "auto_rename_external": "rename",
+}
+NOTIFY_SETTINGS = ("notify_completed", "notify_errors", "notify_external_added", "low_space_warning")
+
+
+def settings_call(screen="main"):
+	return build_call("settings", screen)
+
+
+def settings_nav(markup, back=None):
+	"""The last row of a settings screen: one step back, and out"""
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=back or settings_call()),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return markup
+
+
+def toggle_button(setting_key, text_key, prefix=""):
+	state = "✅" if bot_settings.get(setting_key) else "❌"
+	return InlineKeyboardButton(f"{prefix}{state} {get_text(text_key)}", callback_data=build_call("toggleSetting", setting_key))
+
+
+def limit_text(value, enabled):
+	return f"{value} KB/s" if enabled else get_text("NO_LIMIT")
+
+
+def speed_label(settings):
+	"""How the speed reads in one line of the main screen"""
+	if client.supports_alt_speed and settings["alt_speed_enabled"]:
+		return get_text("SPEED_VALUE_ALT")
+	if not settings["speed_limit_down_enabled"] and not settings["speed_limit_up_enabled"]:
+		return get_text("NO_LIMIT")
+	return get_text("SPEED_VALUE_LIMITS", limit_text(settings["speed_limit_down"], settings["speed_limit_down_enabled"]),
+					limit_text(settings["speed_limit_up"], settings["speed_limit_up_enabled"]))
+
+
+def on_off(value):
+	return "✅" if value else "❌"
+
+
+def build_settings_main():
 	settings = client.get_settings()
+	markup = InlineKeyboardMarkup(row_width=1)
 
-	def limit_text(value, enabled):
-		return f"{value} KB/s" if enabled else get_text("NO_LIMIT")
+	def row(text, call):
+		markup.add(InlineKeyboardButton(text, callback_data=call))
 
-	lines = [get_text("SETTINGS_TITLE", settings["version"]), ""]
+	row(get_text("SETTINGS_ROW_SPEED", speed_label(settings)), settings_call("speed"))
+	enabled_notices = sum(1 for key in NOTIFY_SETTINGS if bot_settings.get(key))
+	row(get_text("SETTINGS_ROW_NOTIFY", enabled_notices, len(NOTIFY_SETTINGS)), settings_call("notify"))
+	add_mode = "ADD_MODE_AUTO" if bot_settings.get("auto_download") else "ADD_MODE_ASK"
+	row(get_text("SETTINGS_ROW_ADD", get_text(add_mode)), settings_call("add"))
+	if client.supports_rename:
+		row(get_text("SETTINGS_ROW_RENAME", on_off(auto_rename_enabled())), settings_call("rename"))
+	row(get_text("SETTINGS_ROW_FAV_DIRS", len(bot_settings.get("favorite_dirs") or [])), build_call("favDirsMenu"))
+	row(get_text("SETTINGS_ROW_TELEMETRY", on_off(telemetry_on())), build_call("telemetryMenu"))
+	settings_nav(markup, back=build_call("dashboard"))
+	lines = [get_text("SETTINGS_TITLE", settings["version"]), "",
+			get_text("SETTINGS_DEFAULT_DIR", html.escape(settings["download_dir"]))]
+	return "\n".join(lines), markup
+
+
+def build_settings_speed():
+	settings = client.get_settings()
+	lines = [get_text("SETTINGS_SPEED_TITLE"), "", get_text("SETTINGS_SPEED_HELP"), ""]
 	if client.supports_alt_speed:
-		alt_state = get_text("ENABLED") if settings["alt_speed_enabled"] else get_text("DISABLED")
-		lines.append(get_text("SETTINGS_ALT_SPEED", alt_state, settings["alt_speed_down"], settings["alt_speed_up"]))
+		lines.append(get_text("SETTINGS_ALT_SPEED", get_text("ENABLED") if settings["alt_speed_enabled"] else get_text("DISABLED"),
+							settings["alt_speed_down"], settings["alt_speed_up"]))
 	lines.append(get_text("SETTINGS_DOWN_LIMIT", limit_text(settings["speed_limit_down"], settings["speed_limit_down_enabled"])))
 	lines.append(get_text("SETTINGS_UP_LIMIT", limit_text(settings["speed_limit_up"], settings["speed_limit_up_enabled"])))
-	lines.append(get_text("SETTINGS_DEFAULT_DIR", html.escape(settings["download_dir"])))
-	lines.append("")
-	lines.append(get_text("SETTINGS_BOT_TITLE"))
-	lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label()))
-	if client.supports_categories:
-		lines.append(get_text("SETTINGS_AUTO_CATEGORY", auto_category_label()))
-	if client.supports_rename:
-		lines.append(get_text("SETTINGS_AUTO_RENAME", auto_rename_label()))
-	lines.append(get_text("SETTINGS_TELEMETRY", get_text("ENABLED") if telemetry_on() else get_text("DISABLED")))
-
-	def toggle_button(setting_key, text_key, prefix=""):
-		state = "✅" if bot_settings.get(setting_key) else "❌"
-		return InlineKeyboardButton(f"{prefix}{state} {get_text(text_key)}", callback_data=build_call("toggleSetting", setting_key))
-
 	markup = InlineKeyboardMarkup(row_width=1)
 	if client.supports_alt_speed:
 		markup.add(InlineKeyboardButton(get_text("BUTTON_TOGGLE_ALT_SPEED"), callback_data=build_call("toggleAltSpeed")))
@@ -1576,43 +1793,80 @@ def build_settings():
 		InlineKeyboardButton(get_text("BUTTON_SET_DOWN_LIMIT"), callback_data=build_call("setDownLimit")),
 		InlineKeyboardButton(get_text("BUTTON_SET_UP_LIMIT"), callback_data=build_call("setUpLimit")),
 	)
+	return "\n".join(lines), settings_nav(markup)
+
+
+def build_settings_notify():
+	lines = [get_text("SETTINGS_NOTIFY_TITLE"), "", get_text("SETTINGS_NOTIFY_HELP")]
+	markup = InlineKeyboardMarkup(row_width=1)
 	markup.add(toggle_button("notify_completed", "BUTTON_SETTING_NOTIFY_COMPLETED"))
 	markup.add(toggle_button("notify_errors", "BUTTON_SETTING_NOTIFY_ERRORS"))
 	markup.add(toggle_button("notify_external_added", "BUTTON_SETTING_NOTIFY_EXTERNAL"))
+	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
+	return "\n".join(lines), settings_nav(markup)
+
+
+def build_settings_add():
+	lines = [get_text("SETTINGS_ADD_TITLE"), "", get_text("SETTINGS_ADD_HELP"), ""]
+	markup = InlineKeyboardMarkup(row_width=1)
 	markup.add(toggle_button("auto_download", "BUTTON_SETTING_AUTO_DOWNLOAD"))
 	if bot_settings.get("auto_download"):
+		lines.append(get_text("SETTINGS_AUTO_DIR", auto_dir_label()))
 		markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_DIR')}", callback_data=build_call("autoDirMenu", 0)))
 		if client.supports_categories:
+			lines.append(get_text("SETTINGS_AUTO_CATEGORY", auto_category_label()))
 			markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_CATEGORY')}", callback_data=build_call("autoCatMenu")))
-	if client.supports_rename:
-		markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
-		if bot_settings.get("auto_rename"):
-			markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
-			markup.add(toggle_button("auto_rename_external", "BUTTON_SETTING_AUTO_RENAME_EXTERNAL", prefix="↳ "))
-	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
-	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_FAV_DIRS"), callback_data=build_call("favDirsMenu")))
+		lines.append(get_text("SETTINGS_AUTO_MOVE_SERIES", auto_move_series_label()))
+		markup.add(toggle_button("auto_move_series", "BUTTON_SETTING_AUTO_MOVE_SERIES", prefix="↳ "))
+		if bot_settings.get("auto_move_series"):
+			markup.add(toggle_button("auto_move_series_external", "BUTTON_SETTING_AUTO_MOVE_SERIES_EXTERNAL", prefix="↳ "))
+	else:
+		lines.append(get_text("SETTINGS_ADD_ASKING"))
+	return "\n".join(lines), settings_nav(markup)
+
+
+def build_settings_rename():
+	lines = [get_text("SETTINGS_RENAME_TITLE"), "", get_text("SETTINGS_RENAME_HELP"), "",
+			get_text("SETTINGS_AUTO_RENAME", auto_rename_label())]
+	markup = InlineKeyboardMarkup(row_width=1)
+	markup.add(toggle_button("auto_rename", "BUTTON_SETTING_AUTO_RENAME"))
+	if bot_settings.get("auto_rename"):
+		markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
+		markup.add(toggle_button("auto_rename_external", "BUTTON_SETTING_AUTO_RENAME_EXTERNAL", prefix="↳ "))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TEMPLATES"), callback_data=build_call("tplMenu")))
-	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TELEMETRY"), callback_data=build_call("telemetryMenu")))
-	markup.row(
-		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
-		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
-	)
-	return "\n".join(lines), markup
+	return "\n".join(lines), settings_nav(markup)
 
 
-def render_settings(chat_id, message_id):
+SETTINGS_SCREENS = {
+	"main": build_settings_main,
+	"speed": build_settings_speed,
+	"notify": build_settings_notify,
+	"add": build_settings_add,
+	"rename": build_settings_rename,
+}
+
+
+def build_settings(screen="main"):
+	"""(text, markup) of a settings screen; an unknown one is the main screen.
+	The rename screen does not exist for a manager that cannot rename"""
+	if screen == "rename" and not client.supports_rename:
+		screen = "main"
+	return SETTINGS_SCREENS.get(screen, build_settings_main)()
+
+
+def render_settings(chat_id, message_id, screen="main"):
 	try:
-		text, markup = build_settings()
+		text, markup = build_settings(screen)
 	except TorrentClientError as e:
 		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
 		markup = back_close_markup()
 	edit_message(chat_id, message_id, text, markup)
 
 
-def send_settings_menu(chat_id, thread_id=None, prefix=None):
-	"""Sends the settings menu as a new message, optionally preceded by a confirmation"""
+def send_settings_menu(chat_id, thread_id=None, prefix=None, screen="main"):
+	"""Sends a settings screen as a new message, optionally preceded by a confirmation"""
 	try:
-		text, markup = build_settings()
+		text, markup = build_settings(screen)
 	except TorrentClientError as e:
 		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
 		markup = back_close_markup()
@@ -1699,6 +1953,8 @@ def collect_telemetry_metrics():
 		"auto_rename": auto_rename_enabled(),
 		"auto_rename_files": auto_rename_enabled() and bool(bot_settings.get("auto_rename_files")),
 		"auto_rename_external": auto_rename_enabled() and bool(bot_settings.get("auto_rename_external")),
+		"auto_move_series": auto_move_series_enabled(),
+		"auto_move_series_external": auto_move_series_enabled(external=True),
 		"low_space_warning": bool(bot_settings.get("low_space_warning")),
 		"favorite_dirs": len(bot_settings.get("favorite_dirs") or []),
 		"custom_templates": sum(1 for key in ("template_movie", "template_series", "template_season") if bot_settings.get(key)),
@@ -1833,7 +2089,7 @@ def render_templates_menu(chat_id, message_id):
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_EDIT_SEASON"), callback_data=build_call("tplEdit", "season")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TPL_RESET"), callback_data=build_call("tplReset")))
 	markup.row(
-		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("settings")),
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=settings_call("rename")),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
 	)
 	edit_message(chat_id, message_id, "\n".join(lines), markup)
@@ -1843,15 +2099,28 @@ def render_templates_menu(chat_id, message_id):
 # ADD TORRENT
 # ---------------------------------------------------------------------------
 
+def pending_series_name(pending):
+	"""The name that tells which series a pending torrent belongs to: the one
+	inside a .torrent file, since the file itself is often just a number"""
+	return torrent_data_name(pending.get("data")) or pending.get("name") or ""
+
+
 def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None, dir_page=0):
+	pending = get_pending_torrent(pending_id) or {}
+	series_name = pending_series_name(pending) or name
+	suggested = series_dirs(series_name)
 	markup = build_dir_markup(
 		dir_call=lambda dir_id: build_call("addTo", pending_id, dir_id),
 		write_call=build_call("addNewDir", pending_id),
 		cancel_call=build_call("cancelAdd", pending_id),
 		page_parts=("addDirPage", pending_id),
 		page=dir_page,
+		suggested=suggested,
 	)
 	text = get_text("ADD_ASK_DIR", html.escape(name))
+	hint = series_hint(series_name, suggested)
+	if hint:
+		text = f"{text}\n\n{hint}"
 	if message_id:
 		edit_message(chat_id, message_id, text, markup)
 	else:
@@ -1860,7 +2129,11 @@ def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None,
 
 def ask_add_category(chat_id, pending_id, name, thread_id=None, message_id=None, cat_page=0):
 	"""On a manager with categories the category is what decides the directory,
-	so it is asked first; picking a folder by hand is still one button away"""
+	so it is asked first; picking a folder by hand is still one button away,
+	and the folder of the series, when there is one, is offered before anything"""
+	pending = get_pending_torrent(pending_id) or {}
+	series_name = pending_series_name(pending) or name
+	suggested = series_dirs(series_name)
 	markup = build_category_markup(
 		cat_call=lambda cat_id: build_call("addCat", pending_id, cat_id),
 		cancel_call=build_call("cancelAdd", pending_id),
@@ -1869,8 +2142,13 @@ def ask_add_category(chat_id, pending_id, name, thread_id=None, message_id=None,
 					callback_data=build_call("addDirPage", pending_id, 0))],
 		page_parts=("addCatPage", pending_id),
 		page=cat_page,
+		lead_rows=[InlineKeyboardButton(f"✨ {truncate_dir(directory)}", callback_data=build_call("addTo", pending_id, get_dir_id(directory)))
+				for directory in suggested],
 	)
 	text = get_text("ADD_ASK_CATEGORY", html.escape(name))
+	hint = series_hint(series_name, suggested)
+	if hint:
+		text = f"{text}\n\n{hint}"
 	if message_id:
 		edit_message(chat_id, message_id, text, markup)
 	else:
@@ -2001,11 +2279,24 @@ def add_torrent_from_bot(**kwargs):
 	return torrent
 
 
-def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, category=None):
-	"""Adds the torrent and returns the result text
-	(add + optional auto-rename + optional low space warning)"""
+def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, category=None, automatic=False):
+	"""Adds the torrent and returns the result (text, markup): add + optional
+	auto-rename + optional low space warning, and when it was added without
+	asking (automatic), the folder of its series. With the automatic move on
+	and no doubt about that folder, the torrent goes straight there instead of
+	to download_dir; otherwise it is offered under the message"""
+	series_title = None
+	previous_dir = None
+	if automatic and not category:
+		series_dir = series_auto_target(pending, current_dir=download_dir)
+		if series_dir:
+			series_title = series_identity(pending_series_name(pending))["title"]
+			previous_dir = download_dir
+			download_dir = series_dir
 	torrent = add_torrent_from_bot(magnet=pending["magnet"], torrent_data=pending["data"],
 							download_dir=download_dir, category=category or None)
+	if series_title:
+		count_usage("auto_move_series")
 	# With a category the directory is not known until the manager has resolved
 	# it, so the one it reports back is the only accurate one
 	download_dir = torrent.download_dir or download_dir or ""
@@ -2025,7 +2316,15 @@ def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, cat
 		space_warning = build_low_space_warning(torrent.total_size, download_dir)
 		if space_warning:
 			lines.append(space_warning)
-	return "\n".join(lines)
+	block, markup = None, None
+	if series_title:
+		block, markup = series_placed(torrent.id, series_title, previous_dir)
+	elif automatic:
+		block, markup = series_suggestion(torrent, download_dir)
+	text = "\n".join(lines)
+	if block:
+		text = f"{text}\n\n{block}"
+	return text, markup
 
 
 def build_low_space_warning(total_size, download_dir):
@@ -2047,7 +2346,7 @@ def do_add_torrent(chat_id, message_id, pending_id, download_dir, thread_id=None
 		edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
 		return
 	try:
-		text = perform_add_torrent(pending, download_dir, chat_id, thread_id, category)
+		text, _markup = perform_add_torrent(pending, download_dir, chat_id, thread_id, category)
 	except TorrentClientError as e:
 		text = get_text("ADD_ERROR", html.escape(str(e)))
 	edit_message(chat_id, message_id, text)
@@ -2062,11 +2361,11 @@ def start_add_flow(chat_id, name, magnet=None, data=None, thread_id=None):
 		try:
 			if not category and not download_dir:
 				download_dir = client.get_default_download_dir()
-			text = perform_add_torrent({"name": name, "magnet": magnet, "data": data},
-									download_dir, chat_id, thread_id, category)
+			text, markup = perform_add_torrent({"name": name, "magnet": magnet, "data": data},
+									download_dir, chat_id, thread_id, category, automatic=True)
 		except TorrentClientError as e:
-			text = get_text("ADD_ERROR", html.escape(str(e)))
-		send_message(chat_id, text, thread_id=thread_id)
+			text, markup = get_text("ADD_ERROR", html.escape(str(e))), None
+		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 		return
 	pending_id = new_pending_torrent(name, magnet=magnet, data=data)
 	if get_known_categories():
@@ -2108,12 +2407,18 @@ def download_torrent_from_url(url):
 		response.close()
 	if b"4:info" not in data or not data.endswith(b"e"):
 		raise ValueError("not a torrent")
-	name = "torrent"
+	return data, torrent_data_name(data) or "torrent"
+
+
+def torrent_data_name(data):
+	"""The name inside the metadata of a .torrent file, or None"""
+	if not data:
+		return None
 	match = re.search(rb"4:name(\d+):", data)
-	if match:
-		start = match.end()
-		name = data[start:start + int(match.group(1))].decode("utf-8", errors="replace")
-	return data, name
+	if not match:
+		return None
+	start = match.end()
+	return data[start:start + int(match.group(1))].decode("utf-8", errors="replace") or None
 
 
 # ---------------------------------------------------------------------------
@@ -2299,13 +2604,13 @@ def handle_pending_input(message, pending):
 			send_message(chat_id, get_text("ADD_EXPIRED"), reply_markup=back_markup, thread_id=thread_id)
 			return
 		try:
-			result = perform_add_torrent(pending_torrent, text)
+			result, _markup = perform_add_torrent(pending_torrent, text)
 		except TorrentClientError as e:
 			result = get_text("ADD_ERROR", html.escape(str(e)))
 		send_message(chat_id, result, reply_markup=back_markup, thread_id=thread_id)
 	elif action == "autoDir":
 		bot_settings.set("auto_download_dir", text.rstrip("/") or "/")
-		send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"))
+		send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"), screen="add")
 	elif action == "favDir":
 		directory = text.rstrip("/") or "/"
 		favorites = bot_settings.get("favorite_dirs") or []
@@ -2347,20 +2652,23 @@ def handle_pending_input(message, pending):
 				client.set_speed_limit(direction, None, enabled=False)
 			else:
 				client.set_speed_limit(direction, kbps, enabled=True)
-			send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"))
+			send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"), screen="speed")
 		except TorrentClientError as e:
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 
 
-def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None, apply=None, target=None):
+def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None, apply=None, target=None, wrap=None):
 	"""Show a progress message and deliver the move order in a background thread
 	(the RPC blocks until the physical move is finished). The message is updated
 	with the final result. If the daemon does not answer (e.g. busy relocating
 	large amounts of data), keep retrying until it is delivered.
 	apply overrides what is delivered, for the operations that also relocate the
 	data and block the same way (assigning a category to an auto managed
-	torrent); it must be safe to call again on a retry."""
+	torrent); it must be safe to call again on a retry.
+	wrap turns the texts that tell about a retry or a failure into the whole
+	message, for a message that has more to say than the move itself."""
 	deliver = apply or (lambda: client.move_torrents(ids, new_dir))
+	wrap = wrap or (lambda text: text)
 	target = target or new_dir  # What the logs call the destination
 	if message_id is not None:
 		edit_message(chat_id, message_id, progress_text)
@@ -2382,17 +2690,17 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 		except PermanentTorrentError as e:
 			# The manager will not do it: retrying only delays the bad news
 			warning(f"Move order refused: {e}")
-			finish(get_text("MOVE_REFUSED", html.escape(str(e))))
+			finish(wrap(get_text("MOVE_REFUSED", html.escape(str(e)))))
 			return
 		except TorrentClientError as e:
 			err = str(e)
 		except Exception as e:
 			error(f"Unexpected error delivering move order: {e}")
-			finish(get_text("MOVE_GIVE_UP", html.escape(str(e))))
+			finish(wrap(get_text("MOVE_GIVE_UP", html.escape(str(e)))))
 			return
 		warning(f"Move order not delivered, will retry in background: {err}")
 		if message_id is not None:
-			edit_message(chat_id, message_id, get_text("MOVE_RETRYING"))
+			edit_message(chat_id, message_id, wrap(get_text("MOVE_RETRYING")))
 		for _ in range(MOVE_RETRY_ATTEMPTS):
 			time.sleep(MOVE_RETRY_DELAY)
 			try:
@@ -2403,7 +2711,7 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 			except TorrentClientError as e:
 				err = str(e)
 		error(f"Move order gave up after {MOVE_RETRY_ATTEMPTS} attempts: {err}")
-		finish(get_text("MOVE_GIVE_UP", html.escape(err)))
+		finish(wrap(get_text("MOVE_GIVE_UP", html.escape(err))))
 
 	threading.Thread(target=worker, daemon=True).start()
 
@@ -2722,13 +3030,15 @@ def handle_callback(call):
 		count_usage(f"btn_{command}")
 	thread_id = normalize_thread(call.message.message_thread_id)
 	stop_dashboard(chat_id, message_id, thread_id)
-	dispatch_callback(chat_id, message_id, call.from_user.id, call.data, thread_id=thread_id)
+	dispatch_callback(chat_id, message_id, call.from_user.id, call.data, thread_id=thread_id, message_html=getattr(call.message, "html_text", None))
 
 
-def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
+def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, message_html=None):
 	"""Runs the action encoded in a callback_data string, editing message_id.
 	thread_id is the topic the button was pressed in: the screens that answer by
-	sending a new message instead of editing must stay in that same topic"""
+	sending a new message instead of editing must stay in that same topic.
+	message_html is the message the button is under, for the buttons that
+	update a message they did not build (the ones under an add message)"""
 	parts = data.split("|")
 	command = parts[0]
 	args = parts[1:]
@@ -2947,14 +3257,20 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 			else:
 				nav_ctx = new_nav_context(torrent_id, filter_key, page)
+				suggested = series_dirs(torrent.name, exclude_id=torrent.id, current_dir=torrent.download_dir)
 				markup = build_dir_markup(
 					dir_call=lambda dir_id: build_call("moveToDir", nav_ctx, dir_id),
 					write_call=build_call("moveNewDir", nav_ctx),
 					cancel_call=build_call("info", torrent_id, filter_key, page),
 					page_parts=("move", torrent_id, filter_key, page),
 					page=dir_page,
+					suggested=suggested,
 				)
-				edit_message(chat_id, message_id, get_text("MOVE_ASK_DIR", html.escape(torrent.name)), markup)
+				text = get_text("MOVE_ASK_DIR", html.escape(torrent.name))
+				hint = series_hint(torrent.name, suggested)
+				if hint:
+					text = f"{text}\n\n{hint}"
+				edit_message(chat_id, message_id, text, markup)
 
 		elif command in ("moveToDir", "moveNewDir"):
 			ctx = get_nav_context(args[0])
@@ -2981,6 +3297,15 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 				if name:
 					prompt = f"{get_text('MOVE_ASK_DIR', html.escape(name))}\n\n{prompt}"
 				ask_for_input(chat_id, user_id, "move", prompt, thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, name=name, back_call=back_call)
+
+		elif command in ("serMove", "serUndo"):
+			place_series_from_message(chat_id, message_id, message_html, args[0], args[1])
+
+		elif command == "serDrop":
+			if message_html:
+				edit_message(chat_id, message_id, without_series_block(message_html))
+			else:
+				bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
 
 		elif command == "search":
 			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), thread_id=thread_id, message_id=message_id)
@@ -3138,12 +3463,12 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 						back_call=build_call("list", filter_key, 0))
 
 		elif command == "settings":
-			render_settings(chat_id, message_id)
+			render_settings(chat_id, message_id, args[0] if args else "main")
 
 		elif command == "toggleAltSpeed":
 			settings = client.get_settings()
 			client.set_alt_speed(not settings["alt_speed_enabled"])
-			render_settings(chat_id, message_id)
+			render_settings(chat_id, message_id, "speed")
 
 		elif command in ("toggleDownLimit", "toggleUpLimit"):
 			settings = client.get_settings()
@@ -3151,15 +3476,15 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 				client.set_speed_limit("down", None, enabled=not settings["speed_limit_down_enabled"])
 			else:
 				client.set_speed_limit("up", None, enabled=not settings["speed_limit_up_enabled"])
-			render_settings(chat_id, message_id)
+			render_settings(chat_id, message_id, "speed")
 
 		elif command == "setDownLimit":
 			ask_for_input(chat_id, user_id, "downLimit", get_text("SETTINGS_ASK_DOWN_LIMIT"), thread_id=thread_id, message_id=message_id,
-						back_call=build_call("settings"))
+						back_call=settings_call("speed"))
 
 		elif command == "setUpLimit":
 			ask_for_input(chat_id, user_id, "upLimit", get_text("SETTINGS_ASK_UP_LIMIT"), thread_id=thread_id, message_id=message_id,
-						back_call=build_call("settings"))
+						back_call=settings_call("speed"))
 
 		elif command == "telemetryMenu":
 			text, markup = build_telemetry_settings()
@@ -3184,14 +3509,16 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 				# Both depend on the torrent rename: never leave them active but hidden
 				bot_settings.set("auto_rename_files", False)
 				bot_settings.set("auto_rename_external", False)
-			render_settings(chat_id, message_id)
+			if args[0] == "auto_move_series" and not enabled:
+				bot_settings.set("auto_move_series_external", False)
+			render_settings(chat_id, message_id, SETTING_SCREENS.get(args[0], "main"))
 
 		elif command == "autoDirMenu":
 			dir_page = int(args[0]) if args else 0
 			markup = build_dir_markup(
 				dir_call=lambda dir_id: build_call("autoDirSet", dir_id),
 				write_call=build_call("autoDirNew"),
-				cancel_call=build_call("settings"),
+				cancel_call=settings_call("add"),
 				page_parts=("autoDirMenu",),
 				page=dir_page,
 			)
@@ -3203,20 +3530,20 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 			new_dir = get_dir_by_id(args[0])
 			if new_dir is not None:
 				bot_settings.set("auto_download_dir", new_dir)
-			render_settings(chat_id, message_id)
+			render_settings(chat_id, message_id, "add")
 
 		elif command == "autoDirDefault":
 			bot_settings.set("auto_download_dir", "")
-			render_settings(chat_id, message_id)
+			render_settings(chat_id, message_id, "add")
 
 		elif command == "autoDirNew":
 			ask_for_input(chat_id, user_id, "autoDir", get_text("MOVE_NEW_DIR_ASK"), thread_id=thread_id, message_id=message_id,
-						back_call=build_call("settings"))
+						back_call=settings_call("add"))
 
 		elif command == "autoCatMenu":
 			markup = build_category_markup(
 				cat_call=lambda cat_id: build_call("autoCatSet", cat_id),
-				cancel_call=build_call("settings"),
+				cancel_call=settings_call("add"),
 				include_none=False,
 				page_parts=("autoCatMenu",),
 				page=int(args[0]) if args else 0,
@@ -3229,7 +3556,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None):
 			category = get_cat_by_id(args[0])
 			if category is not None:
 				bot_settings.set("auto_category", category)
-			render_settings(chat_id, message_id)
+			render_settings(chat_id, message_id, "add")
 
 		elif command == "favDirsMenu":
 			render_favorite_dirs_menu(chat_id, message_id)
@@ -3321,6 +3648,9 @@ def handle_external_torrent(torrent_id):
 	lines = [get_text("NOTIFY_EXTERNAL_ADDED", html.escape(torrent.name), html.escape(torrent.download_dir or ""))]
 	if torrent.total_size and torrent.total_size > 0:
 		lines.append(get_text("ADD_OK_SIZE", sizeof_fmt(torrent.total_size)))
+	block, markup, moved = None, None, False
+	if (bot_settings.get("notify_external_added") or auto_move_series_enabled(external=True)) and not torrent.auto_managed:
+		block, markup, moved = place_external_series(torrent, lines)
 	renamed = []
 	if auto_rename_enabled() and bot_settings.get("auto_rename_external"):
 		if torrent.files:
@@ -3329,11 +3659,38 @@ def handle_external_torrent(torrent_id):
 			# Its own notifications tell the outcome once the metadata arrives
 			lines.append(get_text("ADD_AUTO_RENAME_PENDING"))
 			threading.Thread(target=deferred_auto_rename, args=(torrent.id, torrent.name), daemon=True).start()
-	# With the add notification off, a rename is still worth telling: the
-	# torrent changed its name without anyone in the chat asking for it
-	if bot_settings.get("notify_external_added") or renamed:
+	# With the add notification off, a rename or a move is still worth telling:
+	# the torrent changed without anyone in the chat asking for it
+	if bot_settings.get("notify_external_added") or renamed or moved:
 		count_usage("auto_notify_external")
-		notify("\n".join(lines + renamed))
+		text = "\n".join(lines + renamed)
+		if block:
+			text = f"{text}\n\n{block}"
+		notify(text, reply_markup=markup)
+
+
+def place_external_series(torrent, lines):
+	"""The folder of the series for a torrent the bot did not add. It is
+	already in the manager, so the automatic move really is a move here; the
+	📂 line in lines is updated to tell where it ended up.
+	Returns (block, markup, moved)"""
+	current_dir = torrent.download_dir or ""
+	if auto_move_series_enabled(external=True) and current_dir:
+		target = series_auto_dir(series_candidates(torrent.name, exclude_id=torrent.id, current_dir=current_dir))
+		if target:
+			try:
+				client.move_torrents([torrent.id], target)
+			except TorrentClientError as e:
+				warning(f"Cannot move {torrent.name} to the folder of its series: {e}")
+			else:
+				count_usage("auto_move_series")
+				lines[0] = with_dir_line(lines[0], target)
+				block, markup = series_placed(torrent.id, series_identity(torrent.name)["title"], current_dir)
+				return block, markup, True
+	if not bot_settings.get("notify_external_added"):
+		return None, None, False
+	block, markup = series_suggestion(torrent, current_dir)
+	return block, markup, False
 
 
 def poll_torrents(states):
@@ -3348,7 +3705,8 @@ def poll_torrents(states):
 	new_ids = [str(t.id) for t in torrents if str(t.id) not in states]
 	external = set()
 	if new_ids and not baseline:
-		watch = bot_settings.get("notify_external_added") or (auto_rename_enabled() and bot_settings.get("auto_rename_external"))
+		watch = (bot_settings.get("notify_external_added") or (auto_rename_enabled() and bot_settings.get("auto_rename_external"))
+				or auto_move_series_enabled(external=True))
 		# Waits for any add in progress: the bot registers what it added
 		with _bot_adds_lock:
 			for torrent_id in new_ids:

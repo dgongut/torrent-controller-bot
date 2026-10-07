@@ -10,7 +10,9 @@ release group) and renders user-defined templates with these constructs:
              field inside it has no value
 Field names are accepted both in Spanish and English."""
 
+import functools
 import re
+import unicodedata
 
 # Valid video extensions
 VALID_EXTENSIONS = {"mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "mpg", "mpeg", "m4v", "ts", "m2ts"}
@@ -787,3 +789,165 @@ def companion_subtitle_name(subtitle_name, video_name, new_video_name):
 	suffix = subtitle_stem[len(video_stem):]
 	new_stem = _split_extension(new_video_name)[0]
 	return f"{new_stem}{suffix}.{subtitle_ext}"
+
+
+# ---------------------------------------------------------------------------
+# SERIES FOLDERS
+# ---------------------------------------------------------------------------
+# Where the other episodes of a series already are, so a new one can be sent
+# to the same place. Two names are the same series when their titles match
+# once case, accents and punctuation are left out: never a partial match,
+# since "Chicago Fire" and "Chicago Med" share a word and are different shows
+
+# A name that starts with the episode or season ('14x04 - Chicago Fire', the
+# default series template) has nothing before the marker for the title
+_LEADING_SERIES_MARKER = re.compile(
+	r'^\s*(?:[Ss]\d{1,2}(?:[\s._-]?[Ee]\d{1,3}(?:[\s._-]?-[\s._-]?[Ee]?\d{1,3})?)?(?:[\s._-]?-[\s._-]?[Ss]\d{1,2})?'
+	r'|\d{1,2}[xX]\d{2,3}(?:-\d{2,3})?'
+	r'|[Tt]\d{1,2}(?:-[Tt]?\d{1,2})?'
+	r'|(?:[Tt]emporada|[Ss]eason)[\s._-]+\d{1,2})'
+	r'(?=[\s._\-–\[(]|$)')
+
+_PATH_SEPARATOR = re.compile(r'[/\\]')
+
+
+def _series_text(text):
+	"""The comparable form of a title: lowercase words without accents or
+	punctuation, so 'Chicago.Fire' and 'chicago fire' are the same thing"""
+	text = unicodedata.normalize("NFKD", text or "")
+	text = "".join(char for char in text if not unicodedata.combining(char))
+	return " ".join(re.findall(r'[a-z0-9]+', text.casefold()))
+
+
+def _parse_series(name):
+	fields = parse_metadata(name)
+	if fields["is_series"] and not fields["title"]:
+		stem, ext = _split_extension(name)
+		marker = _LEADING_SERIES_MARKER.match(stem)
+		if marker:
+			rest = stem[marker.end():].lstrip(" -–._")
+			if rest:
+				# The marker goes behind the title, where releases carry it
+				fields = parse_metadata(f"{rest} {marker.group().strip()}")
+	return fields
+
+
+@functools.lru_cache(maxsize=4096)
+def series_identity(name):
+	"""What tells a series apart: {"key", "title", "year", "season"}, or None
+	when the name is not an episode or a season pack of a series. season is
+	None for a pack of several seasons. Every torrent in the manager goes
+	through here each time a suggestion is worked out, hence the cache"""
+	if not name:
+		return None
+	if name.lower().endswith(".torrent"):
+		name = name[:-len(".torrent")]
+	fields = _parse_series(name)
+	key = _series_text(fields["title"])
+	if not fields["is_series"] or not key:
+		return None
+	season = int(fields["season"]) if fields["season"].isdigit() else None
+	return {"key": key, "title": fields["title"], "year": fields["year"], "season": season}
+
+
+def _same_series(identity, other_key, other_year):
+	"""Same title, and the same year when both carry one: 'Doctor Who (2005)'
+	is not 'Doctor Who (1963)', but a name without a year matches either"""
+	if identity["key"] != other_key:
+		return False
+	return not (identity["year"] and other_year and identity["year"] != other_year)
+
+
+def _split_last(path):
+	"""(parent, last segment) of a path, keeping whatever separator it uses
+	(a Windows Deluge reports backslashes) and dropping a trailing one"""
+	path = path.rstrip("/\\")
+	positions = [match.start() for match in _PATH_SEPARATOR.finditer(path)]
+	if not positions:
+		return "", path
+	return path[:positions[-1]], path[positions[-1] + 1:]
+
+
+def _season_folder(segment):
+	"""The season number of a folder that only says the season ('Temporada 2',
+	'Season 02', 'S02'), or None when the folder is anything else"""
+	fields = parse_metadata(segment)
+	if fields["is_series"] and fields["season"].isdigit() and not fields["episode_number"] and not _series_text(fields["title"]):
+		return int(fields["season"])
+	return None
+
+
+def _names_series(path, identity):
+	"""True when the folder is named after the series ('Chicago Fire',
+	'Chicago Fire (2012)'), or is a season folder right inside one"""
+	parent, last = _split_last(path)
+	if _season_folder(last) is not None:
+		parent, last = _split_last(parent)
+	if not last:
+		return False
+	fields = parse_metadata(last)
+	return _same_series(identity, _series_text(fields["title"]), fields["year"])
+
+
+def _retarget_season(path, season):
+	"""Episodes of the previous season sit in 'Temporada 13', but this one
+	belongs in 'Temporada 14' next to it: the number is swapped keeping its
+	padding. A pack of several seasons belongs in the series folder itself"""
+	path = path.rstrip("/\\")
+	parent, last = _split_last(path)
+	folder_season = _season_folder(last)
+	if folder_season is None or folder_season == season or not parent:
+		return path
+	if season is None:
+		return parent
+	number = next(match for match in re.finditer(r'\d+', last) if int(match.group()) == folder_season)
+	digits = str(season).zfill(len(number.group()))
+	return f"{path[:len(parent) + 1]}{last[:number.start()]}{digits}{last[number.end():]}"
+
+
+def series_dir_candidates(name, torrents, known_dirs=(), current_dir=None, generic_dirs=()):
+	"""The folders the series of name already lives in, best first, as a list
+	of (dir, named) where named tells the folder is called after the series.
+	torrents are the other torrents of the manager as (name, download_dir,
+	added timestamp); known_dirs are folders the bot knows of (favorites) that
+	count when they are named after the series. generic_dirs (the default and
+	the automatic download dirs) are where anything lands before being sorted,
+	so they only count when named after the series.
+	Nothing is suggested when the best folder is current_dir: the torrent is
+	already where the series is, and a stray episode elsewhere is no reason
+	to move it"""
+	identity = series_identity(name)
+	if identity is None:
+		return []
+	found = {}  # dir -> [named, episodes, latest]
+
+	def consider(directory, episodes, added):
+		directory = _retarget_season(directory, identity["season"])
+		if not directory:
+			return
+		entry = found.setdefault(directory, [_names_series(directory, identity), 0, 0])
+		entry[1] += episodes
+		entry[2] = max(entry[2], added or 0)
+
+	for other_name, directory, added in torrents:
+		other = series_identity(other_name)
+		if directory and other and _same_series(identity, other["key"], other["year"]):
+			consider(directory, 1, added)
+	for directory in known_dirs:
+		if directory and _names_series(directory.rstrip("/\\"), identity):
+			consider(directory, 0, 0)
+
+	generic = {d.rstrip("/\\") for d in generic_dirs if d}
+	ranked = sorted(((d, e) for d, e in found.items() if e[0] or d not in generic),
+					key=lambda item: (not item[1][0], -item[1][1], -item[1][2], item[0]))
+	current = (current_dir or "").rstrip("/\\")
+	if ranked and ranked[0][0] == current:
+		return []
+	return [(d, e[0]) for d, e in ranked if d != current]
+
+
+def series_auto_dir(candidates):
+	"""The folder a torrent can be moved to without asking: the only one named
+	after the series. Any doubt (none, or two of them) means asking instead"""
+	named = [directory for directory, is_named in candidates if is_named]
+	return named[0] if len(named) == 1 else None

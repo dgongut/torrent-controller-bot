@@ -32,6 +32,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Notificaciones de descarga completada, de errores en torrents y de torrents añadidos fuera del bot (activables desde los ajustes)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
 - ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene y de los torrents añadidos fuera del bot (activable desde los ajustes)
+- ✅ Carpeta de la serie: un episodio nuevo se ofrece (o va directo, si lo activas) a la carpeta donde ya tienes los anteriores
 - ✅ Aviso si el torrent que añades puede no caber en el disco
 - ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
 - ✅ Notificación al administrador al arrancar el bot
@@ -121,6 +122,16 @@ Detalles a tener en cuenta:
 - En rangos se rellena cada lado por separado, así que `S01-S08` con `{temporada.2}` da `01-08`.
 - Solo funciona en `{temporada}` y `{episodio}`; en cualquier otro campo el bot rechaza la plantilla.
 - `{capitulo}` no se ve afectado: mantiene siempre su formato de dos dígitos (`1x03`, `T2`).
+
+## Carpeta de la serie
+
+Cuando llega un episodio o un pack de temporada, el bot busca entre los torrents del gestor otros de la misma serie y te propone su carpeta. Para decidir que son la misma serie compara el título sin tener en cuenta mayúsculas, tildes ni puntuación (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` y `chicago fire s14e02` son la misma serie), y si los dos nombres llevan año, tiene que coincidir. Nunca hace coincidencias parciales: `Chicago Fire` y `Chicago Med` son series distintas, y una película como *El Camino: una película de Breaking Bad* no es un episodio de nada, así que no se le busca carpeta.
+
+- **Al elegir la carpeta** (al añadir o al mover un torrent), la carpeta de la serie aparece la primera, marcada con ✨, aunque tengas muchas favoritas.
+- **Con la descarga automática**, el mensaje de torrent añadido termina con un 💡 que propone la carpeta y los botones para moverlo o descartarlo. Al moverlo, el bot edita ese mismo mensaje para que muestre la carpeta nueva.
+- **Con «Series directas a su carpeta»** (dentro de la descarga automática, desactivado por defecto), si no hay ninguna duda el torrent se añade directamente en la carpeta de la serie en vez de en la automática, y el mensaje lleva un botón ↩️ Deshacer. Solo ocurre cuando hay una única carpeta con el nombre de la serie; si hay dudas (dos carpetas posibles, o una carpeta común como `/media/series`), te la propone en lugar de decidir por ti. Opcionalmente se aplica también a los torrents añadidos fuera del bot, que en ese caso sí se mueven, porque ya están en el gestor.
+
+Si guardas las temporadas en subcarpetas (`Mad Men/Season 01`), un episodio de la temporada siguiente se propone en `Mad Men/Season 02` con el mismo formato, aunque esa carpeta aún no exista. La carpeta de descargas por defecto y la de la descarga automática nunca se proponen, salvo que lleven el nombre de la serie. Un torrent de qBittorrent en gestión automática no se toca: la carpeta la decide su categoría.
 
 ## Qué puede hacer el bot con cada gestor
 

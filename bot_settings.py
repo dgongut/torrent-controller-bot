@@ -22,6 +22,8 @@ DEFAULTS = {
 	"auto_rename": False,
 	"auto_rename_files": False,  # Only used when auto_rename is enabled
 	"auto_rename_external": False,  # Only used when auto_rename is enabled
+	"auto_move_series": False,  # Episodes added without asking go straight to the folder of their series
+	"auto_move_series_external": False,  # Only used when auto_move_series is enabled
 	"low_space_warning": True,
 	"favorite_dirs": [],  # Extra dirs offered as buttons when adding/moving torrents
 	"template_movie": "",  # "" = built-in default template

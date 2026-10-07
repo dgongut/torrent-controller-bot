@@ -162,7 +162,7 @@ real_sleep = time.sleep
 time.sleep = lambda seconds: None  # The deferred rename waits between checks
 
 NOTIFIED = []  # (text, chat_id, thread_id)
-bot.notify = lambda text, chat_id=None, thread_id=None: NOTIFIED.append((text, chat_id, thread_id))
+bot.notify = lambda text, chat_id=None, thread_id=None, reply_markup=None: NOTIFIED.append((text, chat_id, thread_id))
 WARNINGS = []
 _real_warning = bot.warning
 bot.warning = lambda message: WARNINGS.append(message)
@@ -633,7 +633,7 @@ bot._bot_adds_lock.release()
 # The add through the bot still says what it said before
 fresh(auto_rename=True, rename_files=True)
 CLIENT.on_add = lambda: CLIENT.put(series())
-text = bot.perform_add_torrent({"magnet": "m", "data": None}, "/downloads")
+text, _markup = bot.perform_add_torrent({"magnet": "m", "data": None}, "/downloads")
 lines = text.split("\n")
 check("the bot add tells the rename", bot.get_text("ADD_AUTO_RENAMED", SERIES_RENAMED) in lines, True)
 check("the bot add tells the rename before the contents",
@@ -649,12 +649,12 @@ for size in (0, -1, None):
 		t.total_size = torrent_size
 		return t
 	CLIENT.on_add = _add_sized
-	text = bot.perform_add_torrent({"magnet": "m", "data": None}, "/downloads")
+	text, _markup = bot.perform_add_torrent({"magnet": "m", "data": None}, "/downloads")
 	check(f"a bot add with size {size!r} tells no size", "💾" in text, False)
 
 fresh(auto_rename=True)
 CLIENT.on_add = lambda: CLIENT.put(magnet())
-text = bot.perform_add_torrent({"magnet": "m", "data": None}, "/downloads", chat_id=55, thread_id=7)
+text, _markup = bot.perform_add_torrent({"magnet": "m", "data": None}, "/downloads", chat_id=55, thread_id=7)
 check("a magnet added by the bot waits for its metadata", len(DEFERRED), 1)
 check("and answers in the conversation it came from", DEFERRED[0][2:], (55, 7))
 check("and says so", bot.get_text("ADD_AUTO_RENAME_PENDING") in text, True)
@@ -937,9 +937,9 @@ check("a fresh install has the external notification off", bot_settings.get("not
 check("a fresh install has the external rename off", bot_settings.get("auto_rename_external"), False)
 
 
-def settings_screen():
+def settings_screen(screen="main"):
 	EDITS.clear()
-	bot.dispatch_callback(1, 100, 1, bot.build_call("settings"))
+	bot.dispatch_callback(1, 100, 1, bot.build_call("settings", screen))
 	text, markup = EDITS[-1]
 	return text, [b.callback_data for row in markup.keyboard for b in row]
 
@@ -952,9 +952,12 @@ for auto_rename, rename_files, rename_external, supports_rename in itertools.pro
 	label = f"[rename={auto_rename} files={rename_files} external={rename_external} supported={supports_rename}]"
 	configure(auto_rename=auto_rename, rename_files=rename_files and auto_rename,
 			rename_external=rename_external and auto_rename, supports_rename=supports_rename)
-	text, buttons = settings_screen()
+	_text, main_buttons = settings_screen()
+	_text, notify_buttons = settings_screen("notify")
+	text, buttons = settings_screen("rename")
 	children = auto_rename and supports_rename
-	check(f"{label} the external notification is always offered", "toggleSetting|notify_external_added" in buttons, True)
+	check(f"{label} the external notification is always offered", "toggleSetting|notify_external_added" in notify_buttons, True)
+	check(f"{label} the rename section is offered when the manager can rename", "settings|rename" in main_buttons, supports_rename)
 	check(f"{label} the rename is offered when the manager can rename", "toggleSetting|auto_rename" in buttons, supports_rename)
 	check(f"{label} the files scope only under an active rename", "toggleSetting|auto_rename_files" in buttons, children)
 	check(f"{label} the external scope only under an active rename", "toggleSetting|auto_rename_external" in buttons, children)
