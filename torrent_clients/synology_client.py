@@ -21,6 +21,7 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	query_matcher,
 	sort_files,
 )
 
@@ -507,10 +508,10 @@ class SynologyClient(TorrentClient):
 			raise TorrentClientError(f"Error listing torrents: {e}")
 
 		result = []
-		query_lower = query.lower() if query else None
+		matches = query_matcher(query)
 		for t in tasks:
 			info = self._to_info(t)
-			if query_lower and query_lower not in info.name.lower() and query_lower not in info.download_dir.lower():
+			if matches and not matches(info.name, info.download_dir):
 				continue
 			if status and info.status != status:
 				continue

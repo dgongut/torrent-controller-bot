@@ -61,6 +61,17 @@ check_fields("Breaking.Bad.S01E03.720p.HDTV.x264.mkv",
 check_fields("La.Casa.de.Papel.3x05.1080p.WEB-DL.Castellano.mkv",
 	title="La Casa de Papel", chapter="3x05", language="Castellano", is_series=True)
 check_fields("Serie Cap.103 HDTV.avi", title="Serie", chapter="1x03", season="1", episode_number="3")
+# T for temporada, as Spanish releases write it
+check_fields("El.Pueblo (2019) T01E03 AMZN WEBDL 1080p ESP DD5.1.SUB x264 HDBart.mkv",
+	title="El Pueblo", year="2019", chapter="1x03", season="1", episode_number="3", is_series=True)
+check_fields("El.Pueblo.T02E05-E08.1080p", title="El Pueblo", season="2", episode_number="5-8", chapter="2x05-08")
+check_fields("El.Pueblo.T01-T03.1080p", title="El Pueblo", season="1-3", chapter="T1-T3")
+check_fields("T01E03 - El Pueblo.mkv", chapter="1x03")
+# The T has to start a word, it is not the end of the title
+check_fields("Lost01E01.mkv", chapter="", is_series=False)
+check("a T01E03 file inside a season pack folder", suggest_file_name(
+	"El.Pueblo (2019) T01E03 AMZN WEBDL 1080p ESP DD5.1.SUB x264 HDBart.mkv", parent_name="El Pueblo S01 (2019)",
+	template_series="{temporada}x{episode.2} - {title}[ - {titulo_episodio}][.{extension}]"), "1x03 - El Pueblo.mkv")
 check_fields("Otra.Serie.Capitulo.1204.mp4", chapter="12x04", season="12", episode_number="4")
 check_fields("Show.Name.S02.Complete.1080p.mkv",
 	title="Show Name", season="2", chapter="T2", episode_number="", is_series=True)

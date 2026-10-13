@@ -5,6 +5,8 @@ The bot only talks to this interface, so any torrent client
 implementing TorrentClient.
 """
 
+import re
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -30,6 +32,66 @@ class PermanentTorrentError(TorrentClientError):
 	do what was asked no matter how many times it is told. Callers that retry
 	on TorrentClientError have to give up on this one right away"""
 	pass
+
+
+def _fold(text):
+	"""Lowercase text without accents, so 'Películas' and 'PELICULAS' compare equal"""
+	text = unicodedata.normalize("NFKD", text or "")
+	return "".join(char for char in text if not unicodedata.combining(char)).casefold()
+
+
+def _search_words(text):
+	"""Lowercase words of a text without accents or punctuation, so
+	'La.Casa.de.Papel' and 'casa papel' share the same words"""
+	return re.findall(r'[^\W_]+', _fold(text))
+
+
+# A query term: a phrase between straight, curly or angle quotes (Telegram
+# apps turn typed quotes into curly ones), or anything up to the next space
+_QUERY_TERM = re.compile(r'"([^"]*)"|“([^”]*)”|«([^»]*)»|(\S+)')
+_QUOTES = '"“”«»'
+
+
+def query_matcher(query):
+	"""Predicate telling whether the given texts (name, download directory...)
+	match the query, or None when there is no query. Case and accents never
+	matter, and every term of the query has to match, in any order:
+	- a word matches any part of a word, ignoring separators, so
+	  'casa papel' finds 'La.Casa.de.Papel'
+	- a phrase between quotes has to appear as is, word after word, so
+	  '"la casa"' finds 'La.Casa.de.Papel' but not 'Casa.La'
+	- a term with a '/' is a path and has to appear as is, slashes
+	  included, so '/ssd/peliculas' finds '/ssd/Películas' but not
+	  '/media/PELICULAS'"""
+	if not query:
+		return None
+	words, phrases, raws = [], [], []
+	for match in _QUERY_TERM.finditer(query):
+		phrase = next((group for group in match.groups()[:3] if group is not None), None)
+		if phrase is not None:
+			if _search_words(phrase):
+				phrases.append(" ".join(_search_words(phrase)))
+			continue
+		term = match.group(4).strip(_QUOTES)
+		if "/" in term or not _search_words(term):
+			# Paths keep their separators; so does a term made only of
+			# punctuation, which otherwise would have nothing to look for
+			if term:
+				raws.append(_fold(term))
+		else:
+			words.extend(_search_words(term))
+	if not (words or phrases or raws):
+		return None
+
+	def matches(*texts):
+		folded = [_fold(text) for text in texts]
+		# A trailing slash in a path term still finds a directory written without it
+		folded += [text + "/" for text in folded if text and not text.endswith("/")]
+		haystack = " " + " | ".join(" ".join(_search_words(text)) for text in texts) + " "
+		return (all(word in haystack for word in words)
+			and all(f" {phrase} " in haystack for phrase in phrases)
+			and all(any(raw in text for text in folded) for raw in raws))
+	return matches
 
 
 def sort_files(files):
@@ -121,8 +183,8 @@ class TorrentClient(ABC):
 	@abstractmethod
 	def get_torrents(self, status=None, query=None):
 		"""Returns a list of TorrentInfo (light fields). Optionally filtered
-		by normalized status (TorrentStatus) and/or by substring matching
-		the name or the download directory"""
+		by normalized status (TorrentStatus) and/or by a query matched
+		against the name and the download directory (see query_matcher)"""
 		pass
 
 	@abstractmethod

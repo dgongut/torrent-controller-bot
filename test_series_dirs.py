@@ -681,8 +681,10 @@ check("the add message tells that folder", "📂 <code>/media/SERIES/Chicago Fir
 check("and why", text.endswith(bot.get_text("SERIES_PLACED", "Chicago Fire")), True)
 check("no 'moved' line", bot.get_text("SERIES_MOVED", "/media/SERIES/Chicago Fire") in text, False)
 added_id = [t for t in CLIENT.torrents.values() if t.name == CLIENT.added][0].id
-check("with an undo button", buttons(markup),
-	[(bot.get_text("BUTTON_SERIES_UNDO"), bot.build_call("serUndo", added_id, bot.get_dir_id("/downloads")))])
+check("with an undo button and an OK one, side by side", [buttons(markup)], [[
+	(bot.get_text("BUTTON_SERIES_UNDO"), bot.build_call("serUndo", added_id, bot.get_dir_id("/downloads"))),
+	(bot.get_text("BUTTON_SERIES_KEEP"), bot.build_call("serKeep"))]])
+check("in a single row", len(markup.keyboard), 1)
 check("a single message", [s[0] for s in SCREENS], ["send"])
 add_message = text
 
@@ -694,6 +696,15 @@ check("editing the same message", kind, "edit")
 check("whose 📂 line tells it", "📂 <code>/downloads</code>" in text, True)
 check("without the series line", bot.get_text("SERIES_PLACED", "Chicago Fire") in text, False)
 check("nor buttons", markup, None)
+
+fresh(auto_download=True, auto_move_series=True)
+chicago()
+CLIENT.added = "Chicago.Fire.S14E04.1080p"
+bot.start_add_flow(1, "Chicago.Fire.S14E04.1080p", magnet="m")
+CLIENT.calls.clear()
+press(buttons(last()[2])[1][1], message_html=roundtrip(last()[1]))
+check("OK only drops the buttons, keeping the message", (last()[0], last()[2]), ("markup", None))
+check("and nothing is moved", [c for c in CLIENT.calls if c[0] == "move"], [])
 
 fresh(auto_download=True, auto_move_series=True, auto_download_dir="/media/incoming")
 chicago()
@@ -1014,7 +1025,7 @@ check("and the speed screen comes back", SCREENS[-1][1].startswith(f"{bot.get_te
 import json
 locales = {lang: json.load(open(os.path.join(REPO, "locale", f"{lang}.json"), encoding="utf-8")) for lang in ("es", "en")}
 for name in ("SERIES_DIR_HINT", "SERIES_SUGGEST_ONE", "SERIES_SUGGEST_MANY", "SERIES_PLACED", "SERIES_MOVING", "SERIES_MOVED",
-			"SERIES_EXPIRED", "BUTTON_SERIES_MOVE", "BUTTON_SERIES_UNDO", "SETTINGS_AUTO_MOVE_SERIES",
+			"SERIES_EXPIRED", "BUTTON_SERIES_MOVE", "BUTTON_SERIES_UNDO", "BUTTON_SERIES_KEEP", "SETTINGS_AUTO_MOVE_SERIES",
 			"SETTINGS_AUTO_MOVE_SERIES_ON", "BUTTON_SETTING_AUTO_MOVE_SERIES", "BUTTON_SETTING_AUTO_MOVE_SERIES_EXTERNAL"):
 	for lang, texts in locales.items():
 		check(f"{name} is in {lang}", name in texts, True)

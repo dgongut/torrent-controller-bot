@@ -64,7 +64,7 @@ Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu
 |---|---|
 | `/start` | Panel de control con el estado general y los torrents agrupados por estado |
 | `/list` | Listado completo de torrents con filtros y paginación |
-| `/find texto` | Busca torrents por nombre o por ruta (p. ej. `/find /downloads`) |
+| `/find texto` | Busca torrents por nombre o por ruta, sin importar mayúsculas ni tildes. Cada palabra puede ir en cualquier orden (`/find casa papel` encuentra `La.Casa.de.Papel`); una ruta tiene que aparecer tal cual (`/find /ssd/peliculas` no encuentra `/media/Peliculas`) y lo que va entre comillas, como frase exacta (`/find "la casa"`) |
 | `/add` | Añade un torrent (también puedes enviar directamente un fichero `.torrent` o un enlace magnet) |
 | `/settings` | Ajustes del gestor: modo tortuga y límites de velocidad |
 | `/version` | Muestra la versión actual y el gestor al que está conectado |
@@ -76,7 +76,7 @@ Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu
 Al pulsar ✏️ Renombrar sobre un torrent, el bot intenta generar una sugerencia de nombre limpio:
 
 - **Películas**: `The.Matrix.1999.1080p.BluRay.x264.mkv` → `The Matrix (1999) - 1080p.mkv`
-- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (soporta formatos `Cap.103`, `S01E03` y `3x05`)
+- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (soporta formatos `Cap.103`, `S01E03`, `T01E03` y `3x05`)
 
 Si no puede generar sugerencia, siempre puedes escribir el nombre manualmente.
 

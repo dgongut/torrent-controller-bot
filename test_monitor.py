@@ -267,6 +267,7 @@ def fresh(**settings):
 	DEFERRED.clear()
 	PENDING.clear()
 	bot._bot_added_ids.clear()
+	bot._late_adds.clear()
 	bot.deferred_auto_rename = _record_deferred
 
 
@@ -735,6 +736,73 @@ release.set()
 adder.join(5)
 poller.join(5)
 check("a task the bot deleted after a failed add is not announced", NOTIFIED, [])
+
+# ---------------------------------------------------------------------------
+# 7b. THE LATE ADD: the manager takes the torrent after the add timed out
+# ---------------------------------------------------------------------------
+
+# A busy Transmission does not answer in time, the bot reports the error, and
+# the torrent shows up anyway a poll later. It is the bot's add, not an
+# external one: it is told with the add message, in the conversation it came from
+
+LATE_HASH = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a"
+fresh(notify_external=True, auto_rename=True)
+states = poll(None)
+def _timeout_add():
+	raise TorrentClientError("Error adding torrent: timeout when connection to transmission daemon")
+CLIENT.on_add = _timeout_add
+try:
+	bot.perform_add_torrent({"magnet": f"magnet:?xt=urn:btih:{LATE_HASH.upper()}&dn=x", "data": None}, "/downloads",
+						chat_id=55, thread_id=7)
+	check("the timed out add raises", False, True)
+except TorrentClientError:
+	pass
+check("the timed out add is watched for by its info hash", list(bot._late_adds), [LATE_HASH])
+late = CLIENT.put(movie(torrent_id=LATE_HASH))
+states = poll(states)
+check("the late torrent is not taken for external", count_external(), 0)
+check("it is told once", len(NOTIFIED), 1)
+check("as a late add", NOTIFIED[0][0].startswith(bot.get_text("ADD_LATE")), True)
+check("with the add message", bot.get_text("ADD_OK", bot.html.escape(MOVIE_NAME), "/downloads") in NOTIFIED[0][0], True)
+check("and the rename of an add", bot.get_text("ADD_AUTO_RENAMED", MOVIE_RENAMED) in NOTIFIED[0][0], True)
+check("in the conversation it came from", NOTIFIED[0][1:], (55, 7))
+check("and no longer watched for", bot._late_adds, {})
+states = poll(states)
+check("nor told again", len(NOTIFIED), 1)
+
+# Without anything to tell the info hash by, a failed add watches for nothing
+fresh(notify_external=True)
+states = poll(None)
+CLIENT.on_add = _timeout_add
+try:
+	bot.perform_add_torrent({"magnet": "magnet:?dn=x", "data": None}, "/downloads")
+except TorrentClientError:
+	pass
+check("a magnet without info hash is not watched for", bot._late_adds, {})
+CLIENT.put(movie())
+states = poll(states)
+check("so whatever shows up is still external", count_external(), 1)
+
+# A late add that never lands is forgotten with the TTL
+fresh()
+bot._late_adds["0" * 40] = {"ts": time.time() - bot.BOT_ADDED_TTL - 1}
+CLIENT.on_add = lambda: CLIENT.put(movie())
+bot.add_torrent_from_bot(magnet="m")
+check("a late add older than the TTL is dropped", bot._late_adds, {})
+
+# The info hash, from a magnet in hex or base32 and from a .torrent file
+import base64
+import hashlib
+check("a hex magnet", bot.magnet_hash(f"magnet:?xt=urn:btih:{LATE_HASH.upper()}&dn=x"), LATE_HASH)
+check("a base32 magnet", bot.magnet_hash("magnet:?xt=urn:btih:" + base64.b32encode(bytes.fromhex(LATE_HASH)).decode()), LATE_HASH)
+check("a magnet without hash", bot.magnet_hash("magnet:?dn=x"), None)
+info = b"d6:lengthi12345e4:name8:Film.mkv12:piece lengthi16384e6:pieces20:" + b"x" * 20 + b"e"
+torrent_file = b"d8:announce18:http://tr/announce7:commentd1:ai1ee13:creation datei1700000000e" + b"4:info" + info + b"e"
+check("a .torrent file", bot.torrent_data_hash(torrent_file), hashlib.sha1(info).hexdigest())
+check("an info nested in another key does not count", bot.torrent_data_hash(b"d1:xd4:infod1:ai1eee4:info" + info + b"e"),
+	hashlib.sha1(info).hexdigest())
+for broken in (b"", b"not a torrent", b"d4:info", b"d4:infod1:ai1e", b"d99999:x"):
+	check(f"a broken .torrent {broken!r} has no hash", bot.torrent_data_hash(broken), None)
 
 # ---------------------------------------------------------------------------
 # 8. FAILURES ON THE WAY

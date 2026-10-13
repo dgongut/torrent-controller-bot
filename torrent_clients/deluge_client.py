@@ -15,6 +15,7 @@ from torrent_clients.base import (
 	TorrentInfo,
 	TorrentStatus,
 	content_root,
+	query_matcher,
 	sort_files,
 )
 
@@ -188,11 +189,10 @@ class DelugeClient(TorrentClient):
 			raise TorrentClientError(f"Error listing torrents: {e}")
 
 		result = []
-		query_lower = query.lower() if query else None
+		matches = query_matcher(query)
 		for torrent_hash, t in torrents.items():
-			if query_lower:
-				if query_lower not in t.get("name", "").lower() and query_lower not in t.get("save_path", "").lower():
-					continue
+			if matches and not matches(t.get("name", ""), t.get("save_path", "")):
+				continue
 			info = self._to_info(torrent_hash, t)
 			if status and info.status != status:
 				continue

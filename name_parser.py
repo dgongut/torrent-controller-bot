@@ -20,9 +20,13 @@ VALID_EXTENSIONS = {"mkv", "mp4", "avi", "mov", "wmv", "flv", "webm", "mpg", "mp
 # Subtitle extensions: they follow the video file name so players keep matching them
 SUBTITLE_EXTENSIONS = {"srt", "ass", "ssa", "sub", "idx", "vtt", "sup"}
 
-# Episode patterns: S01E03, 1x03, Cap.103 / Capitulo 103
+# Season marker: S01, or T01 (temporada) in Spanish releases. The T has to
+# start a word, so it is never the last letter of the title ('Lost01E01')
+_SEASON_MARK = r'(?:[Ss]|(?<![A-Za-z0-9])[Tt])'
+
+# Episode patterns: S01E03 / T01E03, 1x03, Cap.103 / Capitulo 103
 EPISODE_PATTERNS = [
-	re.compile(r'[Ss](\d{1,2})[\s._-]?[Ee](\d{1,3})'),
+	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee](\d{1,3})'),
 	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})(?!\d)'),
 	re.compile(r'[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})'),
 ]
@@ -45,9 +49,9 @@ SEASON_ONLY_PATTERNS = [
 	re.compile(r'\bT(\d{1,2})\b(?![\s._-]?[Ee]\d)'),
 ]
 
-# Multi-episode/multi-season packs: S04E01-E08, S01-S08
-_EPISODE_RANGE_PATTERN = re.compile(r'[Ss](\d{1,2})[\s._-]?[Ee](\d{1,3})[\s._-]?-[\s._-]?[Ee]?(\d{1,3})(?![\dpP])')
-_SEASON_RANGE_PATTERN = re.compile(r'\b[Ss](\d{1,2})[\s._-]?-[\s._-]?[Ss](\d{1,2})\b')
+# Multi-episode/multi-season packs: S04E01-E08, S01-S08 (or with T)
+_EPISODE_RANGE_PATTERN = re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee](\d{1,3})[\s._-]?-[\s._-]?[Ee]?(\d{1,3})(?![\dpP])')
+_SEASON_RANGE_PATTERN = re.compile(r'\b[Ss](\d{1,2})[\s._-]?-[\s._-]?[Ss](\d{1,2})\b|\b[Tt](\d{1,2})[\s._-]?-[\s._-]?[Tt](\d{1,2})\b')
 
 # 'Cap.1984': four digits that look like a year. On their own they are still a
 # valid chapter (1901 is season 19, episode 01), so they only count as junk
@@ -426,7 +430,7 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 		episode_end = end
 		episode_span = (start, end)
 	elif season_range:
-		s1, s2 = int(season_range.group(1)), int(season_range.group(2))
+		s1, s2 = (int(group) for group in season_range.groups() if group is not None)
 		fields["is_series"] = True
 		fields["season"] = f"{s1}-{s2}"
 		fields["chapter"] = f"{season_prefix}{s1}-{season_prefix}{s2}"
@@ -802,7 +806,7 @@ def companion_subtitle_name(subtitle_name, video_name, new_video_name):
 # A name that starts with the episode or season ('14x04 - Chicago Fire', the
 # default series template) has nothing before the marker for the title
 _LEADING_SERIES_MARKER = re.compile(
-	r'^\s*(?:[Ss]\d{1,2}(?:[\s._-]?[Ee]\d{1,3}(?:[\s._-]?-[\s._-]?[Ee]?\d{1,3})?)?(?:[\s._-]?-[\s._-]?[Ss]\d{1,2})?'
+	r'^\s*(?:[SsTt]\d{1,2}(?:[\s._-]?[Ee]\d{1,3}(?:[\s._-]?-[\s._-]?[Ee]?\d{1,3})?)?(?:[\s._-]?-[\s._-]?[Ss]\d{1,2})?'
 	r'|\d{1,2}[xX]\d{2,3}(?:-\d{2,3})?'
 	r'|[Tt]\d{1,2}(?:-[Tt]?\d{1,2})?'
 	r'|(?:[Tt]emporada|[Ss]eason)[\s._-]+\d{1,2})'

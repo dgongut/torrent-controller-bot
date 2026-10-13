@@ -64,7 +64,7 @@ Before starting the container you need your own Telegram bot and your user ident
 |---|---|
 | `/start` | Dashboard with the overall status and torrents grouped by state |
 | `/list` | Full torrent list with filters and pagination |
-| `/find text` | Search torrents by name or by path (e.g. `/find /downloads`) |
+| `/find text` | Search torrents by name or by path, ignoring case and accents. Words can come in any order (`/find casa papel` finds `La.Casa.de.Papel`); a path has to appear as is (`/find /ssd/movies` does not find `/media/Movies`) and quoted text as an exact phrase (`/find "the office"`) |
 | `/add` | Add a torrent (you can also send a `.torrent` file or a magnet link directly) |
 | `/settings` | Client settings: turtle mode and speed limits |
 | `/version` | Shows the current version and the client it is connected to |
@@ -75,7 +75,7 @@ Before starting the container you need your own Telegram bot and your user ident
 When pressing ✏️ Rename on a torrent, the bot tries to generate a clean name suggestion:
 
 - **Movies**: `The.Matrix.1999.1080p.BluRay.x264.mkv` → `The Matrix (1999) - 1080p.mkv`
-- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (supports `Cap.103`, `S01E03` and `3x05` formats)
+- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (supports `Cap.103`, `S01E03`, `T01E03` and `3x05` formats)
 
 If no suggestion can be generated, you can always type the name manually.
 

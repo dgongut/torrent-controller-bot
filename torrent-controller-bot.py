@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import html
 import json
 import math
@@ -23,7 +25,7 @@ import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1606,12 +1608,14 @@ def series_suggestion(torrent, current_dir):
 
 def series_placed(torrent_id, title, previous_dir):
 	"""The block that tells a torrent went straight to the folder of its
-	series, with the button that sends it where it would have gone instead"""
+	series, with the button that sends it where it would have gone instead
+	and the one that leaves it there and takes both buttons away"""
 	text = get_text("SERIES_PLACED", html.escape(title))
 	markup = None
 	if previous_dir:
-		markup = InlineKeyboardMarkup(row_width=1)
-		markup.add(InlineKeyboardButton(get_text("BUTTON_SERIES_UNDO"), callback_data=build_call("serUndo", torrent_id, get_dir_id(previous_dir))))
+		markup = InlineKeyboardMarkup()
+		markup.row(InlineKeyboardButton(get_text("BUTTON_SERIES_UNDO"), callback_data=build_call("serUndo", torrent_id, get_dir_id(previous_dir))),
+				InlineKeyboardButton(get_text("BUTTON_SERIES_KEEP"), callback_data=build_call("serKeep")))
 	return text, markup
 
 
@@ -2267,16 +2271,38 @@ _bot_adds_lock = threading.Lock()
 _bot_added_ids = {}
 BOT_ADDED_TTL = 3600  # Seconds an unseen id is kept (torrent deleted before the next poll)
 
+# Adds that failed but may still land: a manager that is busy can take the
+# torrent after the bot gave up waiting for its answer. Info hash -> what the
+# add was for, so the monitor finishes it as the bot's own add instead of
+# telling it as an external one
+_late_adds = {}
 
-def add_torrent_from_bot(**kwargs):
+
+def add_torrent_from_bot(late_add=None, **kwargs):
+	"""Adds the torrent and registers it as the bot's. When the add fails and
+	late_add is given (the context to finish it with), the torrent is watched
+	for in case the manager takes it anyway"""
 	with _bot_adds_lock:
-		torrent = client.add_torrent(**kwargs)
 		now = time.time()
-		for torrent_id, ts in list(_bot_added_ids.items()):
-			if now - ts > BOT_ADDED_TTL:
-				del _bot_added_ids[torrent_id]
+		for registry in (_bot_added_ids, _late_adds):
+			for key, entry in list(registry.items()):
+				if now - (entry["ts"] if isinstance(entry, dict) else entry) > BOT_ADDED_TTL:
+					del registry[key]
+		try:
+			torrent = client.add_torrent(**kwargs)
+		except TorrentClientError:
+			info_hash = expected_info_hash(kwargs.get("magnet"), kwargs.get("torrent_data"))
+			if late_add is not None and info_hash:
+				_late_adds[info_hash] = dict(late_add, ts=now)
+			raise
 		_bot_added_ids[str(torrent.id)] = now
 	return torrent
+
+
+def pop_late_add(torrent_id):
+	"""The context of a failed add that turned out to land as torrent_id, or
+	None. Must be called holding _bot_adds_lock"""
+	return _late_adds.pop(str(torrent_id).lower(), None)
 
 
 def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, category=None, automatic=False):
@@ -2293,8 +2319,16 @@ def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, cat
 			series_title = series_identity(pending_series_name(pending))["title"]
 			previous_dir = download_dir
 			download_dir = series_dir
-	torrent = add_torrent_from_bot(magnet=pending["magnet"], torrent_data=pending["data"],
+	late_add = {"chat_id": chat_id, "thread_id": thread_id, "download_dir": download_dir, "category": category,
+				"automatic": automatic, "series_title": series_title, "previous_dir": previous_dir}
+	torrent = add_torrent_from_bot(late_add=late_add, magnet=pending["magnet"], torrent_data=pending["data"],
 							download_dir=download_dir, category=category or None)
+	return added_message(torrent, **late_add)
+
+
+def added_message(torrent, chat_id=None, thread_id=None, download_dir=None, category=None, automatic=False,
+				series_title=None, previous_dir=None):
+	"""The message that tells a torrent the bot added: (text, markup)"""
 	if series_title:
 		count_usage("auto_move_series")
 	# With a category the directory is not known until the manager has resolved
@@ -2338,6 +2372,22 @@ def build_low_space_warning(total_size, download_dir):
 	if free is None or free < 0 or total_size <= free:
 		return None
 	return get_text("LOW_SPACE_WARNING", sizeof_fmt(total_size), sizeof_fmt(free))
+
+
+def handle_late_add(torrent_id, late_add):
+	"""A torrent whose add failed showed up in the manager after all: it is
+	told as the bot's add it was, with its rename and its series folder"""
+	try:
+		torrent = client.get_torrent(torrent_id)
+	except TorrentClientError as e:
+		warning(f"Cannot read the late added torrent {torrent_id}: {e}")
+		return
+	if torrent is None:
+		return
+	context = {key: value for key, value in late_add.items() if key != "ts"}
+	text, markup = added_message(torrent, **context)
+	count_usage("late_add")
+	notify(f"{get_text('ADD_LATE')}\n\n{text}", context["chat_id"], context["thread_id"], reply_markup=markup)
 
 
 def do_add_torrent(chat_id, message_id, pending_id, download_dir, thread_id=None, category=None):
@@ -2419,6 +2469,59 @@ def torrent_data_name(data):
 		return None
 	start = match.end()
 	return data[start:start + int(match.group(1))].decode("utf-8", errors="replace") or None
+
+
+def _bencode_end(data, start):
+	"""Where the bencoded value that starts at start ends"""
+	kind = data[start:start + 1]
+	if kind == b"i":
+		return data.index(b"e", start) + 1
+	if kind in (b"l", b"d"):
+		position = start + 1
+		while data[position:position + 1] != b"e":
+			position = _bencode_end(data, position)
+		return position + 1
+	colon = data.index(b":", start)
+	return colon + 1 + int(data[start:colon])
+
+
+def torrent_data_hash(data):
+	"""The info hash of a .torrent file (SHA-1 of its info dictionary), or None"""
+	if not data or data[:1] != b"d":
+		return None
+	try:
+		position = 1
+		while data[position:position + 1] != b"e":
+			key_end = _bencode_end(data, position)
+			key = data[data.index(b":", position) + 1:key_end]
+			value_end = _bencode_end(data, key_end)
+			if key == b"info":
+				return hashlib.sha1(data[key_end:value_end]).hexdigest()
+			position = value_end
+	except (ValueError, IndexError, RecursionError):
+		return None
+	return None
+
+
+def magnet_hash(magnet):
+	"""The info hash of a magnet link, in hex, or None. It comes in hex or in base32"""
+	match = re.search(r"xt=urn:btih:([0-9A-Za-z]+)", magnet or "")
+	if not match:
+		return None
+	value = match.group(1)
+	if len(value) == 40 and re.fullmatch(r"[0-9A-Fa-f]+", value):
+		return value.lower()
+	if len(value) == 32:
+		try:
+			return base64.b32decode(value.upper()).hex()
+		except ValueError:
+			return None
+	return None
+
+
+def expected_info_hash(magnet=None, torrent_data=None):
+	"""The info hash a torrent will have once added, or None when it cannot be known"""
+	return magnet_hash(magnet) if magnet else torrent_data_hash(torrent_data)
 
 
 # ---------------------------------------------------------------------------
@@ -2604,7 +2707,7 @@ def handle_pending_input(message, pending):
 			send_message(chat_id, get_text("ADD_EXPIRED"), reply_markup=back_markup, thread_id=thread_id)
 			return
 		try:
-			result, _markup = perform_add_torrent(pending_torrent, text)
+			result, _markup = perform_add_torrent(pending_torrent, text, chat_id, thread_id)
 		except TorrentClientError as e:
 			result = get_text("ADD_ERROR", html.escape(str(e)))
 		send_message(chat_id, result, reply_markup=back_markup, thread_id=thread_id)
@@ -3307,6 +3410,9 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			else:
 				bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
 
+		elif command == "serKeep":
+			bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+
 		elif command == "search":
 			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), thread_id=thread_id, message_id=message_id)
 
@@ -3704,19 +3810,30 @@ def poll_torrents(states):
 	torrents = client.get_torrents()
 	new_ids = [str(t.id) for t in torrents if str(t.id) not in states]
 	external = set()
+	late = {}
 	if new_ids and not baseline:
 		watch = (bot_settings.get("notify_external_added") or (auto_rename_enabled() and bot_settings.get("auto_rename_external"))
 				or auto_move_series_enabled(external=True))
 		# Waits for any add in progress: the bot registers what it added
 		with _bot_adds_lock:
 			for torrent_id in new_ids:
-				if _bot_added_ids.pop(torrent_id, None) is None and watch:
+				if _bot_added_ids.pop(torrent_id, None) is not None:
+					continue
+				late_add = pop_late_add(torrent_id)
+				if late_add is not None:
+					late[torrent_id] = late_add
+				elif watch:
 					external.add(torrent_id)
 	for torrent in torrents:
 		torrent_id = str(torrent.id)
 		state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
 		prev = states.get(torrent_id)
 		if not baseline:
+			if torrent_id in late:
+				try:
+					handle_late_add(torrent.id, late[torrent_id])
+				except Exception as e:
+					warning(f"Cannot handle the late added torrent {torrent.name}: {e}")
 			if torrent_id in external:
 				# Inline, so it is told before a completion seen in this same poll.
 				# A failure must not stop it from being recorded as seen, or the

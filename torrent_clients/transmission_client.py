@@ -13,6 +13,7 @@ from torrent_clients.base import (
 	TorrentInfo,
 	TorrentStatus,
 	content_root,
+	query_matcher,
 	sort_files,
 )
 
@@ -194,12 +195,10 @@ class TransmissionClient(TorrentClient):
 			raise TorrentClientError(f"Error listing torrents: {e}")
 
 		result = []
-		query_lower = query.lower() if query else None
+		matches = query_matcher(query)
 		for t in torrents:
-			if query_lower:
-				download_dir = self._raw(t, "downloadDir", "") or ""
-				if query_lower not in t.name.lower() and query_lower not in download_dir.lower():
-					continue
+			if matches and not matches(t.name, self._raw(t, "downloadDir", "") or ""):
+				continue
 			info = self._to_info(t)
 			if status and info.status != status:
 				continue
