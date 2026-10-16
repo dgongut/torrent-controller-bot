@@ -25,7 +25,7 @@ import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -3082,27 +3082,60 @@ def handle_text(message):
 
 	text = message.text.strip()
 	if text.lower().startswith("magnet:"):
-		name = extract_magnet_name(text)
-		count_usage("add_magnet")
-		start_add_flow(message.chat.id, name, magnet=text, thread_id=message.message_thread_id)
+		add_magnet_from_message(message, text)
 	elif text.lower().startswith(("http://", "https://")) and " " not in text:
-		# In groups, ignore invalid links silently (the bot may live with other
-		# bots and people pasting links); only reply in private chats
-		is_private = message.chat.type == "private"
-		try:
-			data, name = download_torrent_from_url(text)
-		except ValueError:
-			debug(f"URL is not a torrent, ignored: {text}")
-			if is_private:
-				send_message(message.chat.id, get_text("ADD_URL_NOT_TORRENT"), thread_id=message.message_thread_id)
-			return
-		except Exception as e:
-			debug(f"Cannot download URL {text}: {e}")
-			if is_private:
-				send_message(message.chat.id, get_text("ADD_URL_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
-			return
-		count_usage("add_url")
-		start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
+		add_url_from_message(message, text)
+	else:
+		# Links inside a longer message or hidden behind text ("Hola! Esto es un enlace")
+		for url in message_links(message):
+			if url.lower().startswith("magnet:"):
+				add_magnet_from_message(message, url)
+			elif url.lower().startswith(("http://", "https://")):
+				add_url_from_message(message, url)
+
+
+def message_links(message):
+	"""The URLs of the link entities of a message, without duplicates. A
+	text_link carries its URL; a url entity is a slice of the text, whose
+	offsets Telegram counts in UTF-16 code units"""
+	links = []
+	encoded = message.text.encode("utf-16-le")
+	for entity in message.entities or []:
+		if entity.type == "text_link":
+			url = entity.url
+		elif entity.type == "url":
+			url = encoded[entity.offset * 2:(entity.offset + entity.length) * 2].decode("utf-16-le", errors="ignore")
+		else:
+			continue
+		if url and url not in links:
+			links.append(url)
+	return links
+
+
+def add_magnet_from_message(message, magnet):
+	name = extract_magnet_name(magnet)
+	count_usage("add_magnet")
+	start_add_flow(message.chat.id, name, magnet=magnet, thread_id=message.message_thread_id)
+
+
+def add_url_from_message(message, url):
+	# In groups, ignore invalid links silently (the bot may live with other
+	# bots and people pasting links); only reply in private chats
+	is_private = message.chat.type == "private"
+	try:
+		data, name = download_torrent_from_url(url)
+	except ValueError:
+		debug(f"URL is not a torrent, ignored: {url}")
+		if is_private:
+			send_message(message.chat.id, get_text("ADD_URL_NOT_TORRENT"), thread_id=message.message_thread_id)
+		return
+	except Exception as e:
+		debug(f"Cannot download URL {url}: {e}")
+		if is_private:
+			send_message(message.chat.id, get_text("ADD_URL_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
+		return
+	count_usage("add_url")
+	start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
 
 
 # ---------------------------------------------------------------------------
