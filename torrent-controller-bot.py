@@ -25,7 +25,7 @@ import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -354,9 +354,11 @@ _dir_ids = {}
 _cat_by_id = {}
 _cat_ids = {}
 
-# Active dashboards: (chat_id, thread_id) -> {"message_id": int, "generation": int}
-dashboards = {}
-_dashboards_lock = threading.Lock()
+# Live screens (the dashboard, a list, a torrent) repainting themselves:
+# (chat_id, thread_id) -> {"message_id": int, "generation": int}. Only the last
+# one opened in a chat or topic is live, so Telegram never gets more edits than one
+live_views = {}
+_live_views_lock = threading.Lock()
 
 
 def get_dir_id(path):
@@ -612,10 +614,7 @@ def build_dashboard(refreshing):
 	if summary.alt_speed_enabled:
 		lines.append(get_text("DASHBOARD_TURTLE_ON"))
 	lines.append("")
-	if refreshing:
-		lines.append(get_text("DASHBOARD_AUTOUPDATING"))
-	else:
-		lines.append(get_text("DASHBOARD_LAST_UPDATE", datetime.now().strftime("%H:%M:%S")))
+	lines.append(live_footer(refreshing))
 
 	markup = InlineKeyboardMarkup(row_width=2)
 	filter_buttons = [
@@ -647,30 +646,6 @@ def build_dashboard(refreshing):
 	return "\n".join(lines), markup
 
 
-def _dashboard_refresher(chat_id, thread_id, message_id, generation):
-	iterations = max(1, DASHBOARD_REFRESH_DURATION // DASHBOARD_REFRESH_SECONDS)
-	for _ in range(iterations):
-		time.sleep(DASHBOARD_REFRESH_SECONDS)
-		with _dashboards_lock:
-			state = dashboards.get((chat_id, thread_id))
-			if not state or state["message_id"] != message_id or state["generation"] != generation:
-				return
-		try:
-			text, markup = build_dashboard(refreshing=True)
-			edit_message(chat_id, message_id, text, markup)
-		except Exception as e:
-			warning(f"Dashboard refresh failed: {e}")
-	with _dashboards_lock:
-		state = dashboards.get((chat_id, thread_id))
-		if not state or state["message_id"] != message_id or state["generation"] != generation:
-			return
-	try:
-		text, markup = build_dashboard(refreshing=False)
-		edit_message(chat_id, message_id, text, markup)
-	except Exception as e:
-		warning(f"Dashboard final refresh failed: {e}")
-
-
 def show_dashboard(chat_id, message_id=None, thread_id=None):
 	"""Sends (or edits) the dashboard and starts the auto-refresh cycle"""
 	try:
@@ -690,18 +665,95 @@ def show_dashboard(chat_id, message_id=None, thread_id=None):
 		if not sent:
 			return
 		message_id = sent.message_id
+	start_live_view(chat_id, message_id, thread_id, build_dashboard)
 
-	thread_id = normalize_thread(thread_id)
-	with _dashboards_lock:
-		state = dashboards.get((chat_id, thread_id), {"generation": 0})
+
+# ---------------------------------------------------------------------------
+# LIVE SCREENS
+# ---------------------------------------------------------------------------
+
+def live_footer(refreshing):
+	if refreshing:
+		return get_text("DASHBOARD_AUTOUPDATING")
+	return get_text("DASHBOARD_LAST_UPDATE", datetime.now().strftime("%H:%M:%S"))
+
+
+def live_buttons(refreshing, refresh_call, *buttons):
+	"""Bottom row of a live screen: the update button only shows up once it has
+	stopped repainting itself, on the left of the rest"""
+	if refreshing:
+		return list(buttons)
+	return [InlineKeyboardButton(get_text("BUTTON_UPDATE"), callback_data=refresh_call)] + list(buttons)
+
+
+def _live_status(key, message_id, generation):
+	"""live, stopped (a button of this same message is already repainting it)
+	or replaced (another message became the live screen of the chat)"""
+	state = live_views.get(key)
+	if state and state["message_id"] == message_id and state["generation"] == generation:
+		return "live"
+	if state and state["message_id"] != message_id:
+		return "replaced"
+	return "stopped"
+
+
+def _live_refresher(chat_id, thread_id, message_id, generation, build):
+	key = (chat_id, thread_id)
+	last = None
+
+	def paint(refreshing):
+		"""Builds outside the lock (the client can be slow) but edits inside it,
+		so a button pressed meanwhile can never be painted over with this screen.
+		Returns False when the screen is no longer live"""
+		nonlocal last
+		try:
+			text, markup = build(refreshing=refreshing)
+		except ExpiredContext:
+			return False
+		except Exception as e:
+			warning(f"Live screen refresh failed: {e}")
+			return True
+		with _live_views_lock:
+			status = _live_status(key, message_id, generation)
+			if status == "stopped" or (refreshing and status == "replaced"):
+				return False
+			# An identical screen is not sent: it is a wasted call to Telegram
+			current = (text, markup.to_json() if markup else None)
+			if current != last:
+				edit_message(chat_id, message_id, text, markup)
+				last = current
+		return True
+
+	iterations = max(1, DASHBOARD_REFRESH_DURATION // DASHBOARD_REFRESH_SECONDS)
+	for _ in range(iterations):
+		time.sleep(DASHBOARD_REFRESH_SECONDS)
+		with _live_views_lock:
+			status = _live_status(key, message_id, generation)
+		if status == "stopped":
+			return
+		# A screen left behind by a newer one stops right away, with its update button
+		if status == "replaced" or not paint(refreshing=True):
+			break
+	with _live_views_lock:
+		if _live_status(key, message_id, generation) == "stopped":
+			return
+	paint(refreshing=False)
+
+
+def start_live_view(chat_id, message_id, thread_id, build):
+	"""Starts repainting a screen already painted with build(refreshing=True).
+	It becomes the live screen of its chat or topic, replacing the previous one"""
+	key = (chat_id, normalize_thread(thread_id))
+	with _live_views_lock:
+		state = live_views.get(key, {"generation": 0})
 		generation = state["generation"] + 1
-		dashboards[(chat_id, thread_id)] = {"message_id": message_id, "generation": generation}
-	threading.Thread(target=_dashboard_refresher, args=(chat_id, thread_id, message_id, generation), daemon=True).start()
+		live_views[key] = {"message_id": message_id, "generation": generation}
+	threading.Thread(target=_live_refresher, args=(chat_id, key[1], message_id, generation, build), daemon=True).start()
 
 
-def stop_dashboard(chat_id, message_id, thread_id=None):
-	with _dashboards_lock:
-		state = dashboards.get((chat_id, normalize_thread(thread_id)))
+def stop_live_view(chat_id, message_id, thread_id=None):
+	with _live_views_lock:
+		state = live_views.get((chat_id, normalize_thread(thread_id)))
 		if state and state["message_id"] == message_id:
 			state["generation"] += 1
 
@@ -710,7 +762,7 @@ def stop_dashboard(chat_id, message_id, thread_id=None):
 # TORRENT LIST
 # ---------------------------------------------------------------------------
 
-def build_list(filter_key, page):
+def build_list(filter_key, page, refreshing=False):
 	torrents = get_filtered_torrents(filter_key)
 	total = len(torrents)
 	pages = max(1, math.ceil(total / TORRENTS_PER_PAGE))
@@ -720,6 +772,7 @@ def build_list(filter_key, page):
 	text = get_text("LIST_TITLE", label, total, page + 1, pages)
 	if total == 0:
 		text += f"\n\n{get_text('LIST_EMPTY')}"
+	text += f"\n\n{live_footer(refreshing)}"
 
 	markup = InlineKeyboardMarkup(row_width=1)
 	start = page * TORRENTS_PER_PAGE
@@ -743,26 +796,32 @@ def build_list(filter_key, page):
 			InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key)),
 		)
 
-	markup.row(
+	markup.row(*live_buttons(refreshing, build_call("list", filter_key, page),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
-	)
+	))
 	return text, markup
 
 
 def render_list(chat_id, message_id, filter_key, page, thread_id=None):
+	live = True
 	try:
-		text, markup = build_list(filter_key, page)
+		text, markup = build_list(filter_key, page, refreshing=True)
 	except ExpiredContext:
 		text = get_text("SEARCH_EXPIRED")
 		markup = back_close_markup()
+		live = False
 	except TorrentClientError as e:
 		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
 		markup = back_close_markup()
+		live = False
 	if message_id:
 		edit_message(chat_id, message_id, text, markup)
 	else:
-		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+		sent = send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+		message_id = sent.message_id if sent else None
+	if live and message_id:
+		start_live_view(chat_id, message_id, thread_id, lambda refreshing: build_list(filter_key, page, refreshing))
 
 
 def back_close_markup(back_call=None):
@@ -784,7 +843,7 @@ def close_markup():
 # TORRENT DETAIL
 # ---------------------------------------------------------------------------
 
-def build_detail(torrent_id, filter_key, page):
+def build_detail(torrent_id, filter_key, page, refreshing=False):
 	torrent = client.get_torrent(torrent_id)
 	if torrent is None:
 		return get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page))
@@ -827,6 +886,8 @@ def build_detail(torrent_id, filter_key, page):
 			lines.append(f"• <code>{html.escape(path)}</code> ({sizeof_fmt(size)})")
 		if len(torrent.files) > 10:
 			lines.append(get_text("INFO_AND_MORE_FILES", len(torrent.files) - 10))
+	lines.append("")
+	lines.append(live_footer(refreshing))
 
 	markup = InlineKeyboardMarkup()
 	if torrent.status == TorrentStatus.PAUSED:
@@ -856,20 +917,23 @@ def build_detail(torrent_id, filter_key, page):
 		root_index = torrent_folders(torrent).index(torrent_root(torrent))
 		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES"), callback_data=build_call("files", files_ctx, root_index, 0)))
 	markup.row(InlineKeyboardButton(get_text("BUTTON_DELETE"), callback_data=build_call("delete", torrent.id, filter_key, page)))
-	markup.row(
+	markup.row(*live_buttons(refreshing, build_call("info", torrent.id, filter_key, page),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, page)),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
-	)
+	))
 	return "\n".join(lines), markup
 
 
-def render_detail(chat_id, message_id, torrent_id, filter_key, page):
+def render_detail(chat_id, message_id, torrent_id, filter_key, page, thread_id=None):
 	try:
-		text, markup = build_detail(torrent_id, filter_key, page)
+		text, markup = build_detail(torrent_id, filter_key, page, refreshing=True)
 	except TorrentClientError as e:
 		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
 		markup = back_close_markup(build_call("list", filter_key, page))
+		edit_message(chat_id, message_id, text, markup)
+		return
 	edit_message(chat_id, message_id, text, markup)
+	start_live_view(chat_id, message_id, thread_id, lambda refreshing: build_detail(torrent_id, filter_key, page, refreshing))
 
 
 # ---------------------------------------------------------------------------
@@ -3165,7 +3229,7 @@ def handle_callback(call):
 	if command != "noop":
 		count_usage(f"btn_{command}")
 	thread_id = normalize_thread(call.message.message_thread_id)
-	stop_dashboard(chat_id, message_id, thread_id)
+	stop_live_view(chat_id, message_id, thread_id)
 	dispatch_callback(chat_id, message_id, call.from_user.id, call.data, thread_id=thread_id, message_html=getattr(call.message, "html_text", None))
 
 
@@ -3195,7 +3259,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 
 		elif command == "info":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
-			render_detail(chat_id, message_id, torrent_id, filter_key, page)
+			render_detail(chat_id, message_id, torrent_id, filter_key, page, thread_id=thread_id)
 
 		elif command in ("pause", "resume", "verify"):
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -3211,7 +3275,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			else:
 				client.verify_torrent(torrent_id)
 			time.sleep(0.5)
-			render_detail(chat_id, message_id, torrent_id, filter_key, page)
+			render_detail(chat_id, message_id, torrent_id, filter_key, page, thread_id=thread_id)
 
 		elif command == "delete":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -3497,7 +3561,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			else:
 				client.set_category([torrent_id], category)
 				time.sleep(0.5)
-				render_detail(chat_id, message_id, torrent_id, filter_key, page)
+				render_detail(chat_id, message_id, torrent_id, filter_key, page, thread_id=thread_id)
 
 		elif command == "addTo":
 			pending_id, dir_id = args[0], args[1]

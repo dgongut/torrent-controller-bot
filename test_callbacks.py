@@ -202,7 +202,8 @@ bot_module = importlib.util.module_from_spec(_spec)
 sys.modules["tcbot"] = bot_module
 _spec.loader.exec_module(bot_module)
 
-bot_module._dashboard_refresher = lambda *a, **k: None  # No background repainting during the test
+real_live_refresher = bot_module._live_refresher
+bot_module._live_refresher = lambda *a, **k: None  # No background repainting during the test
 
 real_sleep = time.sleep
 time.sleep = lambda seconds: None  # The bot waits on the client; the fake one is instant
@@ -653,11 +654,64 @@ check("the General topic normalizes to none", bot_module.normalize_thread(1), No
 check("a real topic is kept", bot_module.normalize_thread("7"), 7)
 
 # Two dashboards in two topics of the same group are two live dashboards
-bot_module.dashboards.clear()
+bot_module.live_views.clear()
 bot_module.show_dashboard(CHAT_ID, thread_id=THREAD)
 bot_module.show_dashboard(CHAT_ID, thread_id=THREAD + 1)
-check("each topic keeps its own dashboard", sorted(bot_module.dashboards), [(CHAT_ID, THREAD), (CHAT_ID, THREAD + 1)])
-bot_module.dashboards.clear()
+check("each topic keeps its own dashboard", sorted(bot_module.live_views), [(CHAT_ID, THREAD), (CHAT_ID, THREAD + 1)])
+bot_module.live_views.clear()
+
+# Live screens: the dashboard, a list and a torrent repaint themselves for a
+# while, then stop and offer the update button on the left of the bottom row
+def live_generation():
+	return bot_module.live_views[(CHAT_ID, None)]["generation"]
+
+
+def run_live_refresher(message_id, build):
+	EDITS.clear()
+	real_live_refresher(CHAT_ID, None, message_id, live_generation(), build)
+	return list(EDITS)
+
+
+update_text = bot_module.get_text("BUTTON_UPDATE")
+autoupdating = bot_module.get_text("DASHBOARD_AUTOUPDATING")
+for name, call, build in (
+		("list", bot_module.build_call("list", config.FILTER_ALL, 0),
+			lambda refreshing: bot_module.build_list(config.FILTER_ALL, 0, refreshing)),
+		("torrent", bot_module.build_call("info", TORRENT_ID, config.FILTER_ALL, 0),
+			lambda refreshing: bot_module.build_detail(TORRENT_ID, config.FILTER_ALL, 0, refreshing))):
+	bot_module.live_views.clear()
+	screen = press(call)
+	check(f"the {name} becomes the live screen", bot_module.live_views.get((CHAT_ID, None), {}).get("message_id"), MESSAGE_ID)
+	check(f"the {name} opens auto-updating", autoupdating in screen[0], True)
+	check(f"the {name} has no update button while auto-updating",
+		any(b.text == update_text for row in screen[1].keyboard for b in row), False)
+	edits = run_live_refresher(MESSAGE_ID, build)
+	# Nothing changes in the fake client, so the repeated screens are not sent
+	check(f"the {name} only sends the screens that changed", len(edits), 2)
+	last_text, last_markup = edits[-1]
+	check(f"the {name} ends with its last update time", autoupdating in last_text, False)
+	check(f"the {name} ends with the update button on the left", last_markup.keyboard[-1][0].text, update_text)
+	check(f"the {name} update button repaints the same screen", last_markup.keyboard[-1][0].callback_data, call)
+
+# A button pressed on the live message stops it without painting over it
+bot_module.live_views.clear()
+press(bot_module.build_call("list", config.FILTER_ALL, 0))
+generation = live_generation()
+bot_module.stop_live_view(CHAT_ID, MESSAGE_ID)
+EDITS.clear()
+real_live_refresher(CHAT_ID, None, MESSAGE_ID, generation, lambda refreshing: bot_module.build_list(config.FILTER_ALL, 0, refreshing))
+check("a stopped live screen is never painted again", EDITS, [])
+
+# A newer live screen in the chat leaves the old one with its update button
+bot_module.live_views.clear()
+press(bot_module.build_call("list", config.FILTER_ALL, 0))
+generation = live_generation()
+bot_module.start_live_view(CHAT_ID, MESSAGE_ID + 1, None, bot_module.build_dashboard)
+EDITS.clear()
+real_live_refresher(CHAT_ID, None, MESSAGE_ID, generation, lambda refreshing: bot_module.build_list(config.FILTER_ALL, 0, refreshing))
+check("a replaced live screen is painted once more", len(EDITS), 1)
+check("a replaced live screen is left with the update button", EDITS and EDITS[-1][1].keyboard[-1][0].text, update_text)
+bot_module.live_views.clear()
 
 # ---------------------------------------------------------------------------
 # 9. CATEGORIES: the category decides the folder, so the two never collide

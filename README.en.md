@@ -199,8 +199,8 @@ Those credentials go into `TORRENT_CLIENT_USER` and `TORRENT_CLIENT_PASSWORD`. T
 |TORRENT_CLIENT_PROTOCOL |❌| Connection protocol, http or https. Default http |
 |TORRENT_CLIENT_RPC_PATH |❌| RPC path. Default /transmission/rpc (Transmission) or /webapi (Synology) |
 |TORRENTS_PER_PAGE |❌| Number of torrents per page in the lists. Default 10 |
-|DASHBOARD_REFRESH_SECONDS |❌| Seconds between automatic dashboard refreshes. Default 2 |
-|DASHBOARD_REFRESH_DURATION |❌| Seconds the automatic dashboard refresh lasts. Default 60 |
+|DASHBOARD_REFRESH_SECONDS |❌| Seconds between automatic refreshes of the dashboard, the lists and a torrent screen. Default 2 |
+|DASHBOARD_REFRESH_DURATION |❌| Seconds the automatic refresh of the dashboard, the lists and a torrent screen lasts. Default 60 |
 |TELEMETRY |❌| `false` to turn the [anonymous statistics](#anonymous-statistics) off without going through `/settings`. Turning them off from `/settings` is the usual way; this is for those who prefer to pin it in the compose file |
 
 ## Docker-Compose example for normal execution

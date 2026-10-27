@@ -200,8 +200,8 @@ Esos datos van en `TORRENT_CLIENT_USER` y `TORRENT_CLIENT_PASSWORD`. El puerto e
 |TORRENT_CLIENT_PROTOCOL |❌| Protocolo de conexión, http o https. Por defecto http |
 |TORRENT_CLIENT_RPC_PATH |❌| Ruta del RPC. Por defecto /transmission/rpc (Transmission) o /webapi (Synology) |
 |TORRENTS_PER_PAGE |❌| Número de torrents por página en los listados. Por defecto 10 |
-|DASHBOARD_REFRESH_SECONDS |❌| Segundos entre refrescos automáticos del panel de control. Por defecto 2 |
-|DASHBOARD_REFRESH_DURATION |❌| Segundos que dura el refresco automático del panel de control. Por defecto 60 |
+|DASHBOARD_REFRESH_SECONDS |❌| Segundos entre refrescos automáticos del panel de control, las listas y la ficha de un torrent. Por defecto 2 |
+|DASHBOARD_REFRESH_DURATION |❌| Segundos que dura el refresco automático del panel de control, las listas y la ficha de un torrent. Por defecto 60 |
 |TELEMETRY |❌| `false` para desactivar las [estadísticas anónimas](#estadísticas-anónimas) sin pasar por `/settings`. Lo normal es desactivarlas desde `/settings`; esto es para quien prefiera dejarlo fijado en el compose |
 
 ## Ejemplo de Docker-Compose para su ejecución normal
