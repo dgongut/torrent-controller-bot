@@ -1,7 +1,7 @@
 """Test battery for name_parser.py. Run with: python3 test_name_parser.py"""
 
 from name_parser import (companion_subtitle_name, parse_metadata, render_template, suggest_file_name, suggest_folder_name,
-						suggest_name, validate_template, TemplateError, _PLATFORM_TAGS, CANONICAL_FIELDS)
+						series_identity, suggest_name, validate_template, TemplateError, _PLATFORM_TAGS, CANONICAL_FIELDS)
 
 FAILED = []
 
@@ -497,6 +497,177 @@ check("the season comes from the folder, not the S01-S07 torrent",
 check("the title still comes from the torrent",
 	suggest_file_name("01.mkv", parent_name="Mad Men (2007) - 1080p", folder_name="Temporada 3"),
 	"3x01 - Mad Men - 1080p.mkv")
+
+# --- Download site prefixes ----------------------------------------------------
+check_fields("www.DonTorrent.xyz - Gladiator II (2024) [BluRay 1080p].mkv", title="Gladiator II", year="2024")
+check_fields("[ www.TorrentDay.com ] - Gladiator.II.2024.1080p.WEB-DL.mkv", title="Gladiator II", year="2024")
+check_fields("[www.site.org] Gladiator II (2024) 1080p.mkv", title="Gladiator II", year="2024")
+check_fields("(www.site.net) - Gladiator II (2024) 1080p.mkv", title="Gladiator II", year="2024")
+check_fields("【www.site.com】Gladiator II (2024) 1080p.mkv", title="Gladiator II", year="2024")
+check_fields("www.mejor-torrent.com.es - Gladiator II (2024) 1080p.mkv", title="Gladiator II", year="2024")
+check_fields("WWW.SITE.COM - Gladiator II (2024) 1080p.mkv", title="Gladiator II", year="2024")
+check_fields("www.DonTorrent.xyz - Chicago Fire S14E04 1080p.mkv", title="Chicago Fire", chapter="14x04")
+check("a site prefix is not part of the suggestion",
+	suggest_name("www.DonTorrent.xyz - Gladiator II (2024) [BluRay 1080p].mkv"), "Gladiator II (2024) - 1080p.mkv")
+# Only at the start, and only a real www address
+check_fields("Gladiator II (2024) [www.site.com] 1080p.mkv", title="Gladiator II", year="2024")
+check_fields("Gladiator.II.2024.1080p.WEB-DL-[DonTorrent].mkv", title="Gladiator II", year="2024")
+check_fields("Wwwesley.Show.S01E01.mkv", title="Wwwesley Show")
+# A leading dash left by a tag is not part of the title
+check_fields("[Tag] - Gladiator II (2024) 1080p.mkv", title="Gladiator II")
+
+# --- 'Temporada N' in front of the episode ------------------------------------
+check_fields("The Last of Us - Temporada 2 [HDTV 720p][Cap.201][AC3 5.1 Castellano]",
+	title="The Last of Us", season="2", episode_number="1", chapter="2x01", is_series=True)
+check_fields("Rick y Morty Temporada 7 [HDTV 1080p][Cap.701].mkv", title="Rick y Morty", chapter="7x01")
+check_fields("Chicago Fire - Temporada 14 [HDTV 720p][Cap.1404].mkv", title="Chicago Fire", chapter="14x04")
+check_fields("Show Name Season 2 [Cap.205].mkv", title="Show Name", chapter="2x05")
+check_fields("Show Name 2ª Temporada [Cap.205].mkv", title="Show Name", chapter="2x05")
+check_fields("Show Name S02 [Cap.205].mkv", title="Show Name", chapter="2x05")
+check_fields("Show.Name.T02.Cap.205.mkv", title="Show Name", chapter="2x05")
+check("the season is not repeated in the suggestion",
+	suggest_name("The Last of Us - Temporada 2 [HDTV 720p][Cap.201][AC3 5.1 Castellano]"), "2x01 - The Last of Us - 720p")
+# Another season is not the one of the episode, so it is left alone
+check_fields("Serie Temporada 3 [Cap.201].mkv", title="Serie Temporada 3", chapter="2x01")
+# Nothing would be left of the title
+check_fields("Temporada 2 [Cap.201].mkv", title="Temporada 2", chapter="2x01")
+
+# --- Chapter ranges: Cap.201_207 ----------------------------------------------
+check_fields("The Last of Us - Temporada 2 [HDTV 720p][Cap.201_207][AC3 5.1 Castellano]",
+	title="The Last of Us", season="2", episode_number="1-7", chapter="2x01-07", is_series=True)
+check_fields("Serie [HDTV][Cap.101-110].mkv", title="Serie", season="1", episode_number="1-10", chapter="1x01-10")
+check_fields("Serie [Cap.301_Cap.305].mkv", title="Serie", episode_number="1-5", chapter="3x01-05")
+check_fields("Serie Capitulo 1001_1010.mkv", title="Serie", season="10", episode_number="1-10", chapter="10x01-10")
+check_fields("Serie [Cap.201 _ 207].mkv", episode_number="1-7")
+check("a chapter range suggestion",
+	suggest_name("The Last of Us - Temporada 2 [HDTV 720p][Cap.201_207][AC3 5.1 Castellano]"),
+	"2x01-07 - The Last of Us - 720p")
+check("a chapter range with padding", suggest_name("Serie [Cap.101-110] 1080p.mkv",
+	template_series="{temporada.2}x{episodio.2} - {titulo}[.{extension}]"), "01x01-10 - Serie.mkv")
+# Both ends belong to the same season and go forwards, otherwise it is no range
+check_fields("Serie [Cap.108_201].mkv", episode_number="8", chapter="1x08")
+check_fields("Serie [Cap.207_201].mkv", episode_number="7", chapter="2x07")
+check_fields("Serie [Cap.201_201].mkv", episode_number="1", chapter="2x01")
+
+# --- Spanish season packs: 2ª Temporada, Temporada Completa -------------------
+check_fields("La Casa de Papel 2ª Temporada [HDTV 720p][Castellano]",
+	title="La Casa de Papel", season="2", chapter="T2", episode_number="", is_series=True)
+check_fields("La Casa de Papel - 1a Temporada Completa [HDTV]", title="La Casa de Papel", season="1", chapter="T1")
+check_fields("La Casa de Papel 3º Temporada [HDTV]", title="La Casa de Papel", season="3")
+check_fields("La Casa de Papel 4o Temporada [HDTV]", title="La Casa de Papel", season="4")
+check_fields("La.Casa.de.Papel.5ª.Temporada.1080p", title="La Casa de Papel", season="5", resolution="1080p")
+check_fields("La Casa de Papel 10ª temporada", title="La Casa de Papel", season="10")
+check_fields("Serie Temporada Completa 2 [HDTV]", title="Serie", season="2", chapter="T2")
+check("an ordinal season pack", suggest_name("La Casa de Papel 2ª Temporada [HDTV 720p][Castellano]"),
+	"T2 - La Casa de Papel - 720p")
+check("an ordinal season pack in English", suggest_name("La Casa de Papel 2ª Temporada [HDTV 720p]", season_prefix="S"),
+	"S2 - La Casa de Papel - 720p")
+# Not a season: no 'Temporada' word, or digits inside a word
+check_fields("2 Fast 2 Furious (2003) 1080p.mkv", title="2 Fast 2 Furious", is_series=False)
+check_fields("La Temporada de Patos (2004) 1080p.mkv", title="La Temporada de Patos", is_series=False)
+check_fields("Agent47 Temporada Final.mkv", season="", is_series=False)
+
+# --- Spanish multi-season packs ----------------------------------------------
+check_fields("Breaking Bad Temporada Completa 1-5 [BluRay 1080p]",
+	title="Breaking Bad", season="1-5", chapter="T1-T5", is_series=True)
+check_fields("Breaking Bad Temporadas 1 a 5 [BluRay 1080p]", title="Breaking Bad", season="1-5")
+check_fields("Breaking Bad Temporadas 1 al 5 [BluRay 1080p]", title="Breaking Bad", season="1-5")
+check_fields("Breaking Bad Temporadas 1 - 5 [BluRay 1080p]", title="Breaking Bad", season="1-5")
+check_fields("Breaking Bad Temporada 1-5 [BluRay 1080p]", title="Breaking Bad", season="1-5")
+check_fields("Breaking Bad Temporada 1 a 5 [BluRay 1080p]", title="Breaking Bad", season="1-5")
+check_fields("Breaking.Bad.Seasons.1-5.1080p", title="Breaking Bad", season="1-5", resolution="1080p")
+check("a multi-season pack", suggest_name("Breaking Bad Temporada Completa 1-5 [BluRay 1080p]"),
+	"T1-T5 - Breaking Bad - 1080p")
+check("a multi-season pack with padding", suggest_name("Breaking Bad Temporadas 1 a 5 [BluRay 1080p]",
+	template_season="{titulo} - T{temporada.2}"), "Breaking Bad - T01-05")
+# A spaced dash after a single season is an episode, and digits must stand alone
+check_fields("Show Season 2 - 05 [1080p].mkv", season="2", episode_number="")
+check_fields("Show Temporada 2 a 1080p.mkv", season="2", resolution="1080p")
+check_fields("Show Temporada 2 a 4K.mkv", season="2", resolution="4K")
+
+# --- Season and episode in words: Temporada 2 Capitulo 3 ----------------------
+check_fields("Los Simpson - Temporada 35 Capitulo 1.mkv",
+	title="Los Simpson", season="35", episode_number="1", chapter="35x01", is_series=True)
+check_fields("Los Simpson T35 Cap 01.mkv", title="Los Simpson", season="35", episode_number="1", chapter="35x01")
+check_fields("Los.Simpson.T35.Cap.12.1080p.mkv", title="Los Simpson", chapter="35x12", resolution="1080p")
+check_fields("Serie Temporada 2 Episodio 3.mkv", title="Serie", chapter="2x03")
+check_fields("Serie Temporada 2 Capítulo 3.mkv", title="Serie", chapter="2x03")
+check_fields("Serie Season 1 Episode 10.mkv", title="Serie", chapter="1x10")
+check_fields("Serie Season 1 Ep 7.mkv", title="Serie", chapter="1x07")
+check_fields("Serie.Temporada.1.Capitulo.100.mkv", title="Serie", episode_number="100")
+# The episode written the Cap.NNN way, with its season in front
+check_fields("Serie Temporada 2 Cap.201.mkv", title="Serie", chapter="2x01")
+check_fields("Serie Temporada 12 Cap.1205.mkv", title="Serie", chapter="12x05")
+check("season and episode in words", suggest_name("Los Simpson - Temporada 35 Capitulo 1.mkv"), "35x01 - Los Simpson.mkv")
+check("episode title after words", suggest_name("Serie Temporada 2 Capitulo 3 El Regreso.mkv",
+	template_series="{temporada}x{episodio.2} - {titulo}[ - {titulo_episodio}][.{extension}]"), "2x03 - Serie - El Regreso.mkv")
+# The T has to start a word
+check_fields("Robot35 Cap 01.mkv", chapter="")
+
+# --- Double episodes ----------------------------------------------------------
+check_fields("Friends.S01E01E02.1080p.mkv", title="Friends", season="1", episode_number="1-2", chapter="1x01-02")
+check_fields("Friends.S01E01-E02.1080p.mkv", episode_number="1-2", chapter="1x01-02")
+check_fields("Friends 1x01-02 1080p.mkv", title="Friends", episode_number="1-2", chapter="1x01-02")
+check_fields("Friends 1x01-1x02 1080p.mkv", title="Friends", episode_number="1-2", chapter="1x01-02")
+check_fields("1x01-02 - Friends - 1080p.mkv", episode_number="1-2", chapter="1x01-02")
+check("a double episode", suggest_name("Friends.S01E01E02.1080p.mkv"), "1x01-02 - Friends - 1080p.mkv")
+check("a renamed double episode stays the same", suggest_name("1x01-02 - Friends - 1080p.mkv"), None)
+# A resolution glued to the episode is no range, nor is another season
+check_fields("Friends 1x01-1080p.mkv", episode_number="1", resolution="1080p")
+check_fields("Friends 1x01-2x02.mkv", episode_number="1")
+
+# --- Movies without a year (default template) ---------------------------------
+check("a movie without a year", suggest_name("El Hoyo 2 [WEB-DL 1080p][AC3 5.1 Castellano]"), "El Hoyo 2 - 1080p")
+check("a movie without a year keeps HDR",
+	suggest_name("Mufasa El Rey Leon [4K 2160p][HDR10][Dual]"), "Mufasa El Rey Leon - 4K HDR")
+check("a movie without a year and extension",
+	suggest_name("Movie.Without.Year.1080p.mkv"), "Movie Without Year - 1080p.mkv")
+check("a movie with its year is unchanged",
+	suggest_name("The.Matrix.1999.1080p.BluRay.x264-GROUP.mkv"), "The Matrix (1999) - 1080p.mkv")
+check("still nothing without a resolution", suggest_name("Pelicula sin ano [DVDRip][Spanish].avi"), None)
+check("a custom template that requires the year",
+	suggest_name("El Hoyo 2 [WEB-DL 1080p]", template_movie="{titulo} ({año}) - {resolucion}"), None)
+# An episode with no season marker is not a movie either
+check("an anime episode is not a movie",
+	suggest_name("[SubsPlease] Sousou no Frieren - 12 (1080p) [ABCD1234].mkv"), None)
+check("a long running episode is not a movie", suggest_name("One Piece - 1100 [1080p].mkv"), None)
+check("a numbered title with a year is still a movie",
+	suggest_name("Rocky - 2 (1979) 1080p.mkv"), "Rocky - 2 (1979) - 1080p.mkv")
+check("a sequel number without a dash is still a movie", suggest_name("El Hoyo 2 1080p.mkv"), "El Hoyo 2 - 1080p.mkv")
+# One video among many still needs its own year to be named
+check("a pack file without a year", suggest_file_name("Otra.Peli.720p.mkv", parent_name="Coleccion", single_video=False), None)
+check("a single video without a year takes the torrent name",
+	suggest_file_name("video.mkv", parent_name="El Hoyo 2 [WEB-DL 1080p]", single_video=True), "El Hoyo 2 - 1080p.mkv")
+check("a folder without a year is left alone", suggest_folder_name("Extras 1080p", parent_name="El Hoyo 2 [WEB-DL 1080p]"), None)
+
+# --- Spanish names through files, folders and series --------------------------
+SPANISH_PACK = "The Last of Us - Temporada 2 [HDTV 720p][Cap.201_207][AC3 5.1 Castellano]"
+check("an episode inside a Spanish pack",
+	suggest_file_name("The Last of Us - Temporada 2 [HDTV 720p][Cap.203][AC3 5.1 Castellano].mkv", parent_name=SPANISH_PACK),
+	"2x03 - The Last of Us - 720p.mkv")
+check("a bare episode inside a Spanish pack", suggest_file_name("03.mkv", parent_name=SPANISH_PACK),
+	"2x03 - The Last of Us - 720p.mkv")
+check("a bare episode inside an ordinal pack", suggest_file_name("05.mkv", parent_name="La Casa de Papel 2ª Temporada [HDTV 720p]"),
+	"2x05 - La Casa de Papel - 720p.mkv")
+check("an ordinal season folder", suggest_folder_name("2ª Temporada", parent_name="Mad Men (2007) - 1080p"),
+	"T2 - Mad Men - 1080p")
+check("a season and episode folder", suggest_folder_name("Temporada 3 Capitulo 4", parent_name="Mad Men (2007) - 1080p"),
+	"3x04 - Mad Men - 1080p")
+# The series folder finds the other episodes by title: a Spanish name has to
+# give the same one as any other release of the series
+def series_key(name):
+	identity = series_identity(name)
+	return identity and (identity["key"], identity["season"])
+check("series of a Spanish episode", series_key("The Last of Us - Temporada 2 [HDTV 720p][Cap.201]"), ("the last of us", 2))
+check("series of a Spanish range", series_key(SPANISH_PACK), ("the last of us", 2))
+check("series of an ordinal pack", series_key("La Casa de Papel 2ª Temporada [HDTV 720p]"), ("la casa de papel", 2))
+check("series of a multi-season pack", series_key("Breaking Bad Temporada Completa 1-5 [BluRay 1080p]"), ("breaking bad", None))
+check("series of season and episode in words", series_key("Los Simpson T35 Cap 01.mkv"), ("los simpson", 35))
+check("series behind a site prefix", series_key("www.DonTorrent.xyz - Chicago Fire S14E04 1080p.mkv"), ("chicago fire", 14))
+check("series of a renamed range", series_key("2x01-07 - The Last of Us - 720p"), ("the last of us", 2))
+check("series of a renamed double episode", series_key("1x01-02 - Friends - 1080p.mkv"), ("friends", 1))
+check("a site prefix on the torrent", suggest_file_name("01.mkv", parent_name="www.DonTorrent.xyz - Mad Men S02 1080p"),
+	"2x01 - Mad Men - 1080p.mkv")
 
 # --- companion_subtitle_name -------------------------------------------------
 check("subtitle keeps language suffix",

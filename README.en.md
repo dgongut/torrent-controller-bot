@@ -32,6 +32,7 @@ Control your torrent client from a single place.
 - ✅ Notifications for completed downloads, torrent errors and torrents added outside the bot (can be toggled from the settings)
 - ✅ Automatic download without asking for the path, with a configurable directory
 - ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains and the torrents added outside the bot (can be toggled from the settings)
+- ✅ Replace a previous copy: when the name a download should take already belongs to another torrent, on completion it offers to delete the old one (with its data) and keep the new one, or does it without asking if you turn that on
 - ✅ Series folder: a new episode is offered (or sent straight, if you turn it on) to the folder where the previous ones already are
 - ✅ Warning if the torrent you add may not fit on the disk
 - ✅ Bot settings persist across restarts (`/config` volume)
@@ -75,7 +76,8 @@ Before starting the container you need your own Telegram bot and your user ident
 When pressing ✏️ Rename on a torrent, the bot tries to generate a clean name suggestion:
 
 - **Movies**: `The.Matrix.1999.1080p.BluRay.x264.mkv` → `The Matrix (1999) - 1080p.mkv`
-- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (supports `Cap.103`, `S01E03`, `T01E03` and `3x05` formats)
+- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (supports `Cap.103`, `S01E03`, `T01E03`, `3x05` and `Temporada 1 Capitulo 3` formats, ranges such as `Cap.101_107` or `S01E01E02`, and packs such as `2ª Temporada` or `Temporada Completa 1-5`)
+- **No year**: when a movie does not carry one, the suggestion leaves it out (`El Hoyo 2 [WEB-DL 1080p]` → `El Hoyo 2 - 1080p`). Custom templates are untouched: if yours requires `{year}`, it still suggests nothing
 
 If no suggestion can be generated, you can always type the name manually.
 
@@ -121,6 +123,21 @@ Things to keep in mind:
 - Ranges are padded on each side, so `S01-S08` with `{season.2}` gives `01-08`.
 - It only works on `{season}` and `{episode}`; on any other field the bot rejects the template.
 - `{chapter}` is unaffected: it always keeps its two-digit format (`1x03`, `T2`).
+
+## Replace a previous copy
+
+When you download something you already had (a better copy of the same movie, say), the automatic rename leaves it alone because the old torrent already has its name, and tells you so when it is added. Once the download finishes, the completion notice carries a 🔁 **Replace the previous one** button: after confirming, the bot deletes the old torrent **with its data** and renames the new one to the name it should have (its subfolders and files too, when the automatic rename includes them).
+
+```
+✅ Download completed
+🧲 Weapons (2025) 1080p NF WEB-DL DD+5.1 AV1-HDZ.mkv
+♻️ There is already a torrent named Weapons (2025) - 1080p.mkv
+      [🔁 Replace the previous one]  [❌ Do not replace]
+```
+
+❌ **Do not replace** leaves both torrents as they are and the notice as a plain completion notice, with no buttons.
+
+With **"Replace without asking when the name exists"** (under the automatic rename, off by default) it does it on its own when the download finishes and tells you what it deleted. A torrent sharing files with the new one is never replaced, since deleting its data would delete the new download too.
 
 ## Series folder
 

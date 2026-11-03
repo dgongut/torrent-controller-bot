@@ -1081,7 +1081,7 @@ metrics = bot_module.collect_telemetry_metrics()
 check("the metrics are exactly the declared ones", sorted(metrics), sorted([
 	"client", "language", "admins", "telegram_group", "torrents_per_page", "notify_completed",
 	"notify_errors", "notify_external_added", "auto_download", "auto_download_dir", "auto_category",
-	"auto_rename", "auto_rename_files", "auto_rename_external", "auto_move_series", "auto_move_series_external",
+	"auto_rename", "auto_rename_files", "auto_rename_external", "auto_replace", "auto_move_series", "auto_move_series_external",
 	"low_space_warning", "favorite_dirs",
 	"custom_templates", "torrents", "transmission_major"]))
 check("the torrent count goes as a number, so the server can add them up", metrics["torrents"], len(bot_module.client.get_torrents()))

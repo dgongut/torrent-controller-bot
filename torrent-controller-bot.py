@@ -25,7 +25,7 @@ import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1782,6 +1782,7 @@ SETTING_SCREENS = {
 	"low_space_warning": "notify",
 	"auto_download": "add", "auto_move_series": "add", "auto_move_series_external": "add",
 	"auto_rename": "rename", "auto_rename_files": "rename", "auto_rename_external": "rename",
+	"auto_replace": "rename",
 }
 NOTIFY_SETTINGS = ("notify_completed", "notify_errors", "notify_external_added", "low_space_warning")
 
@@ -1901,6 +1902,8 @@ def build_settings_rename():
 	if bot_settings.get("auto_rename"):
 		markup.add(toggle_button("auto_rename_files", "BUTTON_SETTING_AUTO_RENAME_FILES", prefix="↳ "))
 		markup.add(toggle_button("auto_rename_external", "BUTTON_SETTING_AUTO_RENAME_EXTERNAL", prefix="↳ "))
+		markup.add(toggle_button("auto_replace", "BUTTON_SETTING_AUTO_REPLACE", prefix="↳ "))
+		lines.append(get_text("SETTINGS_AUTO_REPLACE", get_text("REPLACE_MODE_AUTO" if bot_settings.get("auto_replace") else "REPLACE_MODE_ASK")))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_SETTING_TEMPLATES"), callback_data=build_call("tplMenu")))
 	return "\n".join(lines), settings_nav(markup)
 
@@ -2021,6 +2024,7 @@ def collect_telemetry_metrics():
 		"auto_rename": auto_rename_enabled(),
 		"auto_rename_files": auto_rename_enabled() and bool(bot_settings.get("auto_rename_files")),
 		"auto_rename_external": auto_rename_enabled() and bool(bot_settings.get("auto_rename_external")),
+		"auto_replace": auto_replace_enabled(),
 		"auto_move_series": auto_move_series_enabled(),
 		"auto_move_series_external": auto_move_series_enabled(external=True),
 		"low_space_warning": bool(bot_settings.get("low_space_warning")),
@@ -2302,7 +2306,9 @@ def deferred_auto_rename(torrent_id, original_name, chat_id=None, thread_id=None
 		if renamed:
 			notify(get_text("NOTIFY_AUTO_RENAMED", html.escape(original_name), html.escape(renamed)), chat_id, thread_id)
 		if duplicate:
-			notify(get_text("NOTIFY_AUTO_RENAME_DUPLICATE", html.escape(original_name), html.escape(duplicate)), chat_id, thread_id)
+			hint = replace_hint()
+			text = get_text("NOTIFY_AUTO_RENAME_DUPLICATE", html.escape(original_name), html.escape(duplicate))
+			notify(f"{text}\n{hint}" if hint else text, chat_id, thread_id)
 		if files_renamed:
 			notify(f"{get_text('NOTIFY_AUTO_RENAMED_FILES', html.escape(renamed or original_name))}\n{files_renamed}", chat_id, thread_id)
 		return
@@ -2321,11 +2327,150 @@ def auto_rename_lines(torrent):
 			lines.append(get_text("ADD_AUTO_RENAMED", html.escape(renamed)))
 		if duplicate:
 			lines.append(get_text("ADD_AUTO_RENAME_DUPLICATE", html.escape(duplicate)))
+			hint = replace_hint()
+			if hint:
+				lines.append(hint)
 		if files_renamed:
 			lines.append(files_renamed)
 	except TorrentClientError as e:
 		warning(f"Auto-rename failed for {torrent.name}: {e}")
 	return lines
+
+
+# ---------------------------------------------------------------------------
+# REPLACE: a finished download takes the name of the torrent it supersedes
+# ---------------------------------------------------------------------------
+# The automatic rename skips a torrent whose name is already taken, which is
+# what happens when a better copy of something you already have arrives. Once
+# it finishes, the old one can go (with its data) and the new one take its name
+
+def auto_replace_enabled():
+	return auto_rename_enabled() and bool(bot_settings.get("auto_replace"))
+
+
+def replace_hint():
+	"""What will happen to a torrent whose rename was skipped for a duplicate,
+	or None when nothing will: the offer travels in the completion notice"""
+	if auto_replace_enabled():
+		return get_text("REPLACE_HINT_AUTO")
+	if bot_settings.get("notify_completed"):
+		return get_text("REPLACE_HINT_ASK")
+	return None
+
+
+def torrent_paths(torrent):
+	"""Where the files of the torrent are on disk"""
+	base = (torrent.download_dir or "").rstrip("/\\")
+	return {f"{base}/{path}" for path, _, _ in torrent.files}
+
+
+def replace_targets(torrent):
+	"""What torrent would replace: (its suggested name, the other torrents that
+	already have that name). A torrent sharing any file with it never is one,
+	since deleting its data would delete this download too, and neither is one
+	whose files are still unknown. Returns (None, []) when there is nothing"""
+	if not client.supports_rename:
+		return None, []
+	suggested = parse_name(torrent.name)
+	if not suggested or suggested == torrent.name:
+		return None, []
+	try:
+		holders = [t for t in client.get_torrents() if t.name == suggested and str(t.id) != str(torrent.id)]
+		if not holders:
+			return None, []
+		# Managers list torrents without their files
+		holders = [client.get_torrent(t.id) for t in holders]
+		if not torrent.files:
+			torrent = client.get_torrent(torrent.id)
+	except TorrentClientError as e:
+		warning(f"Cannot look for what {torrent.name} would replace: {e}")
+		return None, []
+	if torrent is None or not torrent.files:
+		return None, []
+	own = torrent_paths(torrent)
+	previous = [t for t in holders if t is not None and t.files and not torrent_paths(t) & own]
+	return (suggested, previous) if previous else (None, [])
+
+
+def wait_until_removed(torrent_ids):
+	for _ in range(REPLACE_WAIT_ATTEMPTS):
+		if all(client.get_torrent(torrent_id) is None for torrent_id in torrent_ids):
+			return
+		time.sleep(REPLACE_WAIT_DELAY)
+
+
+def replace_previous(torrent_id):
+	"""Deletes, with their data, the torrents that have the name torrent_id
+	should take, and renames it to that name (its subfolders and files too
+	when the automatic rename includes them). The manager deletes in the
+	background and the old files can still be on disk when the rename runs,
+	so the rename is retried for a while.
+	Returns the text telling what was done"""
+	try:
+		torrent = client.get_torrent(torrent_id)
+		suggested, previous = replace_targets(torrent) if torrent else (None, [])
+		if not previous:
+			return get_text("REPLACE_NOTHING")
+		# The name is the one the new torrent takes, so where and how big tell them apart
+		if len(previous) == 1:
+			removed = get_text("REPLACED_OLD_ONE", sizeof_fmt(previous[0].total_size), html.escape(previous[0].download_dir or ""))
+		else:
+			removed = get_text("REPLACED_OLD_MANY", len(previous))
+		client.remove_torrents([t.id for t in previous], delete_data=True)
+	except TorrentClientError as e:
+		warning(f"Cannot replace the torrents before {torrent_id}: {e}")
+		return get_text("REPLACE_FAILED", html.escape(str(e)))
+	debug(f"Replaced {', '.join(t.name for t in previous)} with {torrent.name}")
+	wait_until_removed([t.id for t in previous])
+	lines = [get_text("REPLACED", html.escape(suggested), removed)]
+	try:
+		# The contents go first, see auto_rename_torrent_files
+		if auto_rename_enabled() and bot_settings.get("auto_rename_files"):
+			files_renamed = auto_rename_torrent_files(client.get_torrent(torrent_id) or torrent)
+			if files_renamed:
+				lines.append(files_renamed)
+	except TorrentClientError as e:
+		warning(f"Cannot rename the contents of {torrent.name} after replacing: {e}")
+	for attempt in range(REPLACE_WAIT_ATTEMPTS):
+		try:
+			client.rename_torrent(torrent_id, suggested)
+			break
+		except TorrentClientError as e:
+			if attempt == REPLACE_WAIT_ATTEMPTS - 1:
+				warning(f"Cannot rename {torrent.name} to {suggested} after replacing: {e}")
+				lines[0] = get_text("REPLACED_NOT_RENAMED", html.escape(suggested), removed, html.escape(str(e)))
+				return "\n".join(lines)
+			time.sleep(REPLACE_WAIT_DELAY)
+	return "\n".join(lines)
+
+
+def replace_offer(torrent, suggested):
+	"""The completion notice of a torrent that can replace another, with the
+	buttons that do it or leave both"""
+	text = f"{get_text('NOTIFY_COMPLETED', html.escape(torrent.name))}\n{get_text('REPLACE_OFFER', html.escape(suggested))}"
+	markup = InlineKeyboardMarkup()
+	markup.row(InlineKeyboardButton(get_text("BUTTON_REPLACE"), callback_data=build_call("replace", torrent.id)),
+			InlineKeyboardButton(get_text("BUTTON_REPLACE_SKIP"), callback_data=build_call("replaceSkip", torrent.id)))
+	return text, markup
+
+
+def handle_completed(torrent):
+	"""Tells that a download finished and, when it can replace a torrent that
+	has the name it should have, replaces it (automatic setting) or offers to"""
+	notify_on = bot_settings.get("notify_completed")
+	if notify_on:
+		count_usage("auto_notify_completed")
+	suggested, previous = replace_targets(torrent) if notify_on or auto_replace_enabled() else (None, [])
+	text = get_text("NOTIFY_COMPLETED", html.escape(torrent.name))
+	if previous and auto_replace_enabled():
+		count_usage("auto_replace")
+		# Told even with the notice off: data was deleted
+		notify(f"{text}\n\n{replace_previous(torrent.id)}")
+	elif previous:
+		offer_text, markup = replace_offer(torrent, suggested)
+		notify(offer_text, reply_markup=markup)
+	elif notify_on:
+		notify(text)
 
 
 # Torrents added through the bot that the monitor has not seen yet: id -> ts.
@@ -3305,6 +3450,44 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			client.remove_torrents([torrent_id], delete_data=with_data == "1")
 			edit_message(chat_id, message_id, get_text("DELETED", html.escape(name)), back_close_markup(build_call("list", filter_key, page)))
 
+		elif command in ("replace", "replaceNo"):
+			# The button under a completion notice, and the way back to it
+			torrent = client.get_torrent(args[0])
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), close_markup())
+				return
+			suggested, previous = replace_targets(torrent)
+			completed = get_text("NOTIFY_COMPLETED", html.escape(torrent.name))
+			if not previous:
+				edit_message(chat_id, message_id, f"{completed}\n\n{get_text('REPLACE_NOTHING')}")
+			elif command == "replaceNo":
+				edit_message(chat_id, message_id, *replace_offer(torrent, suggested))
+			else:
+				items = "\n".join(get_text("REPLACE_ITEM", html.escape(t.name), html.escape(t.download_dir or ""), sizeof_fmt(t.total_size))
+								for t in previous)
+				markup = InlineKeyboardMarkup(row_width=1)
+				markup.add(InlineKeyboardButton(get_text("BUTTON_REPLACE_CONFIRM"), callback_data=build_call("replaceOk", torrent.id)))
+				markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("replaceNo", torrent.id)))
+				edit_message(chat_id, message_id, get_text("REPLACE_CONFIRM", items, html.escape(torrent.name), html.escape(suggested)), markup)
+
+		elif command == "replaceSkip":
+			# Both stay: the notice is left as a plain completion, with no buttons.
+			# A torrent gone since then still has its name in the notice
+			torrent = client.get_torrent(args[0])
+			if torrent is not None:
+				edit_message(chat_id, message_id, get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
+			elif message_html:
+				edit_message(chat_id, message_id, "\n".join(message_html.split("\n")[:2]))
+
+		elif command == "replaceOk":
+			torrent = client.get_torrent(args[0])
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), close_markup())
+				return
+			completed = get_text("NOTIFY_COMPLETED", html.escape(torrent.name))
+			edit_message(chat_id, message_id, f"{completed}\n\n{get_text('REPLACING')}")
+			edit_message(chat_id, message_id, f"{completed}\n\n{replace_previous(torrent.id)}")
+
 		elif command == "rename":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
 			torrent = client.get_torrent(torrent_id)
@@ -3712,6 +3895,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				# Both depend on the torrent rename: never leave them active but hidden
 				bot_settings.set("auto_rename_files", False)
 				bot_settings.set("auto_rename_external", False)
+				bot_settings.set("auto_replace", False)
 			if args[0] == "auto_move_series" and not enabled:
 				bot_settings.set("auto_move_series_external", False)
 			render_settings(chat_id, message_id, SETTING_SCREENS.get(args[0], "main"))
@@ -3942,9 +4126,11 @@ def poll_torrents(states):
 			# A torrent already finished the first time it is seen is a
 			# download that completed between two polls, not a leftover:
 			# the baseline built on the first poll is what covers restarts
-			if state["finished"] and (prev is None or not prev["finished"]) and bot_settings.get("notify_completed"):
-				count_usage("auto_notify_completed")
-				notify(get_text("NOTIFY_COMPLETED", html.escape(torrent.name)))
+			if state["finished"] and (prev is None or not prev["finished"]):
+				try:
+					handle_completed(torrent)
+				except Exception as e:
+					warning(f"Cannot handle the completion of {torrent.name}: {e}")
 			if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
 				count_usage("auto_notify_error")
 				notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))

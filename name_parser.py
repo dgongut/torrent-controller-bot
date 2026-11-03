@@ -24,12 +24,17 @@ SUBTITLE_EXTENSIONS = {"srt", "ass", "ssa", "sub", "idx", "vtt", "sup"}
 # start a word, so it is never the last letter of the title ('Lost01E01')
 _SEASON_MARK = r'(?:[Ss]|(?<![A-Za-z0-9])[Tt])'
 
-# Episode patterns: S01E03 / T01E03, 1x03, Cap.103 / Capitulo 103
+# Episode patterns: S01E03 / T01E03, 1x03, Temporada 2 Capitulo 3 / T2 Cap 03,
+# Cap.103 / Capitulo 103
 EPISODE_PATTERNS = [
 	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee](\d{1,3})'),
 	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})(?!\d)'),
+	re.compile(r'(?:[Tt]emporada|[Ss]eason|(?<![A-Za-z0-9])[Tt])[\s._-]*(\d{1,2})[\s._-]*'
+		r'(?:[Cc]ap(?:[íi]tulo)?|[Ee]pisodio|[Ee]pisode|[Ee]p)[\s._-]*(\d{1,4})(?!\d)'),
 	re.compile(r'[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})'),
 ]
+_SEASON_AND_EPISODE = 2  # Index of the 'Temporada 2 Capitulo 3' pattern
+_CHAPTER = 3  # Index of the 'Cap.103' pattern
 
 # Bare episode numbers used inside season packs (E01, - 01, [01], 01). Only
 # tried when the context already says the file belongs to a series, since on
@@ -41,17 +46,39 @@ _BARE_EPISODE_PATTERNS = [
 	re.compile(r'^(\d{1,3})$'),
 ]
 
-# Season-only patterns (packs): S02, Temporada 2, Season 2, T2
+# Season-only patterns (packs): S02, Temporada 2, Temporada Completa 2,
+# 2ª Temporada / 1a Temporada, Season 2, T2
 SEASON_ONLY_PATTERNS = [
 	re.compile(r'\b[Ss](\d{1,2})\b(?![\s._-]?[Ee]\d)'),
-	re.compile(r'[Tt]emporada[\s._-]+(\d{1,2})'),
+	re.compile(r'[Tt]emporada(?:[\s._-]+[Cc]ompleta)?[\s._-]+(\d{1,2})(?!\d)'),
+	re.compile(r'(?<![A-Za-z0-9])(\d{1,2})(?:ª|º|[ao])?[\s._-]*[Tt]emporada\b'),
 	re.compile(r'[Ss]eason[\s._-]+(\d{1,2})'),
 	re.compile(r'\bT(\d{1,2})\b(?![\s._-]?[Ee]\d)'),
 ]
 
-# Multi-episode/multi-season packs: S04E01-E08, S01-S08 (or with T)
-_EPISODE_RANGE_PATTERN = re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee](\d{1,3})[\s._-]?-[\s._-]?[Ee]?(\d{1,3})(?![\dpP])')
-_SEASON_RANGE_PATTERN = re.compile(r'\b[Ss](\d{1,2})[\s._-]?-[\s._-]?[Ss](\d{1,2})\b|\b[Tt](\d{1,2})[\s._-]?-[\s._-]?[Tt](\d{1,2})\b')
+# Multi-episode/multi-season packs: S04E01-E08, S01E01E02, 1x01-02, S01-S08
+# (or with T), Temporadas 1-5, Temporada Completa 1 a 5, Seasons 1-5
+_EPISODE_RANGE_PATTERNS = [
+	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee](\d{1,3})(?:[\s._-]?-[\s._-]?[Ee]?|[Ee])(\d{1,3})(?![\dpP])'),
+	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})-(?:\1[xX])?(\d{2,3})(?![\dpP])'),
+]
+_SEASON_RANGE_PATTERNS = [
+	re.compile(r'\b[Ss](\d{1,2})[\s._-]?-[\s._-]?[Ss](\d{1,2})\b|\b[Tt](\d{1,2})[\s._-]?-[\s._-]?[Tt](\d{1,2})\b'),
+	# Plural or 'Completa' leave no doubt. Otherwise the dash has to be tight
+	# ('Temporada 1-5'), since 'Season 2 - 05' is an episode in anime releases
+	re.compile(r'(?:[Tt]emporadas|[Ss]easons|(?:[Tt]emporada|[Ss]eason)[\s._-]+[Cc]ompletas?)[\s._-]+'
+		r'(\d{1,2})[\s._]*(?:-|al?)[\s._]*(\d{1,2})(?![\dpPkKxX])'),
+	re.compile(r'(?:[Tt]emporada|[Ss]eason)[\s._-]+(\d{1,2})(?:-|[\s._]+al?[\s._]+)(\d{1,2})(?![\dpPkKxX])'),
+]
+
+# 'Cap.201_207': every episode from the first to the second, same season
+_CHAPTER_RANGE_PATTERN = re.compile(r'[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})[\s._]*[_-][\s._]*(?:[Cc]ap(?:[íi]tulo)?[\s._-]?)?(\d{3,4})(?!\d)')
+
+# Download sites stamped at the start of the name: 'www.Site.com - Title',
+# '[ www.Site.com ] - Title', '(www.Site.org) Title'
+_SITE_PREFIX = re.compile(
+	r'^\s*(?:[\[(【]\s*www\.[^\])】]*[\])】]|www\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*?\.[A-Za-z]{2,6}(?=[\s_\-–]))'
+	r'[\s._\-–]*', re.IGNORECASE)
 
 # 'Cap.1984': four digits that look like a year. On their own they are still a
 # valid chapter (1901 is season 19, episode 01), so they only count as junk
@@ -244,10 +271,18 @@ def _find_episode(name, skip_span=None):
 			if skip_span and match.start() < skip_span[1] and match.end() > skip_span[0]:
 				position = match.start() + 1
 				continue
-			if i == 2:  # Cap.NNN(N): last two digits are the episode
+			if i == _CHAPTER:  # Cap.NNN(N): last two digits are the episode
 				digits = match.group(1)
 				season = int(digits[:-2]) if len(digits) > 2 else 1
 				episode = int(digits[-2:])
+			elif i == _SEASON_AND_EPISODE:
+				# 'Temporada 2 Cap.201' repeats the season in front of the
+				# episode, the way Cap.NNN always does
+				season = int(match.group(1))
+				digits = match.group(2)
+				episode = int(digits)
+				if len(digits) > 2 and int(digits[:-2]) == season and int(digits[-2:]):
+					episode = int(digits[-2:])
 			else:
 				season = int(match.group(1))
 				episode = int(match.group(2))
@@ -262,6 +297,40 @@ def _find_season_only(name):
 		if match:
 			return int(match.group(1)), match.start()
 	return None
+
+
+def _find_first(patterns, name):
+	for pattern in patterns:
+		match = pattern.search(name)
+		if match:
+			return match
+	return None
+
+
+def _find_chapter_range(name):
+	"""Returns (season, first, last, match_start) for 'Cap.201_207', or None.
+	Both ends have to belong to the same season"""
+	match = _CHAPTER_RANGE_PATTERN.search(name)
+	if not match:
+		return None
+	first, last = match.group(1), match.group(2)
+	season = int(first[:-2])
+	if int(last[:-2]) != season or int(last[-2:]) <= int(first[-2:]):
+		return None
+	return season, int(first[-2:]), int(last[-2:]), match.start()
+
+
+def _season_title_end(name, title_end, season):
+	"""Spanish releases repeat the season before the episode marker ('The Last
+	of Us - Temporada 2 [HDTV][Cap.201]'). It belongs to the episode, not to
+	the title, so the title ends where it starts. Only when it is the same
+	season and some title is left in front of it"""
+	head = name[:title_end]
+	for pattern in SEASON_ONLY_PATTERNS:
+		for match in pattern.finditer(head):
+			if int(match.group(1)) == season and _clean_title(head[:match.start()]):
+				return match.start()
+	return title_end
 
 
 def _find_bare_episode(name, limit):
@@ -345,8 +414,8 @@ def _clean_title(title_part):
 	if depth:
 		title = title[:opener]
 
-	# Remove leftover separators
-	title = re.sub(r'[\s\-–_.]+$', '', title).strip()
+	# Remove leftover separators ('[ www.Site.com ] - Title' leaves a dash)
+	title = re.sub(r'^[\s\-–_.]+|[\s\-–_.]+$', '', title).strip()
 	return title
 
 
@@ -400,6 +469,7 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	allow_bare_episode enables matching episode numbers without a season
 	marker, only safe when the caller already knows it is a series file"""
 	name, ext = _split_extension(filename)
+	name = _SITE_PREFIX.sub("", name, count=1)
 
 	fields = {key: "" for key in CANONICAL_FIELDS}
 	fields["extension"] = ext
@@ -409,24 +479,29 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	title_end = len(name)
 	episode_end = None
 	episode_span = None
-	episode_range = _EPISODE_RANGE_PATTERN.search(name)
+	episode_range = _find_first(_EPISODE_RANGE_PATTERNS, name)
+	chapter_range = None if episode_range else _find_chapter_range(name)
 	chapter_year = _find_chapter_year(name)
 	episode_info = _find_episode(name, chapter_year.span() if chapter_year else None)
-	season_range = _SEASON_RANGE_PATTERN.search(name)
-	if episode_range:
-		season, ep1, ep2 = int(episode_range.group(1)), int(episode_range.group(2)), int(episode_range.group(3))
+	season_range = _find_first(_SEASON_RANGE_PATTERNS, name)
+	if episode_range or chapter_range:
+		if episode_range:
+			season, ep1, ep2 = (int(episode_range.group(i)) for i in (1, 2, 3))
+			start = episode_range.start()
+		else:
+			season, ep1, ep2, start = chapter_range
 		fields["is_series"] = True
 		fields["season"] = str(season)
 		fields["episode_number"] = f"{ep1}-{ep2}"
 		fields["chapter"] = f"{season}x{ep1:02d}-{ep2:02d}"
-		title_end = episode_range.start()
+		title_end = _season_title_end(name, start, season)
 	elif episode_info:
 		season, episode, start, end = episode_info
 		fields["is_series"] = True
 		fields["season"] = str(season)
 		fields["episode_number"] = str(episode)
 		fields["chapter"] = f"{season}x{episode:02d}"
-		title_end = start
+		title_end = _season_title_end(name, start, season)
 		episode_end = end
 		episode_span = (start, end)
 	elif season_range:
@@ -614,7 +689,7 @@ def render_template(template, fields):
 # HIGH-LEVEL API
 # ---------------------------------------------------------------------------
 
-DEFAULT_MOVIE_TEMPLATE = "{title} ({year}) - {resolution}[ {hdr}][.{extension}]"
+DEFAULT_MOVIE_TEMPLATE = "{title}[ ({year})] - {resolution}[ {hdr}][.{extension}]"
 DEFAULT_SERIES_TEMPLATE = "{season}x{episode.2} - {title}[ - {resolution}][ {hdr}][.{extension}]"
 DEFAULT_SEASON_PACK_TEMPLATE = "{chapter} - {title}[ - {resolution}][ {hdr}][.{extension}]"
 
@@ -650,7 +725,15 @@ def _drop_series_title_from_episode_title(fields):
 			fields["episode_title"] = remainder.strip()
 
 
+# 'Frieren - 12', 'One Piece - 1100': a number behind a dash ends the title of an
+# episode with no season marker, which no template can name without its season
+_UNMARKED_EPISODE = re.compile(r'\s[-–]\s*\d{1,4}$')
+
+
 def _render(template, fields, filename):
+	# Without a year, nothing tells a movie apart from such an episode
+	if not fields["is_series"] and not fields["year"] and _UNMARKED_EPISODE.search(fields["title"]):
+		return None
 	try:
 		suggested = render_template(template, fields)
 	except Exception:

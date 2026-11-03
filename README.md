@@ -32,6 +32,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Notificaciones de descarga completada, de errores en torrents y de torrents añadidos fuera del bot (activables desde los ajustes)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
 - ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene y de los torrents añadidos fuera del bot (activable desde los ajustes)
+- ✅ Sustituir una versión anterior: si el nombre que le toca a una descarga ya lo tiene otro torrent, al terminar te ofrece borrar el anterior (con sus datos) y quedarte con el nuevo, o lo hace sin preguntar si lo activas
 - ✅ Carpeta de la serie: un episodio nuevo se ofrece (o va directo, si lo activas) a la carpeta donde ya tienes los anteriores
 - ✅ Aviso si el torrent que añades puede no caber en el disco
 - ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
@@ -76,7 +77,8 @@ Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu
 Al pulsar ✏️ Renombrar sobre un torrent, el bot intenta generar una sugerencia de nombre limpio:
 
 - **Películas**: `The.Matrix.1999.1080p.BluRay.x264.mkv` → `The Matrix (1999) - 1080p.mkv`
-- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (soporta formatos `Cap.103`, `S01E03`, `T01E03` y `3x05`)
+- **Series**: `Operaciones Especiales Lioness [HDTV 1080p][Cap.103]` → `1x03 - Operaciones Especiales Lioness - 1080p` (soporta formatos `Cap.103`, `S01E03`, `T01E03`, `3x05` y `Temporada 1 Capitulo 3`, rangos como `Cap.101_107` o `S01E01E02`, y packs como `2ª Temporada` o `Temporada Completa 1-5`)
+- **Sin año**: si una película no lo trae, la sugerencia sale sin él (`El Hoyo 2 [WEB-DL 1080p]` → `El Hoyo 2 - 1080p`). Las plantillas personalizadas no cambian: si la tuya exige `{año}`, sigue sin sugerir nada
 
 Si no puede generar sugerencia, siempre puedes escribir el nombre manualmente.
 
@@ -122,6 +124,21 @@ Detalles a tener en cuenta:
 - En rangos se rellena cada lado por separado, así que `S01-S08` con `{temporada.2}` da `01-08`.
 - Solo funciona en `{temporada}` y `{episodio}`; en cualquier otro campo el bot rechaza la plantilla.
 - `{capitulo}` no se ve afectado: mantiene siempre su formato de dos dígitos (`1x03`, `T2`).
+
+## Sustituir una versión anterior
+
+Si descargas algo que ya tenías (una copia mejor de la misma película, por ejemplo), el renombrado automático no lo renombra porque su nombre ya lo tiene el torrent antiguo, y te lo avisa al añadirlo. Cuando la descarga termina, el aviso de completado trae el botón 🔁 **Sustituir el anterior**: tras confirmarlo, el bot borra el torrent antiguo **con sus datos** y renombra el nuevo al nombre que le tocaba (y sus subcarpetas y archivos, si el renombrado automático los incluye).
+
+```
+✅ Descarga completada
+🧲 Weapons (2025) 1080p NF WEB-DL DD+5.1 AV1-HDZ.mkv
+♻️ Ya hay un torrent llamado Weapons (2025) - 1080p.mkv
+      [🔁 Sustituir el anterior]  [❌ No sustituir]
+```
+
+❌ **No sustituir** deja los dos torrents como están y el aviso como un aviso de completado normal, sin botones.
+
+Con **«Sustituir sin preguntar si el nombre ya existe»** (dentro del renombrado automático, desactivado por defecto) lo hace solo al terminar la descarga y te cuenta lo que ha borrado. Nunca se sustituye un torrent que comparte ficheros con el nuevo, porque borrar sus datos borraría también la descarga nueva.
 
 ## Carpeta de la serie
 

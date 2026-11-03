@@ -66,6 +66,10 @@ class FakeClient:
 		self.fail_rename = None  # Exception raised by every rename
 		self.hide_from_get = set()  # Ids get_torrent answers None for
 		self.on_add = None  # Replaces add_torrent
+		self.removed = {}  # Removed id -> torrent, still answered by get_torrent while lingering
+		self.linger = 0  # get_torrent calls a removed torrent is still answered for (removal in background)
+		self.fail_remove = None  # Exception raised by remove_torrents
+		self.fail_rename_times = 0  # Renames that fail before they work (old files still on disk)
 
 	def put(self, torrent):
 		self.torrents[torrent.id] = torrent
@@ -92,6 +96,9 @@ class FakeClient:
 			raise self.fail_get
 		if torrent_id in self.hide_from_get:
 			return None
+		if torrent_id in self.removed and self.removed[torrent_id][0] > 0:
+			self.removed[torrent_id][0] -= 1
+			return copy.deepcopy(self.removed[torrent_id][1])
 		torrent = self.torrents.get(torrent_id)
 		return copy.deepcopy(torrent) if torrent else None
 
@@ -118,9 +125,19 @@ class FakeClient:
 				"speed_limit_down": 0, "speed_limit_down_enabled": False,
 				"speed_limit_up": 0, "speed_limit_up_enabled": False, "download_dir": "/downloads"}
 
+	def remove_torrents(self, torrent_ids, delete_data=False):
+		self.calls.append(("remove_torrents", sorted(torrent_ids), delete_data))
+		if self.fail_remove:
+			raise self.fail_remove
+		for torrent_id in torrent_ids:
+			self.removed[torrent_id] = [self.linger, self.torrents.pop(torrent_id)]
+
 	def _renamed(self):
 		if self.fail_rename:
 			raise self.fail_rename
+		if self.fail_rename_times:
+			self.fail_rename_times -= 1
+			raise TorrentClientError("File already exists")
 
 	def rename_torrent(self, torrent_id, new_name):
 		self.calls.append(("rename_torrent", torrent_id, new_name))
@@ -162,7 +179,9 @@ real_sleep = time.sleep
 time.sleep = lambda seconds: None  # The deferred rename waits between checks
 
 NOTIFIED = []  # (text, chat_id, thread_id)
-bot.notify = lambda text, chat_id=None, thread_id=None, reply_markup=None: NOTIFIED.append((text, chat_id, thread_id))
+MARKUPS = []  # The reply_markup of every notification, in the same order
+bot.notify = lambda text, chat_id=None, thread_id=None, reply_markup=None: (
+	NOTIFIED.append((text, chat_id, thread_id)), MARKUPS.append(reply_markup))
 WARNINGS = []
 _real_warning = bot.warning
 bot.warning = lambda message: WARNINGS.append(message)
@@ -248,7 +267,8 @@ KINDS = {"movie": movie, "series": series, "magnet": magnet, "plain": plain}
 
 
 def configure(notify_completed=True, notify_errors=True, notify_external=False, auto_rename=False,
-			rename_files=False, rename_external=False, supports_rename=True):
+			rename_files=False, rename_external=False, supports_rename=True, auto_replace=False):
+	bot_settings.set("auto_replace", auto_replace)
 	bot_settings.set("notify_completed", notify_completed)
 	bot_settings.set("notify_errors", notify_errors)
 	bot_settings.set("notify_external_added", notify_external)
@@ -263,6 +283,7 @@ def fresh(**settings):
 	CLIENT.reset()
 	configure(**settings)
 	NOTIFIED.clear()
+	MARKUPS.clear()
 	WARNINGS.clear()
 	DEFERRED.clear()
 	PENDING.clear()
@@ -987,7 +1008,268 @@ check("monitor and deferred rename together: the rename told after the add",
 	[external_header(m) in texts()[0], texts()[-1]], [True, bot.get_text("NOTIFY_AUTO_RENAMED", MAGNET_NAME, MAGNET_RENAMED)])
 
 # ---------------------------------------------------------------------------
-# 10. SETTINGS
+# 10. REPLACE: a finished download takes the name of the one it supersedes
+# ---------------------------------------------------------------------------
+
+def finish(torrent, states):
+	"""The torrent completes between this poll and the previous one"""
+	torrent.progress = 100.0
+	torrent.files = [(p, s, True) for p, s, _ in torrent.files]
+	return poll(states)
+
+
+def buttons(markup):
+	return [b.callback_data for row in markup.keyboard for b in row] if markup else []
+
+
+def removals():
+	return [c for c in CLIENT.calls if c[0] == "remove_torrents"]
+
+
+def removed_text(old):
+	"""How the deleted torrents are told: by where they were and their size, the
+	name being the one the new torrent takes"""
+	if len(old) == 1:
+		return bot.get_text("REPLACED_OLD_ONE", bot.sizeof_fmt(old[0].total_size), old[0].download_dir)
+	return bot.get_text("REPLACED_OLD_MANY", len(old))
+
+
+def replaced_text(old, new_name):
+	return bot.get_text("REPLACED", bot.html.escape(new_name), removed_text(old))
+
+
+def offer_text(name, suggested):
+	return f"{completed_text(name)}\n{bot.get_text('REPLACE_OFFER', bot.html.escape(suggested))}"
+
+
+def old_copy(name=MOVIE_RENAMED, directory="/media/old"):
+	"""The torrent already in the manager with the name the new one should take"""
+	old = movie(name=name, progress=100.0)
+	old.download_dir = directory
+	return CLIENT.put(old)
+
+
+# Offered: the completion notice carries the button, nothing is deleted
+fresh(auto_rename=True)
+old = old_copy()
+new = CLIENT.put(movie())
+states = finish(new, poll(None))
+check("a download that can replace another is offered to", texts(), [offer_text(new.name, MOVIE_RENAMED)])
+check("with the buttons to replace it or not", buttons(MARKUPS[0]), [f"replace|{new.id}", f"replaceSkip|{new.id}"])
+check("side by side", [len(row) for row in MARKUPS[0].keyboard], [2])
+check("the button fits in callback_data", all(len(b.encode()) <= bot.MAX_CALLBACK_DATA_BYTES for b in buttons(MARKUPS[0])), True)
+check("offering deletes nothing", removals(), [])
+check("offering renames nothing", renames(), [])
+states = poll(states)
+check("it is offered only once", len(NOTIFIED), 1)
+
+# The offer does not depend on the automatic rename: the name is still taken
+fresh()
+old = old_copy()
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("without automatic rename it is offered too", texts(), [offer_text(new.name, MOVIE_RENAMED)])
+
+# Automatic: deleted with its data, renamed, and told
+for notify_completed in (True, False):
+	label = f"[notify={notify_completed}]"
+	fresh(auto_rename=True, auto_replace=True, notify_completed=notify_completed)
+	old = old_copy()
+	new = CLIENT.put(movie())
+	finish(new, poll(None))
+	check(f"{label} the previous one is deleted with its data", removals(), [("remove_torrents", [old.id], True)])
+	check(f"{label} the new one takes the name", CLIENT.torrents[new.id].name, MOVIE_RENAMED)
+	check(f"{label} only the new one is left", list(CLIENT.torrents), [new.id])
+	check(f"{label} it is always told, data was deleted",
+		texts(), [f"{completed_text(MOVIE_NAME)}\n\n{replaced_text([old], MOVIE_RENAMED)}"])
+	check(f"{label} with no button", MARKUPS, [None])
+
+# The automatic setting depends on the automatic rename
+fresh(auto_rename=False, auto_replace=True)
+old = old_copy()
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("without the automatic rename it only offers", (texts(), removals()), ([offer_text(new.name, MOVIE_RENAMED)], []))
+
+# Nothing told and nothing done with the notice and the automatic one off
+fresh(notify_completed=False)
+old_copy()
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("with everything off nothing is told", NOTIFIED, [])
+check("nor done", (removals(), renames()), ([], []))
+
+# Never with a manager that cannot rename
+fresh(auto_rename=True, auto_replace=True, supports_rename=False)
+old_copy()
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("a manager that cannot rename only tells the completion", texts(), [completed_text(new.name)])
+check("and deletes nothing", removals(), [])
+FakeClient.supports_rename = True
+
+# Never a torrent sharing files with it: its data is this download's data
+fresh(auto_rename=True, auto_replace=True)
+new = CLIENT.put(movie())
+twin = movie(name=MOVIE_RENAMED, progress=100.0)
+twin.files = list(new.files)
+CLIENT.put(twin)
+finish(new, poll(None))
+check("a torrent sharing the files is never replaced", removals(), [])
+check("and it is not offered", texts(), [completed_text(new.name)])
+# The same file name in another folder is another file
+fresh(auto_rename=True)
+old = movie(name=MOVIE_RENAMED, progress=100.0)
+old.files = [(MOVIE_NAME, 1000, True)]
+old.download_dir = "/media/old"
+CLIENT.put(old)
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("the same file name in another folder can be replaced", texts(), [offer_text(new.name, MOVIE_RENAMED)])
+# Nor one whose files are still unknown (a magnet without metadata)
+fresh(auto_rename=True, auto_replace=True)
+pending = magnet(name=MOVIE_RENAMED)
+CLIENT.put(pending)
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("a magnet without metadata is never replaced", (removals(), texts()), ([], [completed_text(new.name)]))
+
+# Every torrent with the name goes
+fresh(auto_rename=True, auto_replace=True)
+first = old_copy(directory="/media/a")
+second = old_copy(directory="/media/b")
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("every torrent with the name is replaced", removals(), [("remove_torrents", sorted([first.id, second.id]), True)])
+check("and told", texts(), [f"{completed_text(MOVIE_NAME)}\n\n{replaced_text([first, second], MOVIE_RENAMED)}"])
+
+# The manager deletes in the background: the rename waits and retries
+fresh(auto_rename=True, auto_replace=True)
+CLIENT.linger = 3
+CLIENT.fail_rename_times = 2
+old = old_copy()
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("the rename waits for the deletion and retries", CLIENT.torrents[new.id].name, MOVIE_RENAMED)
+check("three attempts were needed", len([c for c in renames() if c[0] == "rename_torrent"]), 3)
+check("and it is told as done", texts(), [f"{completed_text(MOVIE_NAME)}\n\n{replaced_text([old], MOVIE_RENAMED)}"])
+
+# A rename that never works is told, the deletion already happened
+fresh(auto_rename=True, auto_replace=True)
+CLIENT.fail_rename = TorrentClientError("Permission denied")
+old = old_copy()
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("a rename that never works gives up", len([c for c in renames() if c[0] == "rename_torrent"]), bot.REPLACE_WAIT_ATTEMPTS)
+check("and tells the half done replace", texts(), [f"{completed_text(new.name)}\n\n" + bot.get_text(
+	"REPLACED_NOT_RENAMED", MOVIE_RENAMED, removed_text([old]), "Permission denied")])
+check("the new one keeps its name", CLIENT.torrents[new.id].name, MOVIE_NAME)
+
+# A deletion that fails touches nothing else
+fresh(auto_rename=True, auto_replace=True)
+CLIENT.fail_remove = TorrentClientError("Manager busy")
+old = old_copy()
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("a failed deletion renames nothing", renames(), [])
+check("and is told", texts(), [f"{completed_text(new.name)}\n\n{bot.get_text('REPLACE_FAILED', 'Manager busy')}"])
+check("both are still there", sorted(CLIENT.torrents), sorted([old.id, new.id]))
+
+# A folder torrent: its contents are renamed too when the rename includes them
+for rename_files in (False, True):
+	label = f"[files={rename_files}]"
+	fresh(auto_rename=True, rename_files=rename_files, auto_replace=True)
+	old = series(name=SERIES_RENAMED, progress=100.0)
+	old.files = [(f"{SERIES_RENAMED}/2x01 - Show Name - 1080p.mkv", 400, True)]
+	CLIENT.put(old)
+	new = CLIENT.put(series())
+	finish(new, poll(None))
+	check(f"{label} a folder torrent replaces the previous one", removals(), [("remove_torrents", [old.id], True)])
+	check(f"{label} and takes its name", CLIENT.torrents[new.id].name, SERIES_RENAMED)
+	files = sorted(p for p, _, _ in CLIENT.torrents[new.id].files)
+	check(f"{label} its files follow the rename setting", f"{SERIES_RENAMED}/2x01 - Show Name - 1080p.mkv" in files, rename_files)
+	if rename_files:
+		kinds = [c[0] for c in renames()]
+		check(f"{label} the contents go before the torrent", kinds.index("rename_torrent"), len(kinds) - 1)
+
+# The add tells what will happen once it finishes
+for auto_replace, notify_completed, expected in ((False, True, "REPLACE_HINT_ASK"), (True, True, "REPLACE_HINT_AUTO"),
+												(True, False, "REPLACE_HINT_AUTO"), (False, False, None)):
+	label = f"[replace={auto_replace} notify={notify_completed}]"
+	fresh(auto_rename=True, auto_replace=auto_replace, notify_completed=notify_completed)
+	old_copy()
+	lines = bot.auto_rename_lines(CLIENT.put(movie()))
+	duplicate = bot.get_text("ADD_AUTO_RENAME_DUPLICATE", MOVIE_RENAMED)
+	check(f"{label} the add tells the duplicate", duplicate in lines, True)
+	hints = [line for line in lines if line in (bot.get_text("REPLACE_HINT_ASK"), bot.get_text("REPLACE_HINT_AUTO"))]
+	check(f"{label} and what will happen when it finishes", hints, [bot.get_text(expected)] if expected else [])
+
+# The buttons under the notice
+def press(*parts):
+	EDITS.clear()
+	bot.dispatch_callback(1, 100, 1, bot.build_call(*parts))
+	return EDITS[-1] if EDITS else (None, None)
+
+
+fresh(auto_rename=True)
+old = old_copy()
+new = CLIENT.put(movie())
+text, markup = press("replace", new.id)
+check("the confirmation names what is deleted", bot.html.escape(old.name) in text and old.download_dir in text, True)
+check("and the name the new one takes", bot.html.escape(MOVIE_RENAMED) in text and bot.html.escape(new.name) in text, True)
+check("it confirms or goes back", buttons(markup), [f"replaceOk|{new.id}", f"replaceNo|{new.id}"])
+check("the confirmation buttons fit in callback_data", all(len(b.encode()) <= bot.MAX_CALLBACK_DATA_BYTES for b in buttons(markup)), True)
+check("asking deletes nothing", removals(), [])
+text, markup = press("replaceNo", new.id)
+check("going back shows the notice again", (text, buttons(markup)),
+	(offer_text(new.name, MOVIE_RENAMED), [f"replace|{new.id}", f"replaceSkip|{new.id}"]))
+text, markup = press("replaceOk", new.id)
+check("confirming deletes the previous one with its data", removals(), [("remove_torrents", [old.id], True)])
+check("and renames the new one", CLIENT.torrents[new.id].name, MOVIE_RENAMED)
+check("the notice tells it", text, f"{completed_text(MOVIE_NAME)}\n\n{replaced_text([old], MOVIE_RENAMED)}")
+check("with no buttons left", markup, None)
+text, _ = press("replace", new.id)
+check("pressing again finds nothing to replace", bot.get_text("REPLACE_NOTHING") in text, True)
+text, _ = press("replaceOk", new.id)
+check("confirming again deletes nothing else", len(removals()), 1)
+check("and says so", bot.get_text("REPLACE_NOTHING") in text, True)
+text, _ = press("replace", "f" * 40)
+check("a torrent that is gone", text, bot.get_text("TORRENT_NOT_FOUND"))
+text, _ = press("replaceOk", "f" * 40)
+check("is never replaced", (text, len(removals())), (bot.get_text("TORRENT_NOT_FOUND"), 1))
+# Not replacing leaves a plain completion notice with no buttons, and both torrents
+fresh()
+old = old_copy()
+new = CLIENT.put(movie())
+text, markup = press("replaceSkip", new.id)
+check("not replacing leaves the plain completion notice", (text, markup), (completed_text(new.name), None))
+check("and touches nothing", (removals(), renames(), sorted(CLIENT.torrents)), ([], [], sorted([old.id, new.id])))
+text, markup = press("replace", new.id)
+check("pressed again later it still offers to replace", buttons(markup), [f"replaceOk|{new.id}", f"replaceNo|{new.id}"])
+# The torrent is gone: the name in the notice is kept
+del CLIENT.torrents[new.id]
+EDITS.clear()
+bot.dispatch_callback(1, 100, 1, bot.build_call("replaceSkip", new.id), message_html=offer_text(MOVIE_NAME, MOVIE_RENAMED))
+check("a torrent gone keeps its name in the notice", EDITS[-1], (completed_text(MOVIE_NAME), None))
+# The previous one went away in between: confirming does nothing
+fresh()
+old = old_copy()
+new = CLIENT.put(movie())
+press("replace", new.id)
+del CLIENT.torrents[old.id]
+text, _ = press("replaceOk", new.id)
+check("a previous one deleted meanwhile is not deleted again", (removals(), renames()), ([], []))
+# A torrent that shares the files is not offered from the button either
+fresh()
+new = CLIENT.put(movie())
+twin = movie(name=MOVIE_RENAMED, progress=100.0)
+twin.files = list(new.files)
+CLIENT.put(twin)
+text, _ = press("replaceOk", new.id)
+check("the button never replaces a torrent sharing the files", (removals(), bot.get_text("REPLACE_NOTHING") in text), ([], True))
+
+# ---------------------------------------------------------------------------
+# 11. SETTINGS
 # ---------------------------------------------------------------------------
 
 # A settings file from before 1.6.0 knows nothing of the new keys
@@ -1003,6 +1285,7 @@ os.remove(bot_settings.SETTINGS_FILE)
 bot_settings._settings = None
 check("a fresh install has the external notification off", bot_settings.get("notify_external_added"), False)
 check("a fresh install has the external rename off", bot_settings.get("auto_rename_external"), False)
+check("a fresh install asks before replacing", bot_settings.get("auto_replace"), False)
 
 
 def settings_screen(screen="main"):
@@ -1029,6 +1312,8 @@ for auto_rename, rename_files, rename_external, supports_rename in itertools.pro
 	check(f"{label} the rename is offered when the manager can rename", "toggleSetting|auto_rename" in buttons, supports_rename)
 	check(f"{label} the files scope only under an active rename", "toggleSetting|auto_rename_files" in buttons, children)
 	check(f"{label} the external scope only under an active rename", "toggleSetting|auto_rename_external" in buttons, children)
+	check(f"{label} the replace only under an active rename", "toggleSetting|auto_replace" in buttons, children)
+	check(f"{label} and so is its summary", bot.get_text("SETTINGS_AUTO_REPLACE", "").split(":")[0] in text, children)
 	if children:
 		check(f"{label} the files scope goes right under the rename",
 			buttons.index("toggleSetting|auto_rename_files"), buttons.index("toggleSetting|auto_rename") + 1)
@@ -1048,7 +1333,9 @@ for auto_rename, rename_files, rename_external, supports_rename in itertools.pro
 
 FakeClient.supports_rename = True
 configure(auto_rename=True, rename_files=True, rename_external=True)
+bot_settings.set("auto_replace", True)
 toggle("auto_rename")
+check("turning the rename off turns the replace off", bot_settings.get("auto_replace"), False)
 check("turning the rename off turns the files scope off", bot_settings.get("auto_rename_files"), False)
 check("turning the rename off turns the external scope off", bot_settings.get("auto_rename_external"), False)
 toggle("auto_rename")
@@ -1075,7 +1362,11 @@ check("the new settings are saved to disk", ('"notify_external_added"' in stored
 import json
 import re
 locales = {lang: json.load(open(os.path.join(REPO, "locale", f"{lang}.json"), encoding="utf-8")) for lang in ("es", "en")}
-for key in ("BUTTON_SETTING_NOTIFY_EXTERNAL", "BUTTON_SETTING_AUTO_RENAME_EXTERNAL", "BUTTON_SETTING_AUTO_RENAME_FILES",
+for key in ("BUTTON_SETTING_AUTO_REPLACE", "SETTINGS_AUTO_REPLACE", "REPLACE_MODE_AUTO", "REPLACE_MODE_ASK",
+			"REPLACE_HINT_AUTO", "REPLACE_HINT_ASK", "REPLACE_OFFER", "BUTTON_REPLACE", "REPLACE_CONFIRM", "REPLACE_ITEM",
+			"BUTTON_REPLACE_CONFIRM", "REPLACING", "REPLACED", "REPLACED_NOT_RENAMED", "BUTTON_REPLACE_SKIP",
+			"REPLACED_OLD_ONE", "REPLACED_OLD_MANY", "REPLACE_NOTHING", "REPLACE_FAILED",
+			"BUTTON_SETTING_NOTIFY_EXTERNAL", "BUTTON_SETTING_AUTO_RENAME_EXTERNAL", "BUTTON_SETTING_AUTO_RENAME_FILES",
 			"NOTIFY_EXTERNAL_ADDED", "SETTINGS_AUTO_RENAME", "SETTINGS_AUTO_RENAME_ON", "AUTO_RENAME_SCOPE_TORRENT",
 			"AUTO_RENAME_SCOPE_FILES", "AUTO_RENAME_SOURCE_BOT", "AUTO_RENAME_SOURCE_ALL"):
 	check(f"{key} exists in both languages", all(key in texts_ for texts_ in locales.values()), True)
