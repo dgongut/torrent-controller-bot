@@ -16,6 +16,7 @@ import re
 import sys
 import tempfile
 import time
+from datetime import datetime
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
@@ -1115,6 +1116,50 @@ check("once off nothing is counted", pending_usage(), {})
 press(bot_module.build_call("toggleTelemetry"))
 check("the switch turns them back on", bot_module.telemetry_on(), True)
 bot_module._config_persistent = None
+
+# The torrent screen condenses the seeding and swarm details into the lines
+# they belong to, and leaves out whatever the client does not know
+def detail_text(**changes):
+	torrent = fake_torrent()
+	for key, value in changes.items():
+		setattr(torrent, key, value)
+	real_get_torrent = bot_module.client.get_torrent
+	bot_module.client.get_torrent = lambda torrent_id: torrent
+	try:
+		return bot_module.build_detail(TORRENT_ID, config.FILTER_ALL, 0)[0]
+	finally:
+		bot_module.client.get_torrent = real_get_torrent
+
+
+get_text = bot_module.get_text
+now = int(time.time())
+seeding = detail_text(ratio_limit=2.0, seeding_time=3 * 3600, seeding_time_limit=7 * 86400, eta=2 * 3600,
+	swarm_seeders=42, swarm_leechers=7, seeders=1, leechers=2, peers=3, private=True,
+	tracker_error="Unregistered <torrent>", added_date=now - 86400, completed_date=now - 3600,
+	last_activity=now - 5400, upload_rate=0)
+check("the ratio carries its limit", f"{get_text('INFO_RATIO')}: 0.5 {get_text('INFO_RATIO_LIMIT', '2')}" in seeding, True)
+check("the seeding line has time, limit and time left",
+	f"{get_text('INFO_SEEDING_TIME')}: 3h 0m {get_text('INFO_SEEDING_TIME_LIMIT', '7d 0h')} {get_text('INFO_SEEDING_LEFT', '2h 0m')}" in seeding, True)
+check("the peers line has the whole swarm", get_text("INFO_PEERS_DETAIL_SWARM", 1, 42, 2, 7) in seeding, True)
+check("the tracker line says it is private", get_text("INFO_PRIVATE") in seeding, True)
+check("the tracker error is escaped", "Unregistered &lt;torrent&gt;" in seeding, True)
+check("the added line has the completion date",
+	get_text("INFO_COMPLETED", datetime.fromtimestamp(now - 3600).strftime("%Y-%m-%d %H:%M")) in seeding, True)
+check("the status says how long it has been idle", get_text("INFO_IDLE", "1h 30m") in seeding, True)
+check("no download eta while seeding", get_text("INFO_ETA") in seeding, False)
+
+plain = detail_text()
+for key in ("INFO_RATIO_LIMIT", "INFO_SEEDING_TIME", "INFO_PRIVATE", "INFO_IDLE", "INFO_AVAILABILITY"):
+	check(f"nothing unknown is shown ({key})", get_text(key).split("$")[0].strip() in plain, False)
+check("the peers line falls back to the connected ones", get_text("INFO_PEERS_DETAIL", 0, 0) in plain, True)
+
+downloading = detail_text(status=TorrentStatus.DOWNLOADING, progress=40.0, availability=0.857, eta=600,
+	seeding_time=0, download_rate=100, last_activity=now - 5400, swarm_seeders=0, swarm_leechers=-1, seeders=1)
+check("the progress carries the availability", get_text("INFO_AVAILABILITY", "0.86") in downloading, True)
+check("a transferring torrent is not idle", get_text("INFO_IDLE", "1h 30m") in downloading, False)
+check("no seeding line before it seeds", get_text("INFO_SEEDING_TIME") in downloading, False)
+check("the download eta stays", f"{get_text('INFO_ETA')}: 10m" in downloading, True)
+check("a half known swarm is left out", get_text("INFO_PEERS_DETAIL", 1, 0) in downloading, True)
 
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")

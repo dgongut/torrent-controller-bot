@@ -28,6 +28,8 @@ FULL_FIELDS = LIGHT_FIELDS + [
 	"totalSize", "downloadedEver", "uploadedEver", "uploadRatio", "eta",
 	"peersConnected", "peersSendingToUs", "peersGettingFromUs",
 	"files", "isFinished",
+	"secondsSeeding", "doneDate", "activityDate", "seedRatioLimit", "seedRatioMode",
+	"isPrivate", "trackerStats",
 	# get_files() combines these three: without them it raises KeyError
 	"fileStats", "priorities", "wanted",
 ]
@@ -37,6 +39,10 @@ SUMMARY_FIELDS = ["id", "status", "error", "percentDone", "rateDownload", "rateU
 # Generous timeout for move orders: the daemon can be slow to answer the RPC
 # while it is relocating large amounts of data
 MOVE_RPC_TIMEOUT = 300
+
+# seedRatioMode: follow the session setting, this torrent's own limit, or none
+SEED_RATIO_GLOBAL = 0
+SEED_RATIO_SINGLE = 1
 
 # Transmission status (string) -> normalized status
 STATUS_MAP = {
@@ -97,7 +103,37 @@ class TransmissionClient(TorrentClient):
 		status = str(torrent.status)
 		return STATUS_MAP.get(status, TorrentStatus.PAUSED)
 
-	def _to_info(self, torrent, full=False):
+	def _ratio_limit(self, torrent, session_limit):
+		mode = self._raw(torrent, "seedRatioMode", -1)
+		if mode == SEED_RATIO_SINGLE:
+			return self._raw(torrent, "seedRatioLimit", -1)
+		if mode == SEED_RATIO_GLOBAL:
+			return session_limit
+		return -1
+
+	def _tracker_stats(self, torrent):
+		"""Swarm size as the trackers report it, and the answer of the first one
+		that fails when none of them works (empty while any of them answers)"""
+		seeders, leechers, errors, working = -1, -1, [], False
+		for stat in self._raw(torrent, "trackerStats", []) or []:
+			seeders = max(seeders, stat.get("seederCount", -1))
+			leechers = max(leechers, stat.get("leecherCount", -1))
+			if stat.get("lastAnnounceSucceeded"):
+				working = True
+			elif stat.get("hasAnnounced") and stat.get("lastAnnounceResult"):
+				errors.append(stat["lastAnnounceResult"])
+		return seeders, leechers, "" if working or not errors else errors[0]
+
+	def _session_ratio_limit(self):
+		try:
+			session = self.client.get_session()
+		except Exception:
+			return -1
+		if not session.fields.get("seedRatioLimited"):
+			return -1
+		return session.fields.get("seedRatioLimit", -1)
+
+	def _to_info(self, torrent, full=False, session_ratio_limit=-1):
 		files = []
 		if full:
 			try:
@@ -115,6 +151,7 @@ class TransmissionClient(TorrentClient):
 			if host and host not in trackers:
 				trackers.append(host)
 		eta = self._raw(torrent, "eta", -1)
+		swarm_seeders, swarm_leechers, tracker_error = self._tracker_stats(torrent)
 		info = TorrentInfo(
 			id=self._raw(torrent, "hashString", "") or "",
 			name=torrent.name,
@@ -127,12 +164,20 @@ class TransmissionClient(TorrentClient):
 			upload_rate=self._raw(torrent, "rateUpload", 0),
 			eta=eta if eta is not None and eta >= 0 else -1,
 			ratio=round(self._raw(torrent, "uploadRatio", 0) or 0, 2),
+			ratio_limit=self._ratio_limit(torrent, session_ratio_limit),
+			seeding_time=self._raw(torrent, "secondsSeeding", -1),
 			peers=self._raw(torrent, "peersConnected", 0),
 			seeders=self._raw(torrent, "peersSendingToUs", 0),
 			leechers=self._raw(torrent, "peersGettingFromUs", 0),
+			swarm_seeders=swarm_seeders,
+			swarm_leechers=swarm_leechers,
 			download_dir=self._raw(torrent, "downloadDir", "") or "",
 			error_message=self._raw(torrent, "errorString", "") or "",
+			tracker_error=tracker_error,
+			private=bool(self._raw(torrent, "isPrivate", False)),
 			added_date=self._raw(torrent, "addedDate", None),
+			completed_date=self._raw(torrent, "doneDate", 0) or None,  # 0 while not done
+			last_activity=self._raw(torrent, "activityDate", 0) or None,  # 0 never
 			files=files,
 			trackers=trackers,
 		)
@@ -215,7 +260,7 @@ class TransmissionClient(TorrentClient):
 			return None
 		except Exception as e:
 			raise TorrentClientError(f"Error getting torrent {torrent_id}: {e}")
-		return self._to_info(torrent, full=True)
+		return self._to_info(torrent, full=True, session_ratio_limit=self._session_ratio_limit())
 
 	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		try:

@@ -21,6 +21,7 @@ from torrent_clients.base import (
 
 REQUEST_TIMEOUT = 15
 MOVE_RPC_TIMEOUT = 60
+TRACKER_ERROR_PREFIX = "Error: "  # tracker_status is "Announce OK", "Error: <tracker answer>"...
 
 STATUS_MAP = {
 	"Downloading": TorrentStatus.DOWNLOADING,
@@ -41,6 +42,8 @@ LIGHT_KEYS = [
 FULL_KEYS = LIGHT_KEYS + [
 	"total_done", "total_uploaded", "eta", "ratio", "num_peers", "num_seeds",
 	"files", "file_progress", "trackers",
+	"seeding_time", "stop_ratio", "stop_at_ratio", "total_seeds", "total_peers",
+	"distributed_copies", "tracker_status", "private", "completed_time", "time_since_transfer",
 ]
 
 
@@ -113,6 +116,8 @@ class DelugeClient(TorrentClient):
 				trackers.append(host)
 		eta = t.get("eta", -1)
 		state = t.get("state", "")
+		tracker_status = t.get("tracker_status", "") or ""
+		since_transfer = t.get("time_since_transfer", -1)  # Deluge 2.0+, -1 never
 		return TorrentInfo(
 			id=torrent_hash,
 			name=t.get("name", ""),
@@ -125,12 +130,21 @@ class DelugeClient(TorrentClient):
 			upload_rate=t.get("upload_payload_rate", 0),
 			eta=eta if eta and eta > 0 else -1,
 			ratio=round(float(t.get("ratio", 0) or 0), 2),
+			ratio_limit=t.get("stop_ratio", -1) if t.get("stop_at_ratio") else -1,
+			seeding_time=t.get("seeding_time", -1),
 			peers=t.get("num_peers", 0) + t.get("num_seeds", 0),
 			seeders=t.get("num_seeds", 0),
 			leechers=t.get("num_peers", 0),
+			swarm_seeders=t.get("total_seeds", -1),
+			swarm_leechers=t.get("total_peers", -1),
+			availability=t.get("distributed_copies", -1),
 			download_dir=t.get("save_path", "") or "",
 			error_message=t.get("message", "") if state == "Error" else "",
+			tracker_error=tracker_status[len(TRACKER_ERROR_PREFIX):] if tracker_status.startswith(TRACKER_ERROR_PREFIX) else "",
+			private=bool(t.get("private", False)),
 			added_date=t.get("time_added", None),
+			completed_date=t.get("completed_time", 0) or None,  # Deluge 2.0+, 0 while not done
+			last_activity=int(time.time()) - since_transfer if since_transfer is not None and since_transfer >= 0 else None,
 			files=files,
 			trackers=trackers,
 		)

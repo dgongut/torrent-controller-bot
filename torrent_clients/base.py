@@ -129,16 +129,26 @@ class TorrentInfo:
 	uploaded: int = 0  # bytes
 	download_rate: int = 0  # bytes/s
 	upload_rate: int = 0  # bytes/s
-	eta: int = -1  # seconds, -1 unknown
+	eta: int = -1  # seconds, -1 unknown. While seeding: until the seeding limit is reached
 	ratio: float = 0.0
+	ratio_limit: float = -1.0  # ratio at which the client stops seeding, -1 none or unknown
+	seeding_time: int = -1  # seconds spent seeding, -1 unknown
+	seeding_time_limit: int = -1  # seconds of seeding before the client stops it, -1 none or unknown
 	peers: int = 0
 	seeders: int = 0  # connected peers that have the whole torrent
 	leechers: int = 0  # connected peers still downloading
+	swarm_seeders: int = -1  # seeders in the whole swarm as the tracker reports them, -1 unknown
+	swarm_leechers: int = -1  # leechers in the whole swarm as the tracker reports them, -1 unknown
+	availability: float = -1.0  # distributed copies among connected peers, -1 unknown
 	download_dir: str = ""
 	category: str = ""  # Managers without categories leave it empty
 	auto_managed: bool = False  # The manager decides the location (qBittorrent auto_tmm)
 	error_message: str = ""
-	added_date: object = None  # datetime
+	tracker_error: str = ""  # Message of the tracker when none of them answers right (e.g. Unregistered torrent)
+	private: bool = False
+	added_date: object = None  # unix timestamp
+	completed_date: object = None  # unix timestamp, None while not finished or unknown
+	last_activity: object = None  # unix timestamp of the last transfer, None never or unknown
 	files: list = field(default_factory=list)  # list of (path, size, completed)
 	trackers: list = field(default_factory=list)  # list of tracker hostnames
 

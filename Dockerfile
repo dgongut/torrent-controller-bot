@@ -3,7 +3,7 @@ ARG BASE_IMAGE=alpine:3.24.2
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
 
-ARG VERSION=1.10.0
+ARG VERSION=1.10.1
 
 # Standard OCI labels. The version comes from the same VERSION that picks the
 # source tag below, so it cannot say one thing and contain another; it is
@@ -43,10 +43,11 @@ RUN apk add --no-cache python3 py3-pip tzdata curl unzip && \
     export PIP_BREAK_SYSTEM_PACKAGES=1 && \
     pip3 install --no-cache-dir -Ur /app/requirements.txt
 
-# Health check: unhealthy when Telegram has not answered a poll for 2 minutes
+# Health check: unhealthy when Telegram has not answered a poll for 10 minutes
+# (long enough to ride out the few-minute outages Telegram has most nights)
 # (the bot touches the file on every poll, see HEARTBEAT_PATH in config.py)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python3 -c "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/torrent-controller-bot.heartbeat') > 120)"
+    CMD python3 -c "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/torrent-controller-bot.heartbeat') > 600)"
 
 ENTRYPOINT ["python3", "torrent-controller-bot.py"]
 

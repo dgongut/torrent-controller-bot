@@ -25,7 +25,7 @@ import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -851,19 +851,50 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 	emoji = STATUS_EMOJI.get(torrent.status, "")
 	status_label = get_text(STATUS_TEXT_KEY.get(torrent.status, "STATUS_ALL"))
 	lines = [f"<b>{html.escape(torrent.name)}</b>", ""]
-	lines.append(f"{get_text('INFO_STATUS')}: {emoji} {status_label}")
-	lines.append(f"{get_text('INFO_PROGRESS')}: {torrent.progress:.1f}%")
+	status_text = f"{get_text('INFO_STATUS')}: {emoji} {status_label}"
+	idle = torrent.status in (TorrentStatus.DOWNLOADING, TorrentStatus.SEEDING) and not torrent.download_rate and not torrent.upload_rate
+	if idle and torrent.last_activity:
+		status_text += f" · {get_text('INFO_IDLE', format_eta(max(int(time.time() - torrent.last_activity), 0)))}"
+	lines.append(status_text)
+	progress_text = f"{get_text('INFO_PROGRESS')}: {torrent.progress:.1f}%"
+	if torrent.status == TorrentStatus.DOWNLOADING and torrent.availability >= 0:
+		progress_text += f" · {get_text('INFO_AVAILABILITY', f'{round(torrent.availability, 2):g}')}"
+	lines.append(progress_text)
 	lines.append(f"{get_text('INFO_SIZE')}: {sizeof_fmt(torrent.total_size)}")
 	lines.append(f"{get_text('INFO_DOWNLOADED')}: {sizeof_fmt(torrent.downloaded)} (🔽 {sizeof_fmt(torrent.download_rate)}/s)")
 	lines.append(f"{get_text('INFO_UPLOADED')}: {sizeof_fmt(torrent.uploaded)} (🔼 {sizeof_fmt(torrent.upload_rate)}/s)")
-	lines.append(f"{get_text('INFO_RATIO')}: {torrent.ratio}")
+	ratio_text = f"{get_text('INFO_RATIO')}: {torrent.ratio}"
+	if torrent.ratio_limit >= 0:
+		ratio_text += f" {get_text('INFO_RATIO_LIMIT', f'{torrent.ratio_limit:g}')}"
+	lines.append(ratio_text)
 	if torrent.status == TorrentStatus.DOWNLOADING:
 		lines.append(f"{get_text('INFO_ETA')}: {format_eta(torrent.eta)}")
-	lines.append(f"{get_text('INFO_PEERS')}: {torrent.peers} {get_text('INFO_PEERS_DETAIL', torrent.seeders, torrent.leechers)}")
+	# While seeding, the eta is the time left until the seeding limit stops it
+	seeding_left = torrent.eta if torrent.status == TorrentStatus.SEEDING else -1
+	if torrent.seeding_time > 0 or seeding_left >= 0:
+		seeding_text = f"{get_text('INFO_SEEDING_TIME')}: {format_eta(torrent.seeding_time)}"
+		if torrent.seeding_time_limit > 0:
+			seeding_text += f" {get_text('INFO_SEEDING_TIME_LIMIT', format_eta(torrent.seeding_time_limit))}"
+		if seeding_left >= 0:
+			seeding_text += f" {get_text('INFO_SEEDING_LEFT', format_eta(seeding_left))}"
+		lines.append(seeding_text)
+	if torrent.swarm_seeders >= 0 and torrent.swarm_leechers >= 0:
+		# The swarm can never be smaller than what we are connected to
+		peers_detail = get_text("INFO_PEERS_DETAIL_SWARM",
+			torrent.seeders, max(torrent.swarm_seeders, torrent.seeders),
+			torrent.leechers, max(torrent.swarm_leechers, torrent.leechers))
+	else:
+		peers_detail = get_text("INFO_PEERS_DETAIL", torrent.seeders, torrent.leechers)
+	lines.append(f"{get_text('INFO_PEERS')}: {torrent.peers} {peers_detail}")
 	if torrent.trackers:
 		tracker_text = html.escape(torrent.trackers[0])
 		if len(torrent.trackers) > 1:
 			tracker_text += f" {get_text('INFO_TRACKER_AND_MORE', len(torrent.trackers) - 1)}"
+		if torrent.private:
+			tracker_text += f" · {get_text('INFO_PRIVATE')}"
+		# Transmission also turns it into the error of the torrent, shown below
+		if torrent.tracker_error and torrent.tracker_error != torrent.error_message:
+			tracker_text += f" · ⚠️ <code>{html.escape(torrent.tracker_error)}</code>"
 		lines.append(f"{get_text('INFO_TRACKER')}: {tracker_text}")
 	if client.supports_categories:
 		category_text = html.escape(torrent.category) if torrent.category else get_text("CATEGORY_NONE")
@@ -875,7 +906,11 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 		lines.append(get_text("INFO_CATEGORY_IGNORED"))
 	if torrent.added_date:
 		added = datetime.fromtimestamp(torrent.added_date).strftime("%Y-%m-%d %H:%M")
-		lines.append(f"{get_text('INFO_ADDED')}: {added}")
+		added_text = f"{get_text('INFO_ADDED')}: {added}"
+		if torrent.completed_date:
+			completed = datetime.fromtimestamp(torrent.completed_date).strftime("%Y-%m-%d %H:%M")
+			added_text += f" · {get_text('INFO_COMPLETED', completed)}"
+		lines.append(added_text)
 	if torrent.error_message:
 		lines.append(f"{get_text('INFO_ERROR')}: <code>{html.escape(torrent.error_message)}</code>")
 	show_files = has_browsable_files(torrent)

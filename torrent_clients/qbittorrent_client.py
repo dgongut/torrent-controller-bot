@@ -23,8 +23,26 @@ from torrent_clients.base import (
 REQUEST_TIMEOUT = 15
 MOVE_RPC_TIMEOUT = 60
 ETA_INFINITE = 8640000
+TRACKER_WORKING = 2
+TRACKER_FAILED = (4, 5, 6)  # Not working, tracker error (5.0+), unreachable (5.0+)
 TEMP_TAG_PREFIX = "tcb-"
 TEMP_TAG_RE = re.compile(rf"^{TEMP_TAG_PREFIX}[0-9a-f]{{8}}$")
+
+
+def _num(value, default):
+	return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+
+
+def _limit(value, scale=1):
+	"""A limit as qBittorrent reports it, where any negative value means none"""
+	value = _num(value, -1)
+	return value * scale if value >= 0 else -1
+
+
+def _timestamp(value):
+	value = _num(value, 0)
+	return value if value > 0 else None
+
 
 STATUS_MAP = {
 	"downloading": TorrentStatus.DOWNLOADING,
@@ -102,7 +120,7 @@ class QBittorrentClient(TorrentClient):
 		except TorrentClientError:
 			self._post(f"torrents/{fallback}", data={"hashes": hashes})
 
-	def _to_info(self, t, files=None, trackers=None):
+	def _to_info(self, t, files=None, trackers=None, tracker_error="", swarm=(-1, -1)):
 		if trackers is None:
 			# Light listing: the info payload carries the active tracker URL
 			host = urlparse(t.get("tracker", "") or "").hostname
@@ -126,14 +144,25 @@ class QBittorrentClient(TorrentClient):
 			upload_rate=t.get("upspeed", 0),
 			eta=eta,
 			ratio=round(float(t.get("ratio", 0) or 0), 2),
+			# max_* are the limits that apply, whether set on the torrent or global
+			ratio_limit=_limit(t.get("max_ratio")),
+			seeding_time=_num(t.get("seeding_time"), -1),
+			seeding_time_limit=_limit(t.get("max_seeding_time"), 60),  # minutes
 			peers=t.get("num_leechs", 0) + t.get("num_seeds", 0),
 			seeders=t.get("num_seeds", 0),
 			leechers=t.get("num_leechs", 0),
+			swarm_seeders=swarm[0],
+			swarm_leechers=swarm[1],
+			availability=_num(t.get("availability"), -1),  # -1 once finished
 			download_dir=t.get("save_path", "") or "",
 			category=t.get("category", "") or "",
 			auto_managed=bool(t.get("auto_tmm", False)),
 			error_message=error_message,
+			tracker_error=tracker_error,
+			private=bool(t.get("private", False)),  # qBittorrent 5.0+
 			added_date=t.get("added_on", None),
+			completed_date=_timestamp(t.get("completion_on")),
+			last_activity=_timestamp(t.get("last_activity")),
 			files=files or [],
 			trackers=trackers or [],
 		)
@@ -144,8 +173,13 @@ class QBittorrentClient(TorrentClient):
 		except TorrentClientError:
 			return False
 
-	def _tracker_hosts(self, torrent_hash):
-		trackers = []
+	def _trackers(self, torrent_hash):
+		"""Hostnames of the trackers, the swarm size they report (-1 until one
+		answers: num_complete in the torrent info says 0 instead, and counts
+		peers found through LSD) and the message of the first one that fails
+		when none of them works (empty while any of them answers)"""
+		trackers, errors, working = [], [], False
+		seeders, leechers = -1, -1
 		try:
 			for tracker in self._get("torrents/trackers", params={"hash": torrent_hash}).json():
 				url = tracker.get("url", "")
@@ -154,9 +188,16 @@ class QBittorrentClient(TorrentClient):
 				host = urlparse(url).hostname
 				if host and host not in trackers:
 					trackers.append(host)
+				seeders = max(seeders, _num(tracker.get("num_seeds"), -1))
+				leechers = max(leechers, _num(tracker.get("num_leeches"), -1))
+				status = tracker.get("status")
+				if status == TRACKER_WORKING:
+					working = True
+				elif status in TRACKER_FAILED and tracker.get("msg"):
+					errors.append(tracker["msg"])
 		except TorrentClientError:
 			pass
-		return trackers
+		return trackers, (seeders, leechers), "" if working or not errors else errors[0]
 
 	def test_connection(self):
 		try:
@@ -233,7 +274,8 @@ class QBittorrentClient(TorrentClient):
 			sort_files(files)
 		except TorrentClientError:
 			files = []
-		return self._to_info(t, files=files, trackers=self._tracker_hosts(torrent_id))
+		trackers, swarm, tracker_error = self._trackers(torrent_id)
+		return self._to_info(t, files=files, trackers=trackers, tracker_error=tracker_error, swarm=swarm)
 
 	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		tag = f"{TEMP_TAG_PREFIX}{uuid.uuid4().hex[:8]}"  # Unique tag to find the new hash
