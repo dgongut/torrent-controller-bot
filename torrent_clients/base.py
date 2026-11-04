@@ -22,6 +22,12 @@ class TorrentStatus:
 	ALL = (DOWNLOADING, SEEDING, PAUSED, CHECKING, QUEUED, ERROR)
 
 
+# How the ratio limit of a torrent is decided (TorrentInfo.ratio_limit_mode)
+RATIO_MODE_GLOBAL = "global"  # follows the setting of the manager
+RATIO_MODE_TORRENT = "torrent"  # a limit of its own
+RATIO_MODE_NONE = "none"  # seeds forever
+
+
 class TorrentClientError(Exception):
 	"""Normalized error raised by any torrent client implementation"""
 	pass
@@ -132,6 +138,9 @@ class TorrentInfo:
 	eta: int = -1  # seconds, -1 unknown. While seeding: until the seeding limit is reached
 	ratio: float = 0.0
 	ratio_limit: float = -1.0  # ratio at which the client stops seeding, -1 none or unknown
+	ratio_limit_mode: str = ""  # RATIO_MODE_*, empty when unknown
+	download_limit: int = -1  # KB/s this torrent may download at, -1 none or unknown
+	upload_limit: int = -1  # KB/s this torrent may upload at, -1 none or unknown
 	seeding_time: int = -1  # seconds spent seeding, -1 unknown
 	seeding_time_limit: int = -1  # seconds of seeding before the client stops it, -1 none or unknown
 	peers: int = 0
@@ -179,6 +188,10 @@ class TorrentClient(ABC):
 	supports_rename = True  # Clients that cannot rename the content on disk
 	supports_verify = True  # Clients that cannot recheck the downloaded data
 	supports_categories = False  # Clients with categories/labels bound to a save path
+	supports_ratio_limit = True  # Clients that cannot set the ratio limit of a single torrent, nor the global one
+	ratio_limit_copied_on_add = False  # The global ratio limit is copied into each torrent when added (Deluge)
+	supports_torrent_speed_limit = True  # Clients that cannot limit the speed of a single torrent
+	supports_reannounce = True  # Clients that cannot ask the trackers for peers on demand
 
 	@abstractmethod
 	def test_connection(self):
@@ -228,6 +241,31 @@ class TorrentClient(ABC):
 		On an auto managed torrent this physically moves its data, so it can
 		block for as long as a move does"""
 		raise TorrentClientError("This torrent manager does not support categories")
+
+	def set_ratio_limit(self, torrent_ids, limit):
+		"""Sets the ratio at which the torrents stop seeding: None hands them
+		back to the setting of the manager, -1 lets them seed forever and any
+		other value is a limit of their own. Leaves the seeding time limits
+		as they are"""
+		raise TorrentClientError("This torrent manager does not support ratio limits")
+
+	def set_torrent_speed_limit(self, torrent_ids, direction, kbps):
+		"""Limits the speed of the torrents alone. direction: 'down'|'up';
+		kbps: KB/s, 0 or less removes the limit"""
+		raise TorrentClientError("This torrent manager does not support speed limits per torrent")
+
+	def reannounce_torrents(self, torrent_ids):
+		"""Asks the trackers for peers right now instead of waiting for the next announce"""
+		raise TorrentClientError("This torrent manager does not support reannouncing")
+
+	def get_global_ratio_limit(self):
+		"""Ratio at which the torrents that follow the setting of the manager
+		stop seeding, -1 when they seed forever"""
+		raise TorrentClientError("This torrent manager does not support ratio limits")
+
+	def set_global_ratio_limit(self, limit):
+		"""Sets the ratio of get_global_ratio_limit, -1 to seed forever"""
+		raise TorrentClientError("This torrent manager does not support ratio limits")
 
 	@abstractmethod
 	def remove_torrents(self, torrent_ids, delete_data=False):

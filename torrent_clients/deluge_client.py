@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 import requests
 
 from torrent_clients.base import (
+	RATIO_MODE_NONE,
+	RATIO_MODE_TORRENT,
 	SessionSummary,
 	TorrentClient,
 	TorrentClientError,
@@ -44,11 +46,13 @@ FULL_KEYS = LIGHT_KEYS + [
 	"files", "file_progress", "trackers",
 	"seeding_time", "stop_ratio", "stop_at_ratio", "total_seeds", "total_peers",
 	"distributed_copies", "tracker_status", "private", "completed_time", "time_since_transfer",
+	"max_download_speed", "max_upload_speed",
 ]
 
 
 class DelugeClient(TorrentClient):
 	supports_alt_speed = False
+	ratio_limit_copied_on_add = True
 
 	def __init__(self, host, port, password=None, protocol="http"):
 		self.base_url = f"{protocol}://{host}:{port}/json"
@@ -131,6 +135,10 @@ class DelugeClient(TorrentClient):
 			eta=eta if eta and eta > 0 else -1,
 			ratio=round(float(t.get("ratio", 0) or 0), 2),
 			ratio_limit=t.get("stop_ratio", -1) if t.get("stop_at_ratio") else -1,
+			download_limit=int(t["max_download_speed"]) if (t.get("max_download_speed") or -1) > 0 else -1,
+			upload_limit=int(t["max_upload_speed"]) if (t.get("max_upload_speed") or -1) > 0 else -1,
+			# Deluge copies the global setting into each torrent when adding it
+			ratio_limit_mode=(RATIO_MODE_TORRENT if t.get("stop_at_ratio") else RATIO_MODE_NONE) if "stop_at_ratio" in t else "",
 			seeding_time=t.get("seeding_time", -1),
 			peers=t.get("num_peers", 0) + t.get("num_seeds", 0),
 			seeders=t.get("num_seeds", 0),
@@ -261,6 +269,50 @@ class DelugeClient(TorrentClient):
 					self._call("core.remove_torrent", torrent_id, bool(delete_data))
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error removing torrents: {e}")
+
+	def set_ratio_limit(self, torrent_ids, limit):
+		try:
+			if limit is None:
+				# No torrent follows the global setting in Deluge: it is copied
+				# into each one when added, so going back to it is copying it again
+				config = self._call("core.get_config_values", ["stop_seed_at_ratio", "stop_seed_ratio"]) or {}
+				options = {"stop_at_ratio": bool(config.get("stop_seed_at_ratio")), "stop_ratio": float(config.get("stop_seed_ratio", 2.0))}
+			elif limit < 0:
+				options = {"stop_at_ratio": False}
+			else:
+				options = {"stop_at_ratio": True, "stop_ratio": float(limit)}
+			self._call("core.set_torrent_options", list(torrent_ids), options)
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting ratio limit: {e}")
+
+	def set_torrent_speed_limit(self, torrent_ids, direction, kbps):
+		key = "max_download_speed" if direction == "down" else "max_upload_speed"
+		try:
+			self._call("core.set_torrent_options", list(torrent_ids), {key: float(kbps) if kbps > 0 else -1.0})
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting speed limit: {e}")
+
+	def reannounce_torrents(self, torrent_ids):
+		try:
+			self._call("core.force_reannounce", list(torrent_ids))
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error reannouncing: {e}")
+
+	def get_global_ratio_limit(self):
+		try:
+			config = self._call("core.get_config_values", ["stop_seed_at_ratio", "stop_seed_ratio"]) or {}
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error getting ratio limit: {e}")
+		return float(config.get("stop_seed_ratio", -1)) if config.get("stop_seed_at_ratio") else -1
+
+	def set_global_ratio_limit(self, limit):
+		try:
+			if limit < 0:
+				self._call("core.set_config", {"stop_seed_at_ratio": False})
+			else:
+				self._call("core.set_config", {"stop_seed_at_ratio": True, "stop_seed_ratio": float(limit)})
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting ratio limit: {e}")
 
 	def pause_torrents(self, torrent_ids):
 		try:

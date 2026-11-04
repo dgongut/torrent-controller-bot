@@ -10,6 +10,9 @@ from urllib.parse import urlparse
 import requests
 
 from torrent_clients.base import (
+	RATIO_MODE_GLOBAL,
+	RATIO_MODE_NONE,
+	RATIO_MODE_TORRENT,
 	SessionSummary,
 	TorrentClient,
 	TorrentClientError,
@@ -37,6 +40,23 @@ def _limit(value, scale=1):
 	"""A limit as qBittorrent reports it, where any negative value means none"""
 	value = _num(value, -1)
 	return value * scale if value >= 0 else -1
+
+
+def _ratio_mode(value):
+	"""ratio_limit of a torrent as qBittorrent reports it: -2 follows the
+	global setting, -1 none, anything else a limit of its own"""
+	value = _num(value, None)
+	if value is None:
+		return ""
+	if value == -2:
+		return RATIO_MODE_GLOBAL
+	return RATIO_MODE_NONE if value < 0 else RATIO_MODE_TORRENT
+
+
+def _speed_limit(value):
+	"""A speed limit as qBittorrent reports it (bytes/s, 0 or less none) in KB/s"""
+	value = _num(value, -1)
+	return value // 1024 if value > 0 else -1
 
 
 def _timestamp(value):
@@ -146,6 +166,9 @@ class QBittorrentClient(TorrentClient):
 			ratio=round(float(t.get("ratio", 0) or 0), 2),
 			# max_* are the limits that apply, whether set on the torrent or global
 			ratio_limit=_limit(t.get("max_ratio")),
+			ratio_limit_mode=_ratio_mode(t.get("ratio_limit")),
+			download_limit=_speed_limit(t.get("dl_limit")),
+			upload_limit=_speed_limit(t.get("up_limit")),
 			seeding_time=_num(t.get("seeding_time"), -1),
 			seeding_time_limit=_limit(t.get("max_seeding_time"), 60),  # minutes
 			peers=t.get("num_leechs", 0) + t.get("num_seeds", 0),
@@ -340,6 +363,55 @@ class QBittorrentClient(TorrentClient):
 			})
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error removing torrents: {e}")
+
+	def set_ratio_limit(self, torrent_ids, limit):
+		try:
+			# The same call sets the seeding time limits and, since qBittorrent
+			# 5.x, what to do when one is reached (it refuses the call without
+			# them): each torrent is sent back its own so only the ratio changes
+			current = {t.get("hash"): t for t in self._get("torrents/info", params={"hashes": "|".join(torrent_ids)}).json()}
+			ratio = -2 if limit is None else (-1 if limit < 0 else round(float(limit), 2))
+			for torrent_id in torrent_ids:
+				t = current.get(torrent_id, {})
+				data = {
+					"hashes": torrent_id,
+					"ratioLimit": ratio,
+					"seedingTimeLimit": _num(t.get("seeding_time_limit"), -2),
+					"inactiveSeedingTimeLimit": _num(t.get("inactive_seeding_time_limit"), -2),
+				}
+				for field, param in (("share_limit_action", "shareLimitAction"), ("share_limits_mode", "shareLimitsMode")):
+					if t.get(field):
+						data[param] = t[field]
+				self._post("torrents/setShareLimits", data=data)
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting ratio limit: {e}")
+
+	def set_torrent_speed_limit(self, torrent_ids, direction, kbps):
+		endpoint = "torrents/setDownloadLimit" if direction == "down" else "torrents/setUploadLimit"
+		try:
+			self._post(endpoint, data={"hashes": "|".join(torrent_ids), "limit": int(kbps) * 1024 if kbps > 0 else 0})
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting speed limit: {e}")
+
+	def reannounce_torrents(self, torrent_ids):
+		try:
+			self._post("torrents/reannounce", data={"hashes": "|".join(torrent_ids)})
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error reannouncing: {e}")
+
+	def get_global_ratio_limit(self):
+		try:
+			prefs = self._get("app/preferences").json()
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error getting ratio limit: {e}")
+		return _limit(prefs.get("max_ratio")) if prefs.get("max_ratio_enabled") else -1
+
+	def set_global_ratio_limit(self, limit):
+		try:
+			prefs = {"max_ratio_enabled": False} if limit < 0 else {"max_ratio_enabled": True, "max_ratio": round(float(limit), 2)}
+			self._post("app/setPreferences", data={"json": json.dumps(prefs)})
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error setting ratio limit: {e}")
 
 	def pause_torrents(self, torrent_ids):
 		try:

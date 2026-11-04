@@ -20,16 +20,17 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Listado de torrents con filtros (descargando, compartiendo, pausados, completados, con error...) y paginación
 - ✅ Búsqueda de torrents por nombre o por ruta
 - ✅ Añadir torrents enviando un fichero `.torrent`, un enlace magnet o una URL a un fichero `.torrent`, eligiendo el directorio de descarga
-- ✅ Pausar, reanudar, verificar y borrar torrents (con o sin sus datos)
+- ✅ Pausar, reanudar, verificar, reanunciar al tracker y borrar torrents (con o sin sus datos)
 - ✅ Mover torrents de directorio con aviso al terminar el movimiento
+- ✅ Límites por torrent: hasta qué ratio compartir cada uno (el del gestor, sin límite, 0.5, 1, 2 u otro valor) y su velocidad de bajada y subida, y el ratio del propio gestor desde los ajustes
 - ✅ Renombrado con sugerencia automática para películas y series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
 - ✅ Renombrado de las carpetas y archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
 - ✅ Series completas: renombra de una vez la carpeta, las subcarpetas de temporada y los episodios
-- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar o mover todos
+- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar, mover todos o fijarles el límite de ratio
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
-- ✅ Notificaciones de descarga completada, de errores en torrents y de torrents añadidos fuera del bot (activables desde los ajustes)
+- ✅ Notificaciones de descarga completada, de errores en torrents, de torrents añadidos fuera del bot y de torrents que dejan de compartir al llegar a su límite de ratio, con un botón para que sigan compartiendo (activables desde los ajustes)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
 - ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene y de los torrents añadidos fuera del bot (activable desde los ajustes)
 - ✅ Sustituir una versión anterior: si el nombre que le toca a una descarga ya lo tiene otro torrent, al terminar te ofrece borrar el anterior (con sus datos) y quedarte con el nuevo, o lo hace sin preguntar si lo activas
@@ -67,7 +68,7 @@ Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu
 | `/list` | Listado completo de torrents con filtros y paginación |
 | `/find texto` | Busca torrents por nombre o por ruta, sin importar mayúsculas ni tildes. Cada palabra puede ir en cualquier orden (`/find casa papel` encuentra `La.Casa.de.Papel`); una ruta tiene que aparecer tal cual (`/find /ssd/peliculas` no encuentra `/media/Peliculas`) y lo que va entre comillas, como frase exacta (`/find "la casa"`) |
 | `/add` | Añade un torrent (también puedes enviar directamente un fichero `.torrent` o un enlace magnet) |
-| `/settings` | Ajustes del gestor: modo tortuga y límites de velocidad |
+| `/settings` | Ajustes del gestor: modo tortuga, límites de velocidad y ratio |
 | `/version` | Muestra la versión actual y el gestor al que está conectado |
 | `/help` | Lista de comandos |
 | `/donate` `/donors` | Dona al desarrollador / lista de donantes |
@@ -167,6 +168,9 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Espacio libre y aviso de disco | ✅ | ✅ | ✅ | ✅ |
 | Límites de velocidad | ✅ | ✅ | ✅ | ✅ |
 | Velocidad alternativa (modo tortuga) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
+| Límite de ratio, por torrent y del gestor | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
+| Límite de velocidad por torrent | ✅ | ✅ | ✅ | ❌ ⁶ |
+| Reanunciar al tracker | ✅ | ✅ | ✅ | ❌ ⁷ |
 | Verificar los datos | ✅ | ✅ | ✅ | ❌ ² |
 | Renombrado inteligente, manual y automático | ✅ | ✅ | ✅ | ❌ ³ |
 | Categorías | ❌ ⁴ | ✅ | ❌ ⁴ | ❌ ⁴ |
@@ -178,6 +182,12 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 ⁴ Las categorías son un concepto de qBittorrent: cada una lleva asociada una carpeta, y un torrent en **gestión automática** (*Automatic Torrent Management*) saca su carpeta de su categoría, de modo que cambiársela mueve los ficheros. Por eso el bot no ofrece las dos cosas a la vez: en un torrent auto-gestionado el botón de mover se sustituye por el de categoría, y mover a mano queda disponible dentro de esa pantalla avisando de que el torrent pasa a modo manual. Transmission y Deluge tienen etiquetas, pero son etiquetas sueltas sin carpeta asociada (en Deluge hace falta además el plugin Label), así que el bot no las usa.
 
 ³ La API de Download Station no tiene ningún campo para el nombre de una tarea ni de los ficheros que contiene: lo único editable de una tarea es su destino. Se puede renombrar en disco con File Station, pero entonces la tarea deja de encontrar sus ficheros y se rompe en la siguiente verificación de DSM (un reinicio del NAS, del paquete, o una pausa y reanudación), así que el bot no lo hace. Es la misma limitación que tiene la propia interfaz de DSM, donde tampoco se puede renombrar una descarga.
+
+⁵ Deluge no tiene torrents que «sigan» el ajuste global: lo copia en cada torrent al añadirlo. Elegir «El del gestor» vuelve a copiar el ajuste global actual en ese torrent, y cambiar el ratio del gestor desde los ajustes solo afecta a los torrents que se añadan después.
+
+⁶ Download Station solo tiene ratio y límites de velocidad globales en sus ajustes; su API no permite cambiarlos para una tarea concreta.
+
+⁷ La API de Download Station no tiene ninguna forma de pedir pares al tracker a demanda.
 
 ## Download Station de Synology
 

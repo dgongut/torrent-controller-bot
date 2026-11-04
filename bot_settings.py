@@ -16,6 +16,7 @@ DEFAULTS = {
 	"notify_completed": True,
 	"notify_errors": True,
 	"notify_external_added": False,  # Torrents added outside the bot (other apps, the manager's UI...)
+	"notify_ratio_reached": True,  # A torrent stopped seeding because it reached its ratio limit
 	"auto_download": False,
 	"auto_download_dir": "",  # "" = torrent client default dir
 	"auto_category": "",  # "" = none; takes over the dir on clients with categories

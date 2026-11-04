@@ -6,6 +6,9 @@ from urllib.parse import urlparse
 import transmission_rpc
 
 from torrent_clients.base import (
+	RATIO_MODE_GLOBAL,
+	RATIO_MODE_NONE,
+	RATIO_MODE_TORRENT,
 	PermanentTorrentError,
 	SessionSummary,
 	TorrentClient,
@@ -29,6 +32,7 @@ FULL_FIELDS = LIGHT_FIELDS + [
 	"peersConnected", "peersSendingToUs", "peersGettingFromUs",
 	"files", "isFinished",
 	"secondsSeeding", "doneDate", "activityDate", "seedRatioLimit", "seedRatioMode",
+	"downloadLimit", "downloadLimited", "uploadLimit", "uploadLimited",
 	"isPrivate", "trackerStats",
 	# get_files() combines these three: without them it raises KeyError
 	"fileStats", "priorities", "wanted",
@@ -43,6 +47,8 @@ MOVE_RPC_TIMEOUT = 300
 # seedRatioMode: follow the session setting, this torrent's own limit, or none
 SEED_RATIO_GLOBAL = 0
 SEED_RATIO_SINGLE = 1
+SEED_RATIO_UNLIMITED = 2
+RATIO_MODES = {SEED_RATIO_GLOBAL: RATIO_MODE_GLOBAL, SEED_RATIO_SINGLE: RATIO_MODE_TORRENT, SEED_RATIO_UNLIMITED: RATIO_MODE_NONE}
 
 # Transmission status (string) -> normalized status
 STATUS_MAP = {
@@ -165,6 +171,9 @@ class TransmissionClient(TorrentClient):
 			eta=eta if eta is not None and eta >= 0 else -1,
 			ratio=round(self._raw(torrent, "uploadRatio", 0) or 0, 2),
 			ratio_limit=self._ratio_limit(torrent, session_ratio_limit),
+			ratio_limit_mode=RATIO_MODES.get(self._raw(torrent, "seedRatioMode", -1), ""),
+			download_limit=self._raw(torrent, "downloadLimit", -1) if self._raw(torrent, "downloadLimited") else -1,
+			upload_limit=self._raw(torrent, "uploadLimit", -1) if self._raw(torrent, "uploadLimited") else -1,
 			seeding_time=self._raw(torrent, "secondsSeeding", -1),
 			peers=self._raw(torrent, "peersConnected", 0),
 			seeders=self._raw(torrent, "peersSendingToUs", 0),
@@ -278,6 +287,56 @@ class TransmissionClient(TorrentClient):
 			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error adding torrent: {e}")
+
+	def set_ratio_limit(self, torrent_ids, limit):
+		try:
+			if limit is None:
+				kwargs = {"seed_ratio_mode": SEED_RATIO_GLOBAL}
+			elif limit < 0:
+				kwargs = {"seed_ratio_mode": SEED_RATIO_UNLIMITED}
+			else:
+				kwargs = {"seed_ratio_mode": SEED_RATIO_SINGLE, "seed_ratio_limit": float(limit)}
+			self.client.change_torrent(rpc_ids(torrent_ids), **kwargs)
+		except PermanentTorrentError:
+			raise
+		except Exception as e:
+			raise TorrentClientError(f"Error setting ratio limit: {e}")
+
+	def set_torrent_speed_limit(self, torrent_ids, direction, kbps):
+		try:
+			key = "download" if direction == "down" else "upload"
+			kwargs = {f"{key}_limited": kbps > 0}
+			if kbps > 0:
+				kwargs[f"{key}_limit"] = int(kbps)
+			self.client.change_torrent(rpc_ids(torrent_ids), **kwargs)
+		except PermanentTorrentError:
+			raise
+		except Exception as e:
+			raise TorrentClientError(f"Error setting speed limit: {e}")
+
+	def reannounce_torrents(self, torrent_ids):
+		try:
+			self.client.reannounce_torrent(rpc_ids(torrent_ids))
+		except PermanentTorrentError:
+			raise
+		except Exception as e:
+			raise TorrentClientError(f"Error reannouncing: {e}")
+
+	def get_global_ratio_limit(self):
+		try:
+			session = self.client.get_session()
+			return session.fields.get("seedRatioLimit", -1) if session.fields.get("seedRatioLimited") else -1
+		except Exception as e:
+			raise TorrentClientError(f"Error getting ratio limit: {e}")
+
+	def set_global_ratio_limit(self, limit):
+		try:
+			if limit < 0:
+				self.client.set_session(seed_ratio_limited=False)
+			else:
+				self.client.set_session(seed_ratio_limited=True, seed_ratio_limit=float(limit))
+		except Exception as e:
+			raise TorrentClientError(f"Error setting ratio limit: {e}")
 
 	def remove_torrents(self, torrent_ids, delete_data=False):
 		try:

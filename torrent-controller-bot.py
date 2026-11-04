@@ -20,12 +20,12 @@ from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue, describe_error
 from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
-from torrent_clients import PermanentTorrentError, TorrentClientError, TorrentStatus, content_root, create_client
+from torrent_clients import PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, content_root, create_client
 import bot_settings
 import config as _config_module
 import telemetry
 
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -795,6 +795,8 @@ def build_list(filter_key, page, refreshing=False):
 			InlineKeyboardButton(get_text("BUTTON_MASS_DELETE"), callback_data=build_call("mass", "delete", filter_key)),
 			InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key)),
 		)
+		if client.supports_ratio_limit:
+			markup.row(InlineKeyboardButton(get_text("BUTTON_MASS_RATIO"), callback_data=build_call("mass", "ratio", filter_key)))
 
 	markup.row(*live_buttons(refreshing, build_call("list", filter_key, page),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
@@ -861,8 +863,10 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 		progress_text += f" · {get_text('INFO_AVAILABILITY', f'{round(torrent.availability, 2):g}')}"
 	lines.append(progress_text)
 	lines.append(f"{get_text('INFO_SIZE')}: {sizeof_fmt(torrent.total_size)}")
-	lines.append(f"{get_text('INFO_DOWNLOADED')}: {sizeof_fmt(torrent.downloaded)} (🔽 {sizeof_fmt(torrent.download_rate)}/s)")
-	lines.append(f"{get_text('INFO_UPLOADED')}: {sizeof_fmt(torrent.uploaded)} (🔼 {sizeof_fmt(torrent.upload_rate)}/s)")
+	down_cap = f" · {get_text('INFO_SPEED_LIMIT', speed_limit_text(torrent.download_limit))}" if torrent.download_limit > 0 else ""
+	up_cap = f" · {get_text('INFO_SPEED_LIMIT', speed_limit_text(torrent.upload_limit))}" if torrent.upload_limit > 0 else ""
+	lines.append(f"{get_text('INFO_DOWNLOADED')}: {sizeof_fmt(torrent.downloaded)} (🔽 {sizeof_fmt(torrent.download_rate)}/s{down_cap})")
+	lines.append(f"{get_text('INFO_UPLOADED')}: {sizeof_fmt(torrent.uploaded)} (🔼 {sizeof_fmt(torrent.upload_rate)}/s{up_cap})")
 	ratio_text = f"{get_text('INFO_RATIO')}: {torrent.ratio}"
 	if torrent.ratio_limit >= 0:
 		ratio_text += f" {get_text('INFO_RATIO_LIMIT', f'{torrent.ratio_limit:g}')}"
@@ -929,10 +933,13 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 		toggle = InlineKeyboardButton(get_text("BUTTON_RESUME"), callback_data=build_call("resume", torrent.id, filter_key, page))
 	else:
 		toggle = InlineKeyboardButton(get_text("BUTTON_PAUSE"), callback_data=build_call("pause", torrent.id, filter_key, page))
+	first_row = [toggle]
 	if client.supports_verify:
-		markup.row(toggle, InlineKeyboardButton(get_text("BUTTON_VERIFY"), callback_data=build_call("verify", torrent.id, filter_key, page)))
-	else:
-		markup.row(toggle)
+		first_row.append(InlineKeyboardButton(get_text("BUTTON_VERIFY"), callback_data=build_call("verify", torrent.id, filter_key, page)))
+	# Only an active torrent announces, and only if it has a tracker to ask
+	if client.supports_reannounce and torrent.trackers and torrent.status in (TorrentStatus.DOWNLOADING, TorrentStatus.SEEDING):
+		first_row.append(InlineKeyboardButton(get_text("BUTTON_REANNOUNCE"), callback_data=build_call("reannounce", torrent.id, filter_key, page)))
+	markup.row(*first_row)
 	action_row = []
 	if client.supports_rename:
 		action_row.append(InlineKeyboardButton(get_text(rename_key(torrent, "BUTTON_RENAME")), callback_data=build_call("rename", torrent.id, filter_key, page)))
@@ -943,9 +950,15 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 		action_row.append(InlineKeyboardButton(get_text("BUTTON_MOVE"), callback_data=build_call("move", torrent.id, filter_key, page)))
 	if action_row:
 		markup.row(*action_row)
+	limits_row = []
 	if client.supports_categories:
 		cat_ctx = new_nav_context(torrent.id, filter_key, page)
-		markup.row(InlineKeyboardButton(get_text("BUTTON_CATEGORY"), callback_data=build_call("catMenu", cat_ctx)))
+		limits_row.append(InlineKeyboardButton(get_text("BUTTON_CATEGORY"), callback_data=build_call("catMenu", cat_ctx)))
+	if client.supports_ratio_limit or client.supports_torrent_speed_limit:
+		ratio_ctx = new_nav_context(torrent.id, filter_key, page)
+		limits_row.append(InlineKeyboardButton(get_text("BUTTON_RATIO_LIMIT"), callback_data=build_call("ratioMenu", ratio_ctx)))
+	if limits_row:
+		markup.row(*limits_row)
 	# The file screen only exists to rename folders and files one by one
 	if show_files and client.supports_rename:
 		files_ctx = new_nav_context(torrent.id, filter_key, page)
@@ -1563,6 +1576,87 @@ def build_torrent_category_screen(torrent, filter_key, page, cat_page=0):
 
 
 # ---------------------------------------------------------------------------
+# RATIO LIMIT
+# ---------------------------------------------------------------------------
+
+RATIO_PRESETS = (0.5, 1, 2)
+MAX_RATIO_LIMIT = 9998  # The highest qBittorrent accepts
+
+
+def ratio_limit_label(torrent):
+	"""What decides when the torrent stops seeding, in words"""
+	limit = f"{torrent.ratio_limit:g}" if torrent.ratio_limit >= 0 else get_text("NO_LIMIT")
+	if torrent.ratio_limit_mode == RATIO_MODE_GLOBAL:
+		return get_text("RATIO_GLOBAL_VALUE", limit)
+	return limit
+
+
+def parse_ratio(text):
+	"""Ratio typed by the user (a comma works as decimal separator too), or
+	None when it is not a valid limit"""
+	try:
+		value = float(text.strip().replace(",", "."))
+	except ValueError:
+		return None
+	if not 0 <= value <= MAX_RATIO_LIMIT or value != value:
+		return None
+	return round(value, 2)
+
+
+def ratio_option_rows(limit, selected, set_call, ask_call, with_global=False):
+	"""The choice of ratio limit shared by a torrent and the settings: limit is
+	the one in force and selected the option it came from ("g" the manager's,
+	"n" none, "v" a value, "" unknown)"""
+	def option(text, value, chosen):
+		return InlineKeyboardButton(("✅ " if chosen else "") + text, callback_data=set_call(value))
+
+	first = [option(get_text("BUTTON_RATIO_NONE"), "n", selected == "n")]
+	if with_global:
+		first.insert(0, option(get_text("BUTTON_RATIO_GLOBAL"), "g", selected == "g"))
+	custom = selected == "v" and limit not in RATIO_PRESETS
+	custom_text = ("✅ " if custom else "") + get_text("BUTTON_RATIO_CUSTOM") + (f" ({limit:g})" if custom else "")
+	return [
+		first,
+		[option(f"{preset:g}", f"{preset:g}", selected == "v" and limit == preset) for preset in RATIO_PRESETS],
+		[InlineKeyboardButton(custom_text, callback_data=ask_call)],
+	]
+
+
+def speed_limit_text(kbps):
+	return f"{kbps} KB/s" if kbps > 0 else get_text("NO_LIMIT")
+
+
+def build_ratio_screen(torrent, filter_key, page):
+	"""The limits of a single torrent: until which ratio it keeps seeding and
+	how fast it may download and upload, whatever the manager supports"""
+	lines = [get_text("LIMITS_TITLE", html.escape(torrent.name)), ""]
+	nav_ctx = new_nav_context(torrent.id, filter_key, page)
+	markup = InlineKeyboardMarkup()
+	if client.supports_ratio_limit:
+		lines.append(f"{get_text('INFO_RATIO')}: {torrent.ratio}")
+		lines.append(get_text("RATIO_LIMIT_NOW", ratio_limit_label(torrent)))
+	if client.supports_torrent_speed_limit:
+		lines.append(get_text("LIMITS_DOWN", speed_limit_text(torrent.download_limit)))
+		lines.append(get_text("LIMITS_UP", speed_limit_text(torrent.upload_limit)))
+	if client.supports_ratio_limit:
+		lines += ["", get_text("RATIO_HINT")]
+		selected = {RATIO_MODE_GLOBAL: "g", RATIO_MODE_NONE: "n", RATIO_MODE_TORRENT: "v"}.get(torrent.ratio_limit_mode, "")
+		for row in ratio_option_rows(torrent.ratio_limit, selected, lambda value: build_call("ratioSet", nav_ctx, value),
+									build_call("ratioAsk", nav_ctx), with_global=True):
+			markup.row(*row)
+	if client.supports_torrent_speed_limit:
+		markup.row(
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_DOWN_LIMIT"), callback_data=build_call("tSpeedAsk", nav_ctx, "down")),
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_UP_LIMIT"), callback_data=build_call("tSpeedAsk", nav_ctx, "up")),
+		)
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("info", torrent.id, filter_key, page)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
+
+
+# ---------------------------------------------------------------------------
 # DIRECTORIES
 # ---------------------------------------------------------------------------
 
@@ -1814,12 +1908,12 @@ def auto_move_series_label():
 # Screen each toggle lives in, so pressing it repaints that same screen
 SETTING_SCREENS = {
 	"notify_completed": "notify", "notify_errors": "notify", "notify_external_added": "notify",
-	"low_space_warning": "notify",
+	"low_space_warning": "notify", "notify_ratio_reached": "notify",
 	"auto_download": "add", "auto_move_series": "add", "auto_move_series_external": "add",
 	"auto_rename": "rename", "auto_rename_files": "rename", "auto_rename_external": "rename",
 	"auto_replace": "rename",
 }
-NOTIFY_SETTINGS = ("notify_completed", "notify_errors", "notify_external_added", "low_space_warning")
+NOTIFY_SETTINGS = ("notify_completed", "notify_errors", "notify_external_added", "low_space_warning", "notify_ratio_reached")
 
 
 def settings_call(screen="main"):
@@ -1866,8 +1960,11 @@ def build_settings_main():
 		markup.add(InlineKeyboardButton(text, callback_data=call))
 
 	row(get_text("SETTINGS_ROW_SPEED", speed_label(settings)), settings_call("speed"))
-	enabled_notices = sum(1 for key in NOTIFY_SETTINGS if bot_settings.get(key))
-	row(get_text("SETTINGS_ROW_NOTIFY", enabled_notices, len(NOTIFY_SETTINGS)), settings_call("notify"))
+	notices = [key for key in NOTIFY_SETTINGS if key != "notify_ratio_reached" or client.supports_ratio_limit]
+	enabled_notices = sum(1 for key in notices if bot_settings.get(key))
+	row(get_text("SETTINGS_ROW_NOTIFY", enabled_notices, len(notices)), settings_call("notify"))
+	if client.supports_ratio_limit:
+		row(get_text("SETTINGS_ROW_RATIO", global_ratio_label(client.get_global_ratio_limit())), settings_call("ratio"))
 	add_mode = "ADD_MODE_AUTO" if bot_settings.get("auto_download") else "ADD_MODE_ASK"
 	row(get_text("SETTINGS_ROW_ADD", get_text(add_mode)), settings_call("add"))
 	if client.supports_rename:
@@ -1900,6 +1997,23 @@ def build_settings_speed():
 	return "\n".join(lines), settings_nav(markup)
 
 
+def global_ratio_label(limit):
+	return f"{limit:g}" if limit >= 0 else get_text("NO_LIMIT")
+
+
+def build_settings_ratio():
+	limit = client.get_global_ratio_limit()
+	lines = [get_text("SETTINGS_RATIO_TITLE"), "", get_text("SETTINGS_RATIO_HELP"), "",
+			get_text("RATIO_LIMIT_NOW", global_ratio_label(limit))]
+	if client.ratio_limit_copied_on_add:
+		lines += ["", get_text("SETTINGS_RATIO_ONLY_NEW")]
+	markup = InlineKeyboardMarkup()
+	for row in ratio_option_rows(limit, "n" if limit < 0 else "v", lambda value: build_call("globalRatioSet", value),
+								build_call("globalRatioAsk")):
+		markup.row(*row)
+	return "\n".join(lines), settings_nav(markup)
+
+
 def build_settings_notify():
 	lines = [get_text("SETTINGS_NOTIFY_TITLE"), "", get_text("SETTINGS_NOTIFY_HELP")]
 	markup = InlineKeyboardMarkup(row_width=1)
@@ -1907,6 +2021,8 @@ def build_settings_notify():
 	markup.add(toggle_button("notify_errors", "BUTTON_SETTING_NOTIFY_ERRORS"))
 	markup.add(toggle_button("notify_external_added", "BUTTON_SETTING_NOTIFY_EXTERNAL"))
 	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
+	if client.supports_ratio_limit:
+		markup.add(toggle_button("notify_ratio_reached", "BUTTON_SETTING_NOTIFY_RATIO"))
 	return "\n".join(lines), settings_nav(markup)
 
 
@@ -1946,6 +2062,7 @@ def build_settings_rename():
 SETTINGS_SCREENS = {
 	"main": build_settings_main,
 	"speed": build_settings_speed,
+	"ratio": build_settings_ratio,
 	"notify": build_settings_notify,
 	"add": build_settings_add,
 	"rename": build_settings_rename,
@@ -1955,7 +2072,7 @@ SETTINGS_SCREENS = {
 def build_settings(screen="main"):
 	"""(text, markup) of a settings screen; an unknown one is the main screen.
 	The rename screen does not exist for a manager that cannot rename"""
-	if screen == "rename" and not client.supports_rename:
+	if (screen == "rename" and not client.supports_rename) or (screen == "ratio" and not client.supports_ratio_limit):
 		screen = "main"
 	return SETTINGS_SCREENS.get(screen, build_settings_main)()
 
@@ -2053,6 +2170,7 @@ def collect_telemetry_metrics():
 		"notify_completed": bool(bot_settings.get("notify_completed")),
 		"notify_errors": bool(bot_settings.get("notify_errors")),
 		"notify_external_added": bool(bot_settings.get("notify_external_added")),
+		"notify_ratio_reached": client.supports_ratio_limit and bool(bot_settings.get("notify_ratio_reached")),
 		"auto_download": bool(bot_settings.get("auto_download")),
 		"auto_download_dir": bool(bot_settings.get("auto_download_dir")),
 		"auto_category": bool(bot_settings.get("auto_category")),
@@ -2508,6 +2626,22 @@ def handle_completed(torrent):
 		notify(text)
 
 
+def handle_seeding_stopped(torrent_id):
+	"""A torrent went from seeding to stopped: when it was its ratio limit that
+	stopped it (and not someone pausing it), tells so, with a way to keep it
+	seeding. The light listing does not carry the ratio, so it is read here"""
+	torrent = client.get_torrent(torrent_id)
+	if torrent is None or torrent.ratio_limit < 0 or torrent.ratio + 0.005 < torrent.ratio_limit:
+		return
+	count_usage("auto_notify_ratio")
+	markup = InlineKeyboardMarkup()
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_KEEP_SEEDING"), callback_data=build_call("keepSeeding", torrent.id)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	notify(get_text("NOTIFY_RATIO_REACHED", html.escape(torrent.name), f"{torrent.ratio_limit:g}"), reply_markup=markup)
+
+
 # Torrents added through the bot that the monitor has not seen yet: id -> ts.
 # The lock is held for the whole add, so the monitor can never classify as
 # external a torrent the manager already lists but the bot has not registered
@@ -2799,6 +2933,11 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 		text = get_text("MASS_CONFIRM_DELETE", count)
 		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "0")))
 		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "1")))
+	elif action == "ratio":
+		text = get_text("MASS_RATIO_ASK", count)
+		for row in ratio_option_rows(-1, "", lambda value: build_call("confirmMass", "ratio", filter_key, value),
+									build_call("massRatioAsk", filter_key), with_global=True):
+			markup.row(*row)
 	elif action == "move":
 		text = get_text("MASS_MOVE_ASK_DIR", count)
 		markup = build_dir_markup(
@@ -2813,6 +2952,12 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 	if action != "move":
 		markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=back_call))
 	edit_message(chat_id, message_id, text, markup)
+
+
+def mass_ratio_label(limit):
+	if limit is None:
+		return get_text("BUTTON_RATIO_GLOBAL")
+	return f"{limit:g}" if limit >= 0 else get_text("NO_LIMIT")
 
 
 def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
@@ -2835,6 +2980,12 @@ def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
 		elif action == "pause":
 			client.pause_torrents(ids)
 			text = get_text("MASS_DONE_PAUSE", count)
+		elif action == "ratio":
+			limit = None if extra == "g" else (-1 if extra == "n" else parse_ratio(extra or ""))
+			if limit is None and extra != "g":
+				return
+			client.set_ratio_limit(ids, limit)
+			text = get_text("MASS_DONE_RATIO", count, mass_ratio_label(limit))
 		elif action == "delete":
 			client.remove_torrents(ids, delete_data=extra == "1")
 			text = get_text("MASS_DONE_DELETE", count)
@@ -2863,6 +3014,17 @@ def set_pending_input(chat_id, user_id, action, **extra):
 def pop_pending_input(chat_id, user_id):
 	with _contexts_lock:
 		return pending_inputs.pop((chat_id, user_id), None)
+
+
+def send_limits_screen(chat_id, thread_id, pending, done, back_markup):
+	"""After a typed limit: back on the limits screen, as when a preset is
+	pressed, with the confirmation on top and the value read back from the manager"""
+	torrent = client.get_torrent(pending["torrent_id"])
+	if torrent is None:
+		send_message(chat_id, done, reply_markup=back_markup, thread_id=thread_id)
+		return
+	text, markup = build_ratio_screen(torrent, pending["filter_key"], pending["page"])
+	send_message(chat_id, f"{done}\n\n{text}", reply_markup=markup, thread_id=thread_id)
 
 
 def handle_pending_input(message, pending):
@@ -2983,8 +3145,49 @@ def handle_pending_input(message, pending):
 		example = {"movie": TEMPLATE_EXAMPLE_MOVIE, "series": TEMPLATE_EXAMPLE_SERIES, "season": TEMPLATE_EXAMPLE_SEASON}[kind]
 		preview = parse_name(example) or "-"
 		send_message(chat_id, get_text("TPL_SAVED", html.escape(text), html.escape(example), html.escape(preview)), reply_markup=back_markup, thread_id=thread_id)
+	elif action == "massRatio":
+		limit = parse_ratio(text)
+		if limit is None:
+			send_message(chat_id, get_text("RATIO_INVALID", MAX_RATIO_LIMIT), reply_markup=back_markup, thread_id=thread_id)
+			return
+		sent = send_message(chat_id, "⏳", thread_id=thread_id)
+		if sent:
+			do_mass_action(chat_id, sent.message_id, "ratio", pending["filter_key"], f"{limit:g}")
 	elif action == "massMove":
 		do_mass_move_to(chat_id, pending["filter_key"], text, thread_id=thread_id)
+	elif action == "ratioLimit":
+		limit = parse_ratio(text)
+		if limit is None:
+			send_message(chat_id, get_text("RATIO_INVALID", MAX_RATIO_LIMIT), reply_markup=back_markup, thread_id=thread_id)
+			return
+		try:
+			client.set_ratio_limit([pending["torrent_id"]], limit)
+			send_limits_screen(chat_id, thread_id, pending, get_text("RATIO_SET_OK", html.escape(pending.get("name", "")), f"{limit:g}"), back_markup)
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
+	elif action == "torrentSpeed":
+		try:
+			kbps = int(text)
+			if kbps < 0:
+				raise ValueError()
+		except ValueError:
+			send_message(chat_id, get_text("INVALID_NUMBER"), reply_markup=back_markup, thread_id=thread_id)
+			return
+		try:
+			client.set_torrent_speed_limit([pending["torrent_id"]], pending["direction"], kbps)
+			send_limits_screen(chat_id, thread_id, pending, get_text("LIMIT_SET_OK"), back_markup)
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
+	elif action == "globalRatio":
+		limit = parse_ratio(text)
+		if limit is None:
+			send_message(chat_id, get_text("RATIO_INVALID", MAX_RATIO_LIMIT), reply_markup=back_markup, thread_id=thread_id)
+			return
+		try:
+			client.set_global_ratio_limit(limit)
+			send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"), screen="ratio")
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 	elif action in ("downLimit", "upLimit"):
 		try:
 			kbps = int(text)
@@ -3401,6 +3604,8 @@ def handle_callback(call):
 		tooltip = get_text("INPUT_CANCELLED")
 	elif command == "cancelAdd":
 		tooltip = get_text("ADD_CANCELLED")
+	elif command == "reannounce":
+		tooltip = get_text("REANNOUNCED")
 	try:
 		bot.answer_callback_query(call.id, tooltip)
 	except Exception:
@@ -3441,7 +3646,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			torrent_id, filter_key, page = args[0], args[1], args[2]
 			render_detail(chat_id, message_id, torrent_id, filter_key, page, thread_id=thread_id)
 
-		elif command in ("pause", "resume", "verify"):
+		elif command in ("pause", "resume", "verify", "reannounce"):
 			torrent_id, filter_key, page = args[0], args[1], args[2]
 			# A button left in the chat can outlive its torrent (or carry an id
 			# the client no longer honors), and that is not a connection error
@@ -3452,6 +3657,8 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				client.pause_torrents([torrent_id])
 			elif command == "resume":
 				client.resume_torrents([torrent_id])
+			elif command == "reannounce":
+				client.reannounce_torrents([torrent_id])
 			else:
 				client.verify_torrent(torrent_id)
 			time.sleep(0.5)
@@ -3753,6 +3960,39 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				text, markup = build_torrent_category_screen(torrent, filter_key, page, cat_page)
 				edit_message(chat_id, message_id, text, markup)
 
+		elif command in ("ratioMenu", "ratioSet", "ratioAsk", "tSpeedAsk"):
+			ctx = get_nav_context(args[0])
+			if ctx is None:
+				edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
+				return
+			torrent_id, filter_key, page = ctx
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+			elif command == "ratioMenu":
+				text, markup = build_ratio_screen(torrent, filter_key, page)
+				edit_message(chat_id, message_id, text, markup)
+			elif command == "tSpeedAsk":
+				direction = "up" if args[1:] == ["up"] else "down"
+				prompt = "LIMITS_ASK_UP" if direction == "up" else "LIMITS_ASK_DOWN"
+				ask_for_input(chat_id, user_id, "torrentSpeed", get_text(prompt, html.escape(torrent.name)),
+							thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, name=torrent.name, direction=direction,
+							filter_key=filter_key, page=page, back_call=build_call("ratioMenu", args[0]))
+			elif command == "ratioAsk":
+				ask_for_input(chat_id, user_id, "ratioLimit", get_text("RATIO_ASK_VALUE", html.escape(torrent.name)),
+							thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, name=torrent.name,
+							filter_key=filter_key, page=page, back_call=build_call("ratioMenu", args[0]))
+			else:
+				value = args[1]
+				limit = None if value == "g" else (-1 if value == "n" else parse_ratio(value))
+				if limit is not None or value == "g":
+					client.set_ratio_limit([torrent_id], limit)
+				# Stays on the screen with the mark on what was just chosen, read
+				# back from the manager so it shows what really applies
+				torrent = client.get_torrent(torrent_id) or torrent
+				text, markup = build_ratio_screen(torrent, filter_key, page)
+				edit_message(chat_id, message_id, text, markup)
+
 		elif command == "catSet":
 			ctx = get_nav_context(args[0])
 			category = get_cat_by_id(args[1])
@@ -3862,6 +4102,22 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			action, filter_key, extra = args[0], args[1], args[2]
 			do_mass_action(chat_id, message_id, action, filter_key, extra)
 
+		elif command == "massRatioAsk":
+			filter_key = args[0]
+			ask_for_input(chat_id, user_id, "massRatio", get_text("MASS_RATIO_ASK_VALUE"), thread_id=thread_id, message_id=message_id,
+						filter_key=filter_key, back_call=build_call("mass", "ratio", filter_key))
+
+		elif command == "keepSeeding":
+			torrent_id = args[0]
+			torrent = client.get_torrent(torrent_id)
+			if torrent is None:
+				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), close_markup())
+				return
+			client.set_ratio_limit([torrent_id], -1)
+			client.resume_torrents([torrent_id])
+			base = message_html or get_text("NOTIFY_RATIO_REACHED", html.escape(torrent.name), "")
+			edit_message(chat_id, message_id, f"{base}\n\n{get_text('KEEP_SEEDING_DONE')}", close_markup())
+
 		elif command == "massMoveDir":
 			filter_key, dir_id = args[0], args[1]
 			new_dir = get_dir_by_id(dir_id)
@@ -3898,6 +4154,17 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			else:
 				client.set_speed_limit("up", None, enabled=not settings["speed_limit_up_enabled"])
 			render_settings(chat_id, message_id, "speed")
+
+		elif command == "globalRatioSet":
+			value = args[0] if args else ""
+			limit = -1 if value == "n" else parse_ratio(value)
+			if limit is not None:
+				client.set_global_ratio_limit(limit)
+			render_settings(chat_id, message_id, "ratio")
+
+		elif command == "globalRatioAsk":
+			ask_for_input(chat_id, user_id, "globalRatio", get_text("SETTINGS_ASK_RATIO"), thread_id=thread_id, message_id=message_id,
+						back_call=settings_call("ratio"))
 
 		elif command == "setDownLimit":
 			ask_for_input(chat_id, user_id, "downLimit", get_text("SETTINGS_ASK_DOWN_LIMIT"), thread_id=thread_id, message_id=message_id,
@@ -4142,7 +4409,7 @@ def poll_torrents(states):
 					external.add(torrent_id)
 	for torrent in torrents:
 		torrent_id = str(torrent.id)
-		state = {"finished": torrent.is_finished, "error": torrent.error_message or ""}
+		state = {"finished": torrent.is_finished, "error": torrent.error_message or "", "status": torrent.status}
 		prev = states.get(torrent_id)
 		if not baseline:
 			if torrent_id in late:
@@ -4166,6 +4433,12 @@ def poll_torrents(states):
 					handle_completed(torrent)
 				except Exception as e:
 					warning(f"Cannot handle the completion of {torrent.name}: {e}")
+			if (prev and prev.get("status") == TorrentStatus.SEEDING and state["status"] == TorrentStatus.PAUSED
+					and client.supports_ratio_limit and bot_settings.get("notify_ratio_reached")):
+				try:
+					handle_seeding_stopped(torrent.id)
+				except Exception as e:
+					warning(f"Cannot tell why {torrent.name} stopped seeding: {e}")
 			if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
 				count_usage("auto_notify_error")
 				notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))

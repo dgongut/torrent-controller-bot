@@ -20,16 +20,17 @@ Control your torrent client from a single place.
 - ✅ Torrent list with filters (downloading, seeding, paused, completed, with errors...) and pagination
 - ✅ Search torrents by name or by path
 - ✅ Add torrents by sending a `.torrent` file, a magnet link or a URL to a `.torrent` file, choosing the download directory
-- ✅ Pause, resume, verify and delete torrents (with or without their data)
+- ✅ Pause, resume, verify, reannounce to the tracker and delete torrents (with or without their data)
 - ✅ Move torrents to another directory with a notice when the move finishes
+- ✅ Per torrent limits: up to which ratio each one seeds (the manager's, no limit, 0.5, 1, 2 or any other value) and its download and upload speed, and the manager's own ratio from the settings
 - ✅ Renaming with automatic suggestion for movies and series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
 - ✅ Renaming the folders and files inside a torrent, one by one or in batch, dragging their subtitles along
 - ✅ Complete series: renames the folder, the season subfolders and the episodes in one go
-- ✅ Mass actions over a filter or search: resume, pause, delete or move all
+- ✅ Mass actions over a filter or search: resume, pause, delete, move all or set their ratio limit
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
 - ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits
-- ✅ Notifications for completed downloads, torrent errors and torrents added outside the bot (can be toggled from the settings)
+- ✅ Notifications for completed downloads, torrent errors, torrents added outside the bot and torrents that stop seeding at their ratio limit, with a button to keep them seeding (can be toggled from the settings)
 - ✅ Automatic download without asking for the path, with a configurable directory
 - ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains and the torrents added outside the bot (can be toggled from the settings)
 - ✅ Replace a previous copy: when the name a download should take already belongs to another torrent, on completion it offers to delete the old one (with its data) and keep the new one, or does it without asking if you turn that on
@@ -67,7 +68,7 @@ Before starting the container you need your own Telegram bot and your user ident
 | `/list` | Full torrent list with filters and pagination |
 | `/find text` | Search torrents by name or by path, ignoring case and accents. Words can come in any order (`/find casa papel` finds `La.Casa.de.Papel`); a path has to appear as is (`/find /ssd/movies` does not find `/media/Movies`) and quoted text as an exact phrase (`/find "the office"`) |
 | `/add` | Add a torrent (you can also send a `.torrent` file or a magnet link directly) |
-| `/settings` | Client settings: turtle mode and speed limits |
+| `/settings` | Client settings: turtle mode, speed limits and ratio |
 | `/version` | Shows the current version and the client it is connected to |
 | `/help` | List of commands |
 
@@ -166,6 +167,9 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 | Free space and low disk warning | ✅ | ✅ | ✅ | ✅ |
 | Speed limits | ✅ | ✅ | ✅ | ✅ |
 | Alternative speed (turtle mode) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
+| Ratio limit, per torrent and the manager's | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
+| Speed limit per torrent | ✅ | ✅ | ✅ | ❌ ⁶ |
+| Reannounce to the tracker | ✅ | ✅ | ✅ | ❌ ⁷ |
 | Verify the data | ✅ | ✅ | ✅ | ❌ ² |
 | Smart, manual and automatic renaming | ✅ | ✅ | ✅ | ❌ ³ |
 | Categories | ❌ ⁴ | ✅ | ❌ ⁴ | ❌ ⁴ |
@@ -177,6 +181,12 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 ⁴ Categories are a qBittorrent concept: each one carries a folder, and a torrent under **Automatic Torrent Management** takes its folder from its category, so changing the category moves the files. That is why the bot never offers both at once: on an auto managed torrent the move button is replaced by the category one, and moving by hand stays available inside that screen, stating that the torrent switches to manual mode. Transmission and Deluge have labels, but they are plain labels with no folder attached (and Deluge needs the Label plugin on top), so the bot does not use them.
 
 ³ The Download Station API has no field for the name of a task or of the files it contains: the only editable thing about a task is its destination. The content can be renamed on disk with File Station, but then the task no longer finds its files and breaks on the next check DSM makes (a reboot of the NAS, of the package, or a pause and resume), so the bot does not do it. It is the same limitation the DSM interface itself has, where a download cannot be renamed either.
+
+⁵ No Deluge torrent "follows" the global setting: it is copied into each torrent when added. Choosing "Manager's" copies the current global setting into that torrent again, and changing the manager's ratio from the settings only affects the torrents added afterwards.
+
+⁶ Download Station only has a global ratio and global speed limits in its settings; its API cannot change them for a single task.
+
+⁷ The Download Station API has no way to ask the tracker for peers on demand.
 
 ## Synology Download Station
 

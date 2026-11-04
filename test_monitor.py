@@ -51,6 +51,9 @@ def check(description, actual, expected):
 
 class FakeClient:
 	supports_alt_speed = True
+	supports_ratio_limit = False  # Turned on only by the ratio limit tests
+	supports_torrent_speed_limit = False
+	supports_reannounce = False
 	supports_rename = True
 	supports_verify = True
 	supports_categories = False
@@ -138,6 +141,16 @@ class FakeClient:
 		if self.fail_rename_times:
 			self.fail_rename_times -= 1
 			raise TorrentClientError("File already exists")
+
+	def set_ratio_limit(self, torrent_ids, limit):
+		self.calls.append(("set_ratio_limit", list(torrent_ids), limit))
+		for torrent_id in torrent_ids:
+			self.torrents[torrent_id].ratio_limit = limit
+
+	def resume_torrents(self, torrent_ids):
+		self.calls.append(("resume_torrents", list(torrent_ids)))
+		for torrent_id in torrent_ids:
+			self.torrents[torrent_id].status = TorrentStatus.SEEDING
 
 	def rename_torrent(self, torrent_id, new_name):
 		self.calls.append(("rename_torrent", torrent_id, new_name))
@@ -1357,6 +1370,56 @@ check("the external notification turns off", bot_settings.get("notify_external_a
 with open(bot_settings.SETTINGS_FILE, encoding="utf-8") as file:
 	stored = file.read()
 check("the new settings are saved to disk", ('"notify_external_added"' in stored, '"auto_rename_external"' in stored), (True, True))
+
+# ---------------------------------------------------------------------------
+# RATIO LIMIT REACHED: the manager stopped a torrent that was seeding
+# ---------------------------------------------------------------------------
+
+def seeding(ratio=0.5, limit=0.5):
+	torrent = movie(progress=100.0)
+	torrent.status, torrent.ratio, torrent.ratio_limit = TorrentStatus.SEEDING, ratio, limit
+	return CLIENT.put(torrent)
+
+
+def ratio_text(torrent):
+	return bot.get_text("NOTIFY_RATIO_REACHED", bot.html.escape(torrent.name), f"{torrent.ratio_limit:g}")
+
+
+FakeClient.supports_ratio_limit = True
+fresh()
+bot_settings.set("notify_ratio_reached", True)
+reached, paused_by_hand, no_limit = seeding(), seeding(ratio=0.2), seeding(limit=-1)
+states = poll(None)
+for torrent in (reached, paused_by_hand, no_limit):
+	CLIENT.torrents[torrent.id].status = TorrentStatus.PAUSED
+states = poll(states)
+check("a torrent stopped at its ratio limit is told, and only that one", texts(), [ratio_text(reached)])
+keep = MARKUPS[-1].keyboard[0][0].callback_data
+check("the notice offers to keep seeding", keep, bot.build_call("keepSeeding", reached.id))
+check("or to close it", MARKUPS[-1].keyboard[0][1].callback_data, bot.build_call("cerrar"))
+states = poll(states)
+check("a torrent that stays stopped is told once", len(NOTIFIED), 1)
+bot.dispatch_callback(1, 7, 1, keep, message_html=ratio_text(reached))
+check("keeping it seeding drops the limit and resumes it",
+	[c for c in CLIENT.calls if c[0] in ("set_ratio_limit", "resume_torrents")],
+	[("set_ratio_limit", [reached.id], -1), ("resume_torrents", [reached.id])])
+
+fresh()
+bot_settings.set("notify_ratio_reached", False)
+quiet = seeding()
+states = poll(None)
+CLIENT.torrents[quiet.id].status = TorrentStatus.PAUSED
+poll(states)
+check("with the setting off nothing is told", NOTIFIED, [])
+bot_settings.set("notify_ratio_reached", True)
+
+fresh()
+stopped = seeding()
+stopped.status = TorrentStatus.PAUSED
+states = poll(None)
+poll(states)
+check("a torrent already stopped at startup is not told", NOTIFIED, [])
+FakeClient.supports_ratio_limit = False
 
 # Every text the new settings use exists in both languages, with the same placeholders
 import json

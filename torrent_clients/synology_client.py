@@ -224,6 +224,9 @@ class SynologyClient(TorrentClient):
 	supports_alt_speed = False  # Download Station has no alternative speed mode
 	supports_rename = False  # No rename API for tasks or files
 	supports_verify = False  # No recheck API
+	supports_ratio_limit = False  # Only a global seeding ratio in the Download Station settings
+	supports_torrent_speed_limit = False  # Only global speed limits
+	supports_reannounce = False  # No API to reach the trackers on demand
 
 	def __init__(self, host, port, username=None, password=None, protocol="http", api_path=None):
 		self.base_url = f"{protocol}://{host}:{port}/{(api_path or 'webapi').strip('/')}"

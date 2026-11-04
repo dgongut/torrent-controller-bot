@@ -247,6 +247,9 @@ def new_id():
 
 class FakeClient:
 	supports_alt_speed = True
+	supports_ratio_limit = False  # Not what these tests are about
+	supports_torrent_speed_limit = False
+	supports_reannounce = False
 	supports_rename = True
 	supports_verify = True
 	supports_categories = False

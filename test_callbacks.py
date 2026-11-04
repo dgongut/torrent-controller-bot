@@ -10,6 +10,7 @@ enforces that same limit, so any screen that would be refused fails the test.
 The crawler below walks every screen reachable from the dashboard, which is what
 keeps this honest: it does not need to know in advance which keyboard is new."""
 
+import html
 import importlib.util
 import os
 import re
@@ -122,6 +123,10 @@ class FakeClient:
 	supports_rename = True
 	supports_verify = True
 	supports_categories = True
+	supports_ratio_limit = True
+	ratio_limit_copied_on_add = False
+	supports_torrent_speed_limit = True
+	supports_reannounce = True
 
 	def test_connection(self):
 		return "qBittorrent 5.1.0 (fake)"
@@ -194,6 +199,24 @@ class FakeClient:
 
 	def set_speed_limit(self, direction, kbps, enabled):
 		CALLS.append(("set_speed_limit", direction, kbps, enabled))
+
+	def set_ratio_limit(self, torrent_ids, limit):
+		CALLS.append(("set_ratio_limit", list(torrent_ids), limit))
+
+	def set_torrent_speed_limit(self, torrent_ids, direction, kbps):
+		CALLS.append(("set_torrent_speed_limit", list(torrent_ids), direction, kbps))
+
+	def reannounce_torrents(self, torrent_ids):
+		CALLS.append(("reannounce_torrents", list(torrent_ids)))
+
+	global_ratio = 2.0
+
+	def get_global_ratio_limit(self):
+		return self.global_ratio
+
+	def set_global_ratio_limit(self, limit):
+		CALLS.append(("set_global_ratio_limit", limit))
+		self.global_ratio = limit
 
 
 torrent_clients.create_client = lambda config_module: FakeClient()
@@ -377,7 +400,8 @@ for label, profile in PROFILES.items():
 	for command in ("list", "info", "delete", "confirmDelete", "rename", "renameAuto", "renameManual",
 					"move", "moveToDir", "files", "file", "fileAuto", "mass", "confirmMass",
 					"settings", "toggleSetting", "favDirsMenu", "tplMenu", "trackers", "goto",
-					"categories", "catMenu", "catSet", "folder", "folderManual", "filesAll", "filesAllOk"):
+					"categories", "catMenu", "catSet", "folder", "folderManual", "filesAll", "filesAllOk",
+					"ratioMenu", "ratioSet", "globalRatioSet", "reannounce"):
 		check(f"[{label}] the crawler reached the {command} screen", command in reached, True)
 	if profile["files"] is SERIES_FILES:
 		check(f"[{label}] the crawler reached the folder suggestion", "folderAuto" in reached, True)
@@ -1081,11 +1105,15 @@ check("an unauthorized command is not counted", pending_usage().get("cmd_version
 metrics = bot_module.collect_telemetry_metrics()
 check("the metrics are exactly the declared ones", sorted(metrics), sorted([
 	"client", "language", "admins", "telegram_group", "torrents_per_page", "notify_completed",
-	"notify_errors", "notify_external_added", "auto_download", "auto_download_dir", "auto_category",
+	"notify_errors", "notify_external_added", "notify_ratio_reached", "auto_download", "auto_download_dir", "auto_category",
 	"auto_rename", "auto_rename_files", "auto_rename_external", "auto_replace", "auto_move_series", "auto_move_series_external",
 	"low_space_warning", "favorite_dirs",
 	"custom_templates", "torrents", "transmission_major"]))
 check("the torrent count goes as a number, so the server can add them up", metrics["torrents"], len(bot_module.client.get_torrents()))
+check("the ratio limit notice is reported", metrics["notify_ratio_reached"], True)
+bot_module.client.supports_ratio_limit = False
+check("but never as on for a manager without ratio limits", bot_module.collect_telemetry_metrics()["notify_ratio_reached"], False)
+bot_module.client.supports_ratio_limit = True
 for name, version, expected in (("qbittorrent", "qBittorrent 5.2.4", 5), ("transmission", "Transmission 4.1.3 (abc)", 4), ("deluge", "Deluge 2.2.0", 2)):
 	_real_test_connection, _real_client_name = bot_module.client.test_connection, bot_module.TORRENT_CLIENT
 	bot_module.client.test_connection = lambda version=version: version
@@ -1160,6 +1188,209 @@ check("a transferring torrent is not idle", get_text("INFO_IDLE", "1h 30m") in d
 check("no seeding line before it seeds", get_text("INFO_SEEDING_TIME") in downloading, False)
 check("the download eta stays", f"{get_text('INFO_ETA')}: 10m" in downloading, True)
 check("a half known swarm is left out", get_text("INFO_PEERS_DETAIL", 1, 0) in downloading, True)
+
+# The ratio limit of a single torrent: one tap between the usual values, and
+# the screen marks the one in force
+def ratio_screen(**changes):
+	torrent = fake_torrent()
+	for key, value in changes.items():
+		setattr(torrent, key, value)
+	return bot_module.build_ratio_screen(torrent, config.FILTER_ALL, 0)
+
+
+def labelled(markup):
+	return {button.text: button.callback_data for row in markup.keyboard for button in row}
+
+
+ratio_button = next((c for c in detail_buttons() if c.startswith("ratioMenu|")), None)
+check("the torrent screen offers the ratio limit", ratio_button is not None, True)
+text, markup = ratio_screen(ratio_limit=2.0, ratio_limit_mode="global")
+buttons = labelled(markup)
+check("the ratio screen says the limit comes from the manager",
+	get_text("RATIO_LIMIT_NOW", get_text("RATIO_GLOBAL_VALUE", "2")) in text, True)
+check("the manager's option is the one marked", "✅ " + get_text("BUTTON_RATIO_GLOBAL") in buttons, True)
+check("only one option is marked", sum(label.startswith("✅") for label in buttons), 1)
+text, markup = ratio_screen(ratio_limit=-1, ratio_limit_mode="none")
+check("no limit reads as such", get_text("RATIO_LIMIT_NOW", get_text("NO_LIMIT")) in text, True)
+check("and its option is marked", "✅ " + get_text("BUTTON_RATIO_NONE") in labelled(markup), True)
+check("a preset is marked", "✅ 0.5" in labelled(ratio_screen(ratio_limit=0.5, ratio_limit_mode="torrent")[1]), True)
+check("any other value is marked on the typed option",
+	"✅ " + get_text("BUTTON_RATIO_CUSTOM") + " (1.5)" in labelled(ratio_screen(ratio_limit=1.5, ratio_limit_mode="torrent")[1]), True)
+check("an unknown mode marks nothing", sum(label.startswith("✅") for label in labelled(ratio_screen(ratio_limit_mode="")[1])), 0)
+
+screen = press(ratio_button)
+for label, expected in ((get_text("BUTTON_RATIO_NONE"), -1), ("0.5", 0.5), ("2", 2.0), (get_text("BUTTON_RATIO_GLOBAL"), None)):
+	CALLS.clear()
+	press(labelled(screen[1])[label])
+	check(f"the {label} option sets the limit", CALLS, [("set_ratio_limit", [TORRENT_ID], expected)])
+	check(f"the {label} option stays on the ratio screen", EDITS[-1][0].startswith(get_text("LIMITS_TITLE", html.escape(fake_torrent().name))), True)
+# The mark follows the choice, read back from the manager
+chosen = {}
+real_get, real_set = bot_module.client.get_torrent, bot_module.client.set_ratio_limit
+def get_with_limit(torrent_id):
+	torrent = real_get(torrent_id)
+	limit = chosen.get("limit", "unset")
+	if limit != "unset":
+		torrent.ratio_limit_mode = "global" if limit is None else ("none" if limit < 0 else "torrent")
+		torrent.ratio_limit = 2.0 if limit is None else limit
+	return torrent
+bot_module.client.get_torrent = get_with_limit
+bot_module.client.set_ratio_limit = lambda ids, limit: chosen.update(limit=limit)
+for label, marked in (("0.5", "✅ 0.5"), (get_text("BUTTON_RATIO_NONE"), "✅ " + get_text("BUTTON_RATIO_NONE")),
+					(get_text("BUTTON_RATIO_GLOBAL"), "✅ " + get_text("BUTTON_RATIO_GLOBAL"))):
+	screen = press(labelled(screen[1]).get(label) or labelled(screen[1])["✅ " + label])
+	check(f"pressing {label} moves the mark to it", marked in labelled(screen[1]), True)
+	check(f"pressing {label} leaves a single mark", sum(text.startswith("✅") for text in labelled(screen[1])), 1)
+bot_module.client.get_torrent, bot_module.client.set_ratio_limit = real_get, real_set
+screen = press(ratio_button)
+
+CALLS.clear()
+press(bot_module.build_call("ratioSet", ratio_button.split("|")[1], "x"))
+check("a forged value sets nothing", CALLS, [])
+
+for typed, expected in (("0,5", 0.5), ("1.25", 1.25), ("0", 0.0), ("-1", None), ("abc", None), ("nan", None), ("99999", None)):
+	check(f"typing {typed!r}", bot_module.parse_ratio(typed), expected)
+bot_module.pending_inputs.clear()
+press(labelled(screen[1])[get_text("BUTTON_RATIO_CUSTOM")])
+pending = bot_module.pop_pending_input(CHAT_ID, 1)
+check("cancelling the typed value goes back to the ratio screen", pending["back_call"], ratio_button)
+CALLS.clear()
+message = type("M", (), {"chat": type("C", (), {"id": CHAT_ID})(), "message_thread_id": None, "text": "0,75", "message_id": 9,
+						"from_user": type("U", (), {"id": 1})()})()
+bot_module.handle_pending_input(message, pending)
+check("a typed ratio is set", CALLS, [("set_ratio_limit", [TORRENT_ID], 0.75)])
+check("and confirmed on top of the ratio screen", EDITS[-1][0].startswith(
+	get_text("RATIO_SET_OK", html.escape(fake_torrent().name), "0.75") + "\n\n" + get_text("LIMITS_TITLE", html.escape(fake_torrent().name))), True)
+check("which keeps its buttons", bot_module.build_call("info", TORRENT_ID, config.FILTER_ALL, 0) in labelled(EDITS[-1][1]).values(), True)
+
+# The speed of a single torrent, typed, back on the limits screen
+screen = press(ratio_button)
+check("the limits screen tells both speeds", all(get_text(key, get_text("NO_LIMIT")) in screen[0] for key in ("LIMITS_DOWN", "LIMITS_UP")), True)
+for label, direction in ((get_text("BUTTON_TORRENT_DOWN_LIMIT"), "down"), (get_text("BUTTON_TORRENT_UP_LIMIT"), "up")):
+	bot_module.pending_inputs.clear()
+	press(labelled(screen[1])[label])
+	pending = bot_module.pop_pending_input(CHAT_ID, 1)
+	check(f"cancelling the {direction} limit goes back to the limits screen", pending["back_call"], ratio_button)
+	for typed, expected in (("500", 500), ("0", 0), ("abc", None), ("-3", None)):
+		CALLS.clear()
+		message.text = typed
+		bot_module.handle_pending_input(message, dict(pending))
+		calls = [c for c in CALLS if c[0] == "set_torrent_speed_limit"]
+		check(f"typing {typed!r} as the {direction} limit", calls, [] if expected is None else [("set_torrent_speed_limit", [TORRENT_ID], direction, expected)])
+		if expected is not None:
+			check(f"typing {typed!r} as the {direction} limit comes back to the limits screen",
+				EDITS[-1][0].startswith(get_text("LIMIT_SET_OK") + "\n\n" + get_text("LIMITS_TITLE", html.escape(fake_torrent().name))), True)
+limited = fake_torrent()
+limited.download_limit, limited.upload_limit = 800, -1
+real_get = bot_module.client.get_torrent
+bot_module.client.get_torrent = lambda torrent_id: limited
+detail = bot_module.build_detail(TORRENT_ID, config.FILTER_ALL, 0)[0]
+check("the torrent screen tells its own download limit", get_text("INFO_SPEED_LIMIT", "800 KB/s") in detail, True)
+check("and nothing for the upload one it does not have", detail.count(get_text("INFO_SPEED_LIMIT", "")[:4]), 1)
+check("the limits screen shows it", get_text("LIMITS_DOWN", "800 KB/s") in bot_module.build_ratio_screen(limited, config.FILTER_ALL, 0)[0], True)
+bot_module.client.get_torrent = real_get
+
+# A manager with speed but no ratio limits per torrent, and the other way round
+bot_module.client.supports_ratio_limit = False
+text, markup = ratio_screen()
+check("without ratio limits the screen only has the speeds",
+	(get_text("RATIO_HINT") in text, get_text("BUTTON_RATIO_NONE") in labelled(markup), get_text("BUTTON_TORRENT_DOWN_LIMIT") in labelled(markup)),
+	(False, False, True))
+check("and the limits button stays", any(c.startswith("ratioMenu|") for c in detail_buttons()), True)
+bot_module.client.supports_ratio_limit = True
+bot_module.client.supports_torrent_speed_limit = False
+text, markup = ratio_screen()
+check("without speed limits per torrent the screen only has the ratio",
+	(get_text("LIMITS_DOWN", "")[:6] in text, get_text("BUTTON_TORRENT_DOWN_LIMIT") in labelled(markup)), (False, False))
+bot_module.client.supports_torrent_speed_limit = True
+
+# Reannounce: only an active torrent with a tracker
+check("a seeding torrent with trackers can reannounce", any(c.startswith("reannounce|") for c in detail_buttons()), True)
+CALLS.clear()
+press(next(c for c in detail_buttons() if c.startswith("reannounce|")))
+check("reannouncing asks the manager", CALLS, [("reannounce_torrents", [TORRENT_ID])])
+for changes, label in (({"status": TorrentStatus.PAUSED}, "a paused torrent"), ({"trackers": []}, "a torrent without trackers")):
+	quiet = fake_torrent()
+	for key, value in changes.items():
+		setattr(quiet, key, value)
+	bot_module.client.get_torrent = lambda torrent_id: quiet
+	check(f"{label} has nothing to reannounce", bot_module.build_call("reannounce", TORRENT_ID, config.FILTER_ALL, 0)
+		in callbacks_of(bot_module.build_detail(TORRENT_ID, config.FILTER_ALL, 0)[1]), False)
+	bot_module.client.get_torrent = real_get
+bot_module.client.supports_reannounce = False
+check("a manager that cannot reannounce has no button", any(c.startswith("reannounce|") for c in detail_buttons()), False)
+bot_module.client.supports_reannounce = True
+
+# Ratio limit of every torrent of a filter
+list_calls = callbacks_of(press(bot_module.build_call("list", config.FILTER_ALL, 0))[1])
+mass_ratio = bot_module.build_call("mass", "ratio", config.FILTER_ALL)
+check("the list offers the ratio limit of all", mass_ratio in list_calls, True)
+screen = press(mass_ratio)
+check("it asks for the ratio of all of them", screen[0], get_text("MASS_RATIO_ASK", len(TORRENT_IDS)))
+check("with nothing marked", sum(label.startswith("✅") for label in labelled(screen[1])), 0)
+for label, expected, said in ((get_text("BUTTON_RATIO_NONE"), -1, get_text("NO_LIMIT")), ("0.5", 0.5, "0.5"),
+							(get_text("BUTTON_RATIO_GLOBAL"), None, get_text("BUTTON_RATIO_GLOBAL"))):
+	CALLS.clear()
+	done = press(labelled(screen[1])[label])
+	check(f"{label} for all is set on all of them", CALLS, [("set_ratio_limit", TORRENT_IDS, expected)])
+	check(f"{label} for all is confirmed", done[0], get_text("MASS_DONE_RATIO", len(TORRENT_IDS), said))
+bot_module.pending_inputs.clear()
+press(labelled(screen[1])[get_text("BUTTON_RATIO_CUSTOM")])
+pending = bot_module.pop_pending_input(CHAT_ID, 1)
+check("cancelling the typed ratio of all goes back to its screen", pending["back_call"], mass_ratio)
+CALLS.clear()
+message.text = "1,5"
+bot_module.handle_pending_input(message, pending)
+check("a typed ratio is set on all of them", CALLS, [("set_ratio_limit", TORRENT_IDS, 1.5)])
+check("and confirmed", EDITS[-1][0], get_text("MASS_DONE_RATIO", len(TORRENT_IDS), "1.5"))
+
+bot_module.client.supports_ratio_limit = False
+check("no ratio of all without ratio limits", mass_ratio in callbacks_of(press(bot_module.build_call("list", config.FILTER_ALL, 0))[1]), False)
+bot_module.client.supports_torrent_speed_limit = False
+check("a manager without per torrent limits has no limits button",
+	any(c.startswith("ratioMenu|") for c in detail_buttons()), False)
+bot_module.client.supports_torrent_speed_limit = True
+check("nor a ratio row in the settings",
+	bot_module.settings_call("ratio") in callbacks_of(bot_module.build_settings()[1]), False)
+check("nor a ratio settings screen", bot_module.build_settings("ratio")[0].startswith(get_text("SETTINGS_RATIO_TITLE")), False)
+bot_module.client.supports_ratio_limit = True
+
+# The manager's own ratio, from the settings: same choices but the manager's one
+bot_module.client.global_ratio = 2.0
+main_text, main_markup = bot_module.build_settings()
+check("the settings show the manager's ratio",
+	labelled(main_markup).get(get_text("SETTINGS_ROW_RATIO", "2")), bot_module.settings_call("ratio"))
+screen = press(bot_module.settings_call("ratio"))
+check("the ratio settings screen opens", screen[0].startswith(get_text("SETTINGS_RATIO_TITLE")), True)
+check("it says the limit in force", get_text("RATIO_LIMIT_NOW", "2") in screen[0], True)
+check("its preset is marked", "✅ 2" in labelled(screen[1]), True)
+check("there is no manager's option inside the manager", any(get_text("BUTTON_RATIO_GLOBAL") in label for label in labelled(screen[1])), False)
+check("only Deluge warns that it only applies to new torrents", get_text("SETTINGS_RATIO_ONLY_NEW") in screen[0], False)
+for label, expected, marked in ((get_text("BUTTON_RATIO_NONE"), -1, "✅ " + get_text("BUTTON_RATIO_NONE")), ("0.5", 0.5, "✅ 0.5")):
+	CALLS.clear()
+	screen = press(labelled(screen[1])[label])
+	check(f"the manager's {label} is set", CALLS, [("set_global_ratio_limit", expected)])
+	check(f"and the mark moves to {label}", marked in labelled(screen[1]), True)
+	check(f"and stays on the ratio settings", screen[0].startswith(get_text("SETTINGS_RATIO_TITLE")), True)
+bot_module.client.global_ratio = -1
+check("no limit reads as such in the settings",
+	get_text("SETTINGS_ROW_RATIO", get_text("NO_LIMIT")) in labelled(bot_module.build_settings()[1]), True)
+bot_module.client.global_ratio = 0.5
+bot_module.pending_inputs.clear()
+press(labelled(screen[1])[get_text("BUTTON_RATIO_CUSTOM")])
+pending = bot_module.pop_pending_input(CHAT_ID, 1)
+check("cancelling the typed global ratio goes back to its screen", pending["back_call"], bot_module.settings_call("ratio"))
+CALLS.clear()
+message.text = "3,5"
+bot_module.handle_pending_input(message, pending)
+check("a typed global ratio is set", CALLS, [("set_global_ratio_limit", 3.5)])
+check("and its screen comes back confirmed",
+	EDITS[-1][0].startswith(f"{get_text('SETTINGS_UPDATED')}\n\n{get_text('SETTINGS_RATIO_TITLE')}"), True)
+check("with the typed value marked", "✅ " + get_text("BUTTON_RATIO_CUSTOM") + " (3.5)" in labelled(EDITS[-1][1]), True)
+bot_module.client.ratio_limit_copied_on_add = True
+check("Deluge warns that it only applies to new torrents", get_text("SETTINGS_RATIO_ONLY_NEW") in bot_module.build_settings("ratio")[0], True)
+del bot_module.client.ratio_limit_copied_on_add
+bot_module.client.global_ratio = 2.0
 
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
