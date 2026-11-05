@@ -53,6 +53,7 @@ class FakeClient:
 	supports_alt_speed = True
 	supports_ratio_limit = False  # Turned on only by the ratio limit tests
 	supports_torrent_speed_limit = False
+	ratio_limit_copied_on_add = False
 	supports_reannounce = False
 	supports_rename = True
 	supports_verify = True
@@ -73,6 +74,7 @@ class FakeClient:
 		self.linger = 0  # get_torrent calls a removed torrent is still answered for (removal in background)
 		self.fail_remove = None  # Exception raised by remove_torrents
 		self.fail_rename_times = 0  # Renames that fail before they work (old files still on disk)
+		self.fail_limits = None  # Exception raised by set_torrent_speed_limit
 
 	def put(self, torrent):
 		self.torrents[torrent.id] = torrent
@@ -146,6 +148,16 @@ class FakeClient:
 		self.calls.append(("set_ratio_limit", list(torrent_ids), limit))
 		for torrent_id in torrent_ids:
 			self.torrents[torrent_id].ratio_limit = limit
+
+	def get_global_ratio_limit(self):
+		return -1
+
+	def set_torrent_speed_limit(self, torrent_ids, direction, kbps):
+		self.calls.append(("set_torrent_speed_limit", list(torrent_ids), direction, kbps))
+		if self.fail_limits:
+			raise self.fail_limits
+		for torrent_id in torrent_ids:
+			setattr(self.torrents[torrent_id], "download_limit" if direction == "down" else "upload_limit", kbps if kbps > 0 else -1)
 
 	def resume_torrents(self, torrent_ids):
 		self.calls.append(("resume_torrents", list(torrent_ids)))
@@ -1421,6 +1433,163 @@ poll(states)
 check("a torrent already stopped at startup is not told", NOTIFIED, [])
 FakeClient.supports_ratio_limit = False
 
+# ---------------------------------------------------------------------------
+# LIMITS PER TRACKER: the torrents already there get them when the rule
+# changes, the ones that arrive get them once, and a torrent changed by hand
+# stays the exception it was made, even after a restart of the bot
+# ---------------------------------------------------------------------------
+
+PUBLIC, PRIVATE = "tracker.public.example", "tracker.private.example"
+
+
+def on_tracker(*trackers, torrent_id=None):
+	torrent = movie(progress=100.0, torrent_id=torrent_id)
+	torrent.status, torrent.trackers = TorrentStatus.SEEDING, list(trackers)
+	return CLIENT.put(torrent)
+
+
+def limit_calls():
+	return [c for c in CLIENT.calls if c[0] in ("set_ratio_limit", "set_torrent_speed_limit")]
+
+
+def restart_bot():
+	"""What survives a restart is on disk: forget what is held in memory"""
+	bot.tracker_limits.reset_for_tests()
+
+
+FakeClient.supports_ratio_limit = True
+FakeClient.supports_torrent_speed_limit = True
+bot_settings.set("notify_ratio_reached", False)
+bot_settings.set("tracker_limits", {})
+bot.tracker_limits.prune([])
+fresh()
+public_old, private_old = on_tracker(PUBLIC), on_tracker(PRIVATE)
+states = poll(None)
+check("with no rule the monitor touches no limit", limit_calls(), [])
+
+check("a new rule is applied to the torrents the tracker already has", bot.set_tracker_rule(PUBLIC, "ratio", 0.5), 1)
+check("and only the value that changed, only to that tracker", limit_calls(), [("set_ratio_limit", [public_old.id], 0.5)])
+CLIENT.calls.clear()
+bot.set_tracker_rule(PUBLIC, "up", 50)
+check("another value of the rule is applied on its own", limit_calls(), [("set_torrent_speed_limit", [public_old.id], "up", 50)])
+check("the rule is a setting", bot_settings.get("tracker_limits"), {PUBLIC: {"ratio": 0.5, "down": 0, "up": 50}})
+
+CLIENT.calls.clear()
+states = poll(states)
+check("the torrents that already got the rule are left alone by the monitor", limit_calls(), [])
+
+arrived = on_tracker(PUBLIC)
+other = on_tracker(PRIVATE)
+states = poll(states)
+check("a torrent that arrives gets every value the rule sets, and only those",
+	limit_calls(), [("set_ratio_limit", [arrived.id], 0.5), ("set_torrent_speed_limit", [arrived.id], "up", 50)])
+check("it really has them", (CLIENT.torrents[arrived.id].ratio_limit, CLIENT.torrents[arrived.id].upload_limit), (0.5, 50))
+
+CLIENT.calls.clear()
+CLIENT.set_ratio_limit([arrived.id], -1)  # The user makes it an exception from its screen
+CLIENT.calls.clear()
+states = poll(poll(states))
+check("a torrent changed by hand is not set back by the monitor", (limit_calls(), CLIENT.torrents[arrived.id].ratio_limit), ([], -1))
+
+restart_bot()
+while_down = on_tracker(PUBLIC)
+states = poll(None)
+check("after a restart only the torrent added while the bot was down gets the rule",
+	limit_calls(), [("set_ratio_limit", [while_down.id], 0.5), ("set_torrent_speed_limit", [while_down.id], "up", 50)])
+check("and the exception is still one", CLIENT.torrents[arrived.id].ratio_limit, -1)
+
+CLIENT.calls.clear()
+unannounced = on_tracker()  # A magnet the manager has not announced yet: no tracker known
+states = poll(states)
+check("a torrent with no tracker known yet gets nothing", limit_calls(), [])
+CLIENT.torrents[unannounced.id].trackers = [PUBLIC]
+states = poll(states)
+check("it gets the rule once its tracker shows up",
+	limit_calls(), [("set_ratio_limit", [unannounced.id], 0.5), ("set_torrent_speed_limit", [unannounced.id], "up", 50)])
+
+CLIENT.calls.clear()
+CLIENT.fail_limits = TorrentClientError("busy")
+failing = on_tracker(PUBLIC)
+states = poll(states)
+check("a failure is told in the log", any(PUBLIC in w for w in WARNINGS), True)
+CLIENT.fail_limits = None
+CLIENT.calls.clear()
+states = poll(states)
+check("and the rule is tried again on the next poll",
+	limit_calls(), [("set_ratio_limit", [failing.id], 0.5), ("set_torrent_speed_limit", [failing.id], "up", 50)])
+
+CLIENT.calls.clear()
+both = on_tracker(PRIVATE, PUBLIC)
+states = poll(states)
+check("a torrent on several trackers follows the first one with a rule", limit_calls()[0], ("set_ratio_limit", [both.id], 0.5))
+CLIENT.calls.clear()
+bot.set_tracker_rule(PRIVATE, "ratio", -1)
+check("its main tracker wins once it has a rule", limit_calls(), [("set_ratio_limit", [private_old.id, other.id, both.id], -1)])
+CLIENT.calls.clear()
+check("deleting a rule can hand its torrents back to the manager", bot.delete_tracker_rule(PRIVATE, restore=True), 3)
+check("only the values the rule set go back", limit_calls(), [("set_ratio_limit", [private_old.id, other.id, both.id], None)])
+CLIENT.calls.clear()
+states = poll(states)
+check("with the main rule gone, the torrent follows the next one", limit_calls(),
+	[("set_ratio_limit", [both.id], 0.5), ("set_torrent_speed_limit", [both.id], "up", 50)])
+CLIENT.calls.clear()
+check("or leave them as they are", bot.delete_tracker_rule(PUBLIC, restore=False), 0)
+check("touching nothing", limit_calls(), [])
+on_tracker(PUBLIC)
+poll(states)
+check("and the torrents that arrive afterwards get nothing", limit_calls(), [])
+check("no rule is left", bot_settings.get("tracker_limits"), {})
+
+# The screens
+fresh()
+public_one = on_tracker(PUBLIC)
+key = bot.tracker_limits.tracker_key(PUBLIC)
+EDITS.clear()
+bot.dispatch_callback(1, 7, 1, bot.build_call("settings", "tlimits"))
+check("the settings list the rules, empty at first", bot.get_text("TRACKER_LIMITS_EMPTY") in EDITS[-1][0], True)
+bot.dispatch_callback(1, 7, 1, bot.build_call("tlAdd"))
+pick = [b.callback_data for row in EDITS[-1][1].keyboard for b in row]
+check("adding one offers the trackers in use", bot.build_call("tlRule", key) in pick, True)
+bot.dispatch_callback(1, 7, 1, bot.build_call("tlRule", key))
+check("a tracker without rule shows its torrents and no delete button",
+	(bot.get_text("TRACKER_LIMITS_COUNT", 1) in EDITS[-1][0],
+	bot.build_call("tlDel", key) in [b.callback_data for row in EDITS[-1][1].keyboard for b in row]), (True, False))
+bot.dispatch_callback(1, 7, 1, bot.build_call("tlRatio", key, "1"))
+check("pressing a ratio applies it and says to how many", bot.get_text("TRACKER_LIMITS_APPLIED", 1) in EDITS[-1][0], True)
+check("the torrent has it", CLIENT.torrents[public_one.id].ratio_limit, 1)
+filter_key = "t" + bot.new_tracker_context(PUBLIC)
+text, markup = bot.build_list(filter_key, 0)
+calls = [b.callback_data for row in markup.keyboard for b in row]
+check("the list of a tracker filter leads to its limits", bot.build_call("tlRule", key, filter_key) in calls, True)
+check("instead of the ratio of all", bot.build_call("mass", "ratio", filter_key) in calls, False)
+text, markup = bot.build_list("all", 0)
+check("which the other filters keep", bot.build_call("mass", "ratio", "all") in [b.callback_data for row in markup.keyboard for b in row], True)
+_, markup = bot.build_settings()
+check("the settings group every limit under one row", [b.callback_data for row in markup.keyboard for b in row][0], bot.settings_call("limits"))
+_, markup = bot.build_settings("limits")
+check("speed, ratio and tracker limits, then back to the main settings", [b.callback_data for row in markup.keyboard for b in row],
+	[bot.settings_call("speed"), bot.settings_call("ratio"), bot.settings_call("tlimits"), bot.settings_call(), bot.build_call("cerrar")])
+for sub in ("speed", "ratio", "tlimits"):
+	_, markup = bot.build_settings(sub)
+	check(f"the {sub} screen goes back to the limits", markup.keyboard[-1][0].callback_data, bot.settings_call("limits"))
+text, markup = bot.build_tracker_rule_screen(PUBLIC, filter_key)
+check("and back to that list", markup.keyboard[-1][0].callback_data, bot.build_call("list", filter_key, 0))
+text, _ = bot.build_ratio_screen(CLIENT.get_torrent(public_one.id), "all", 0)
+check("the limits of a torrent tell that its tracker has some", bot.get_text("LIMITS_FROM_TRACKER", PUBLIC) in text, True)
+bot.dispatch_callback(1, 7, 1, bot.build_call("tlDelOk", key, "0"))
+check("the rule can be deleted from its screen", bot_settings.get("tracker_limits"), {})
+bot.dispatch_callback(1, 7, 1, bot.build_call("tlRule", "deadbeef"))
+check("a button of a tracker that is gone says so", EDITS[-1][0], bot.get_text("TRACKER_LIMITS_GONE"))
+
+FakeClient.supports_ratio_limit = False
+FakeClient.supports_torrent_speed_limit = False
+bot_settings.set("tracker_limits", {PUBLIC: {"ratio": 0.5, "down": 0, "up": 0}})
+CLIENT.calls.clear()
+poll(poll(None))
+check("a manager without limits per torrent never gets them", limit_calls(), [])
+check("nor the settings screen", bot.build_settings("tlimits")[0], bot.build_settings("main")[0])
+bot_settings.set("tracker_limits", {})
+
 # Every text the new settings use exists in both languages, with the same placeholders
 import json
 import re
@@ -1431,7 +1600,9 @@ for key in ("BUTTON_SETTING_AUTO_REPLACE", "SETTINGS_AUTO_REPLACE", "REPLACE_MOD
 			"REPLACED_OLD_ONE", "REPLACED_OLD_MANY", "REPLACE_NOTHING", "REPLACE_FAILED",
 			"BUTTON_SETTING_NOTIFY_EXTERNAL", "BUTTON_SETTING_AUTO_RENAME_EXTERNAL", "BUTTON_SETTING_AUTO_RENAME_FILES",
 			"NOTIFY_EXTERNAL_ADDED", "SETTINGS_AUTO_RENAME", "SETTINGS_AUTO_RENAME_ON", "AUTO_RENAME_SCOPE_TORRENT",
-			"AUTO_RENAME_SCOPE_FILES", "AUTO_RENAME_SOURCE_BOT", "AUTO_RENAME_SOURCE_ALL"):
+			"AUTO_RENAME_SCOPE_FILES", "AUTO_RENAME_SOURCE_BOT", "AUTO_RENAME_SOURCE_ALL",
+			*[k for k in locales["es"] if "TRACKER_LIMITS" in k], "LIMITS_FROM_TRACKER", "SETTINGS_ROW_LIMITS", "SETTINGS_LIMITS_TITLE", "SETTINGS_LIMITS_HELP",
+			"BUTTON_MASS_LIMITS", "MASS_LIMITS_TITLE", "MASS_RATIO_HINT", "MASS_LIMITS_ASK_DOWN", "MASS_LIMITS_ASK_UP", "MASS_DONE_DOWN", "MASS_DONE_UP"):
 	check(f"{key} exists in both languages", all(key in texts_ for texts_ in locales.values()), True)
 	check(f"{key} has the same placeholders in both languages",
 		sorted(re.findall(r"\$\d", locales["es"].get(key, ""))), sorted(re.findall(r"\$\d", locales["en"].get(key, ""))))

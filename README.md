@@ -23,10 +23,11 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Pausar, reanudar, verificar, reanunciar al tracker y borrar torrents (con o sin sus datos)
 - ✅ Mover torrents de directorio con aviso al terminar el movimiento
 - ✅ Límites por torrent: hasta qué ratio compartir cada uno (el del gestor, sin límite, 0.5, 1, 2 u otro valor) y su velocidad de bajada y subida, y el ratio del propio gestor desde los ajustes
+- ✅ Límites por tracker: ratio y velocidad para todos los torrents de un tracker, los que ya tiene y los que vayan llegando (por ejemplo, compartir sin fin en los privados y poco en los públicos), desde los ajustes o desde el filtro de ese tracker
 - ✅ Renombrado con sugerencia automática para películas y series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
 - ✅ Renombrado de las carpetas y archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
 - ✅ Series completas: renombra de una vez la carpeta, las subcarpetas de temporada y los episodios
-- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar, mover todos o fijarles el límite de ratio
+- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar, mover todos o fijarles el límite de ratio y de velocidad
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
@@ -170,6 +171,7 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Velocidad alternativa (modo tortuga) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Límite de ratio, por torrent y del gestor | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
 | Límite de velocidad por torrent | ✅ | ✅ | ✅ | ❌ ⁶ |
+| Límites por tracker | ✅ | ✅ ⁸ | ✅ ⁸ | ❌ ⁶ |
 | Reanunciar al tracker | ✅ | ✅ | ✅ | ❌ ⁷ |
 | Verificar los datos | ✅ | ✅ | ✅ | ❌ ² |
 | Renombrado inteligente, manual y automático | ✅ | ✅ | ✅ | ❌ ³ |
@@ -188,6 +190,8 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 ⁶ Download Station solo tiene ratio y límites de velocidad globales en sus ajustes; su API no permite cambiarlos para una tarea concreta.
 
 ⁷ La API de Download Station no tiene ninguna forma de pedir pares al tracker a demanda.
+
+⁸ En su lista de torrents, qBittorrent y Deluge solo dicen el tracker con el que está trabajando cada uno (Deluge, además, por su dominio: `tracker.ejemplo.org` sale como `ejemplo.org`). Un torrent recién añadido recibe los límites de su tracker en cuanto lo anuncia por primera vez, y uno con varios trackers, según el que esté usando en ese momento.
 
 ## Download Station de Synology
 

@@ -931,23 +931,25 @@ fresh()
 text, calls = screen(bot.build_call("settings"))
 check("the bare settings call is the main screen", title_of(text), bot.get_text("SETTINGS_TITLE", "Fake 1.0"))
 check("the main screen has one row per section", calls[:-2], [
-	bot.build_call("settings", "speed"), bot.build_call("settings", "notify"), bot.build_call("settings", "add"),
+	bot.build_call("settings", "limits"), bot.build_call("settings", "notify"), bot.build_call("settings", "add"),
 	bot.build_call("settings", "rename"), bot.build_call("favDirsMenu"), bot.build_call("telemetryMenu")])
 check("and goes back to the dashboard", calls[-2:], [bot.build_call("dashboard"), bot.build_call("cerrar")])
 check("no toggle on the main screen", [c for c in calls if c.startswith("toggleSetting")], [])
 labels = button_texts(last()[2])
-check("the speed row tells the speed", labels[0], bot.get_text("SETTINGS_ROW_SPEED", bot.get_text("NO_LIMIT")))
+check("the limits row leads to the limits", labels[0], bot.get_text("SETTINGS_ROW_LIMITS"))
+check("where the speed row tells the speed", button_texts(bot.build_settings("limits")[1])[0], bot.get_text("SETTINGS_ROW_SPEED", bot.get_text("NO_LIMIT")))
 check("the notices row counts them", labels[1], bot.get_text("SETTINGS_ROW_NOTIFY", 2, 4))
 check("the add row tells the mode", labels[2], bot.get_text("SETTINGS_ROW_ADD", bot.get_text("ADD_MODE_ASK")))
 check("the rename row tells its state", labels[3], bot.get_text("SETTINGS_ROW_RENAME", "❌"))
 check("the favorites row counts them", labels[4], bot.get_text("SETTINGS_ROW_FAV_DIRS", 0))
 check("an unknown screen is the main one", title_of(screen(bot.build_call("settings", "nope"))[0]), bot.get_text("SETTINGS_TITLE", "Fake 1.0"))
 
-titles = {"speed": "SETTINGS_SPEED_TITLE", "notify": "SETTINGS_NOTIFY_TITLE", "add": "SETTINGS_ADD_TITLE", "rename": "SETTINGS_RENAME_TITLE"}
+titles = {"limits": "SETTINGS_LIMITS_TITLE", "speed": "SETTINGS_SPEED_TITLE", "notify": "SETTINGS_NOTIFY_TITLE", "add": "SETTINGS_ADD_TITLE", "rename": "SETTINGS_RENAME_TITLE"}
 for name, key in titles.items():
 	text, calls = screen(bot.build_call("settings", name))
 	check(f"the {name} screen has its title", title_of(text), bot.get_text(key))
-	check(f"the {name} screen goes back to the main one", calls[-2:], [bot.build_call("settings", "main"), bot.build_call("cerrar")])
+	parent = "limits" if name == "speed" else "main"
+	check(f"the {name} screen goes back to the {parent} one", calls[-2:], [bot.build_call("settings", parent), bot.build_call("cerrar")])
 	for call in calls:
 		if call.startswith("toggleSetting"):
 			text, _ = screen(call)
@@ -959,11 +961,11 @@ for call, key in ((bot.build_call("toggleAltSpeed"), "SETTINGS_SPEED_TITLE"), (b
 	check(f"{call} repaints the speed screen", title_of(screen(call)[0]), bot.get_text(key))
 fresh()
 press(bot.build_call("toggleAltSpeed"))
-check("turtle mode shows on the main row", button_texts(bot.build_settings()[1])[0],
+check("turtle mode shows on the speed row", button_texts(bot.build_settings("limits")[1])[0],
 	bot.get_text("SETTINGS_ROW_SPEED", bot.get_text("SPEED_VALUE_ALT")))
 press(bot.build_call("toggleAltSpeed"))
 CLIENT.set_speed_limit("down", 5000)
-check("a limit shows on the main row", button_texts(bot.build_settings()[1])[0],
+check("a limit shows on the speed row", button_texts(bot.build_settings("limits")[1])[0],
 	bot.get_text("SETTINGS_ROW_SPEED", bot.get_text("SPEED_VALUE_LIMITS", "5000 KB/s", bot.get_text("NO_LIMIT"))))
 
 fresh(auto_download=True)

@@ -24,8 +24,9 @@ from torrent_clients import PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE
 import bot_settings
 import config as _config_module
 import telemetry
+import tracker_limits
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -762,6 +763,13 @@ def stop_live_view(chat_id, message_id, thread_id=None):
 # TORRENT LIST
 # ---------------------------------------------------------------------------
 
+def list_tracker(filter_key):
+	"""The tracker of a tracker filter, None for any other filter or an expired one"""
+	if is_known_filter(filter_key) or not filter_key.startswith("t"):
+		return None
+	return get_tracker_filter(filter_key[1:])
+
+
 def build_list(filter_key, page, refreshing=False):
 	torrents = get_filtered_torrents(filter_key)
 	total = len(torrents)
@@ -795,8 +803,16 @@ def build_list(filter_key, page, refreshing=False):
 			InlineKeyboardButton(get_text("BUTTON_MASS_DELETE"), callback_data=build_call("mass", "delete", filter_key)),
 			InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key)),
 		)
-		if client.supports_ratio_limit:
-			markup.row(InlineKeyboardButton(get_text("BUTTON_MASS_RATIO"), callback_data=build_call("mass", "ratio", filter_key)))
+	# On a tracker filter the limits of the tracker take the place of the ratio
+	# of all: they cover the torrents there are now and the ones that arrive
+	tracker = list_tracker(filter_key) if tracker_limits_supported() else None
+	if total > 0 and (client.supports_ratio_limit or client.supports_torrent_speed_limit) and not tracker:
+		# "ratio" is the name the limits of all had when they were only the ratio:
+		# kept, so the buttons already in the chats still work
+		markup.row(InlineKeyboardButton(get_text("BUTTON_MASS_LIMITS"), callback_data=build_call("mass", "ratio", filter_key)))
+	if tracker:
+		markup.row(InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_OF", "📌" if tracker_limits.get_rule(tracker) else "➕"),
+										callback_data=build_call("tlRule", tracker_limits.tracker_key(tracker), filter_key)))
 
 	markup.row(*live_buttons(refreshing, build_call("list", filter_key, page),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
@@ -1653,7 +1669,219 @@ def build_ratio_screen(torrent, filter_key, page):
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("info", torrent.id, filter_key, page)),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
 	)
+	# Told by the rule it got, not by its trackers: the list of a manager and
+	# the full torrent may name them differently (Deluge, qBittorrent)
+	rule_tracker = tracker_limits.applied_tracker(torrent.id) if tracker_limits_supported() else None
+	if rule_tracker:
+		lines += ["", get_text("LIMITS_FROM_TRACKER", html.escape(rule_tracker))]
 	return "\n".join(lines), markup
+
+
+# ---------------------------------------------------------------------------
+# LIMITS PER TRACKER
+# ---------------------------------------------------------------------------
+# A rule is applied to the torrents a tracker already has when it is changed
+# (only the value that changed), and by the monitor to the ones that arrive
+# (see tracker_limits for why each torrent gets it only once)
+
+def tracker_limits_supported():
+	return client.supports_ratio_limit or client.supports_torrent_speed_limit
+
+
+def tracker_rule_ratio_label(ratio):
+	if ratio is None:
+		return get_text("BUTTON_RATIO_GLOBAL")
+	return f"{ratio:g}" if ratio >= 0 else get_text("NO_LIMIT")
+
+
+def tracker_rule_summary(rule):
+	"""The values of a rule in a few characters, for its button"""
+	parts = []
+	if client.supports_ratio_limit and rule["ratio"] is not None:
+		parts.append(f"⚖️ {rule['ratio']:g}" if rule["ratio"] >= 0 else "⚖️ ♾️")
+	if client.supports_torrent_speed_limit and rule["down"] > 0:
+		parts.append(f"🔽 {rule['down']}")
+	if client.supports_torrent_speed_limit and rule["up"] > 0:
+		parts.append(f"🔼 {rule['up']}")
+	return " · ".join(parts) if parts else get_text("TRACKER_LIMITS_NONE_SET")
+
+
+def apply_rule_fields(torrent_ids, rule, fields):
+	if not torrent_ids:
+		return
+	if "ratio" in fields and client.supports_ratio_limit:
+		client.set_ratio_limit(torrent_ids, rule["ratio"])
+	for direction in ("down", "up"):
+		if direction in fields and client.supports_torrent_speed_limit:
+			client.set_torrent_speed_limit(torrent_ids, direction, rule[direction])
+
+
+def tracker_rule_torrent_ids(tracker, torrents):
+	"""Ids of the torrents that follow the rule of the tracker (or would, for a
+	tracker that has none yet): the ones whose main ruled tracker it is"""
+	current = tracker_limits.rules()
+	current.setdefault(tracker, dict(tracker_limits.EMPTY_RULE))
+	return [str(t.id) for t in torrents if tracker_limits.rule_tracker(t.trackers, current) == tracker]
+
+
+def known_trackers():
+	trackers = []
+	for torrent in client.get_torrents():
+		for tracker in torrent.trackers:
+			if tracker not in trackers:
+				trackers.append(tracker)
+	return trackers
+
+
+def tracker_from_key(key):
+	"""The tracker of a button, among the ones with a rule and the ones in use"""
+	tracker = tracker_limits.tracker_by_key(key)
+	if tracker is None:
+		tracker = tracker_limits.tracker_by_key(key, known_trackers())
+	return tracker
+
+
+def set_tracker_rule(tracker, field, value):
+	"""Changes one value of the rule and applies it to the torrents the tracker
+	already has. Returns how many got it"""
+	rule = tracker_limits.set_field(tracker, field, value)
+	torrents = client.get_torrents()
+	ids = tracker_rule_torrent_ids(tracker, torrents)
+	apply_rule_fields(ids, rule, [field])
+	tracker_limits.mark_applied(ids, tracker)
+	# A fresh and whole list of the manager: the moment to forget torrents that are gone
+	tracker_limits.prune(t.id for t in torrents)
+	return len(ids)
+
+
+def delete_tracker_rule(tracker, restore):
+	"""Removes the rule; with restore, its torrents go back to the manager's
+	ratio and no speed limits, for the values the rule had set. Returns how
+	many were restored"""
+	rule = tracker_limits.get_rule(tracker)
+	restored = 0
+	if restore and rule:
+		fields = tracker_limits.non_default_fields(rule)
+		ids = tracker_rule_torrent_ids(tracker, client.get_torrents())
+		apply_rule_fields(ids, tracker_limits.EMPTY_RULE, fields)
+		restored = len(ids) if fields else 0
+	tracker_limits.delete_rule(tracker)
+	return restored
+
+
+def apply_pending_tracker_limits(torrents):
+	"""Gives the rule of their tracker to the torrents that did not get it yet:
+	new ones, the ones added while the bot was down, and the ones whose tracker
+	the manager did not know yet (a magnet before its first announce)"""
+	for tracker, ids in tracker_limits.pending(torrents):
+		rule = tracker_limits.get_rule(tracker)
+		fields = tracker_limits.non_default_fields(rule)
+		try:
+			apply_rule_fields(ids, rule, fields)
+		except PermanentTorrentError as e:
+			warning(f"Cannot apply the limits of the tracker {tracker}, giving up on {len(ids)} torrents: {e}")
+		except TorrentClientError as e:
+			# Tried again on the next poll
+			warning(f"Cannot apply the limits of the tracker {tracker} to {len(ids)} torrents: {e}")
+			continue
+		else:
+			if fields:
+				debug(f"Limits of the tracker {tracker} applied to {len(ids)} torrents")
+				count_usage("auto_tracker_limits")
+		tracker_limits.mark_applied(ids, tracker)
+
+
+def tracker_rule_back(back_filter):
+	"""Where the back button of a rule goes: the list of the tracker filter it
+	was opened from, or the screen of the rules"""
+	return build_call("list", back_filter, 0) if back_filter else settings_call("tlimits")
+
+
+def build_tracker_rule_screen(tracker, back_filter="", done=None):
+	key = tracker_limits.tracker_key(tracker)
+	extra = (back_filter,) if back_filter else ()
+	rule = tracker_limits.get_rule(tracker)
+	shown = rule or tracker_limits.EMPTY_RULE
+	count = len(tracker_rule_torrent_ids(tracker, client.get_torrents()))
+	lines = []
+	if done:
+		lines += [done, ""]
+	lines += [get_text("TRACKER_LIMITS_RULE_TITLE", html.escape(tracker)), get_text("TRACKER_LIMITS_COUNT", count), ""]
+	if client.supports_ratio_limit:
+		lines.append(get_text("TRACKER_LIMITS_RATIO", tracker_rule_ratio_label(shown["ratio"])))
+	if client.supports_torrent_speed_limit:
+		lines.append(get_text("LIMITS_DOWN", speed_limit_text(shown["down"])))
+		lines.append(get_text("LIMITS_UP", speed_limit_text(shown["up"])))
+	lines += ["", get_text("TRACKER_LIMITS_RULE_HELP")]
+	markup = InlineKeyboardMarkup()
+	if client.supports_ratio_limit:
+		ratio = shown["ratio"]
+		selected = "g" if ratio is None else ("n" if ratio < 0 else "v")
+		for row in ratio_option_rows(ratio if ratio is not None else -1, selected,
+									lambda value: build_call("tlRatio", key, value, *extra),
+									build_call("tlRatioAsk", key, *extra), with_global=True):
+			markup.row(*row)
+	if client.supports_torrent_speed_limit:
+		markup.row(
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_DOWN_LIMIT"), callback_data=build_call("tlSpeedAsk", key, "down", *extra)),
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_UP_LIMIT"), callback_data=build_call("tlSpeedAsk", key, "up", *extra)),
+		)
+	if rule is not None:
+		markup.row(InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_DELETE"), callback_data=build_call("tlDel", key, *extra)))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=tracker_rule_back(back_filter)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
+
+
+def build_tracker_rule_delete(tracker, back_filter=""):
+	key = tracker_limits.tracker_key(tracker)
+	extra = (back_filter,) if back_filter else ()
+	count = len(tracker_rule_torrent_ids(tracker, client.get_torrents()))
+	text = get_text("TRACKER_LIMITS_DELETE_ASK", html.escape(tracker), count)
+	markup = InlineKeyboardMarkup(row_width=1)
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_DELETE_RESTORE"), callback_data=build_call("tlDelOk", key, "1", *extra)))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_DELETE_KEEP"), callback_data=build_call("tlDelOk", key, "0", *extra)))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("tlRule", key, *extra)))
+	return text, markup
+
+
+def build_tracker_rule_pick():
+	"""The trackers in use that have no rule yet, most used first"""
+	current = tracker_limits.rules()
+	counts = Counter()
+	for torrent in client.get_torrents():
+		for tracker in torrent.trackers:
+			if tracker not in current:
+				counts[tracker] += 1
+	text = get_text("TRACKER_LIMITS_PICK")
+	if not counts:
+		text += f"\n\n{get_text('TRACKERS_EMPTY')}"
+	markup = InlineKeyboardMarkup(row_width=1)
+	for tracker, count in counts.most_common(MAX_TRACKER_BUTTONS):
+		markup.add(InlineKeyboardButton(f"🌐 {truncate(tracker)} ({count})",
+										callback_data=build_call("tlRule", tracker_limits.tracker_key(tracker))))
+	return text, settings_nav(markup, back=settings_call("tlimits"))
+
+
+def build_settings_tracker_limits():
+	current = tracker_limits.rules()
+	lines = [get_text("SETTINGS_TRACKER_LIMITS_TITLE"), "", get_text("SETTINGS_TRACKER_LIMITS_HELP")]
+	if not current:
+		lines += ["", get_text("TRACKER_LIMITS_EMPTY")]
+	markup = InlineKeyboardMarkup(row_width=1)
+	for tracker in sorted(current):
+		markup.add(InlineKeyboardButton(f"🌐 {truncate(tracker, 28)} · {tracker_rule_summary(current[tracker])}",
+										callback_data=build_call("tlRule", tracker_limits.tracker_key(tracker))))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_ADD"), callback_data=build_call("tlAdd")))
+	return "\n".join(lines), settings_nav(markup, back=settings_call("limits"))
+
+
+def send_tracker_rule_screen(chat_id, thread_id, tracker, back_filter, done):
+	"""After a typed value: back on the rule, as when a preset is pressed"""
+	text, markup = build_tracker_rule_screen(tracker, back_filter, done=done)
+	send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1959,12 +2187,10 @@ def build_settings_main():
 	def row(text, call):
 		markup.add(InlineKeyboardButton(text, callback_data=call))
 
-	row(get_text("SETTINGS_ROW_SPEED", speed_label(settings)), settings_call("speed"))
+	row(get_text("SETTINGS_ROW_LIMITS"), settings_call("limits"))
 	notices = [key for key in NOTIFY_SETTINGS if key != "notify_ratio_reached" or client.supports_ratio_limit]
 	enabled_notices = sum(1 for key in notices if bot_settings.get(key))
 	row(get_text("SETTINGS_ROW_NOTIFY", enabled_notices, len(notices)), settings_call("notify"))
-	if client.supports_ratio_limit:
-		row(get_text("SETTINGS_ROW_RATIO", global_ratio_label(client.get_global_ratio_limit())), settings_call("ratio"))
 	add_mode = "ADD_MODE_AUTO" if bot_settings.get("auto_download") else "ADD_MODE_ASK"
 	row(get_text("SETTINGS_ROW_ADD", get_text(add_mode)), settings_call("add"))
 	if client.supports_rename:
@@ -1975,6 +2201,20 @@ def build_settings_main():
 	lines = [get_text("SETTINGS_TITLE", settings["version"]), "",
 			get_text("SETTINGS_DEFAULT_DIR", html.escape(settings["download_dir"]))]
 	return "\n".join(lines), markup
+
+
+def build_settings_limits():
+	"""The limits of the manager (speed and ratio) and the ones per tracker"""
+	settings = client.get_settings()
+	markup = InlineKeyboardMarkup(row_width=1)
+	markup.add(InlineKeyboardButton(get_text("SETTINGS_ROW_SPEED", speed_label(settings)), callback_data=settings_call("speed")))
+	if client.supports_ratio_limit:
+		markup.add(InlineKeyboardButton(get_text("SETTINGS_ROW_RATIO", global_ratio_label(client.get_global_ratio_limit())),
+										callback_data=settings_call("ratio")))
+	if tracker_limits_supported():
+		markup.add(InlineKeyboardButton(get_text("SETTINGS_ROW_TRACKER_LIMITS", len(tracker_limits.rules())),
+										callback_data=settings_call("tlimits")))
+	return "\n".join([get_text("SETTINGS_LIMITS_TITLE"), "", get_text("SETTINGS_LIMITS_HELP")]), settings_nav(markup)
 
 
 def build_settings_speed():
@@ -1994,7 +2234,7 @@ def build_settings_speed():
 		InlineKeyboardButton(get_text("BUTTON_SET_DOWN_LIMIT"), callback_data=build_call("setDownLimit")),
 		InlineKeyboardButton(get_text("BUTTON_SET_UP_LIMIT"), callback_data=build_call("setUpLimit")),
 	)
-	return "\n".join(lines), settings_nav(markup)
+	return "\n".join(lines), settings_nav(markup, back=settings_call("limits"))
 
 
 def global_ratio_label(limit):
@@ -2011,7 +2251,7 @@ def build_settings_ratio():
 	for row in ratio_option_rows(limit, "n" if limit < 0 else "v", lambda value: build_call("globalRatioSet", value),
 								build_call("globalRatioAsk")):
 		markup.row(*row)
-	return "\n".join(lines), settings_nav(markup)
+	return "\n".join(lines), settings_nav(markup, back=settings_call("limits"))
 
 
 def build_settings_notify():
@@ -2061,18 +2301,21 @@ def build_settings_rename():
 
 SETTINGS_SCREENS = {
 	"main": build_settings_main,
+	"limits": build_settings_limits,
 	"speed": build_settings_speed,
 	"ratio": build_settings_ratio,
 	"notify": build_settings_notify,
 	"add": build_settings_add,
 	"rename": build_settings_rename,
+	"tlimits": build_settings_tracker_limits,
 }
 
 
 def build_settings(screen="main"):
 	"""(text, markup) of a settings screen; an unknown one is the main screen.
 	The rename screen does not exist for a manager that cannot rename"""
-	if (screen == "rename" and not client.supports_rename) or (screen == "ratio" and not client.supports_ratio_limit):
+	if ((screen == "rename" and not client.supports_rename) or (screen == "ratio" and not client.supports_ratio_limit)
+			or (screen == "tlimits" and not tracker_limits_supported())):
 		screen = "main"
 	return SETTINGS_SCREENS.get(screen, build_settings_main)()
 
@@ -2183,6 +2426,7 @@ def collect_telemetry_metrics():
 		"low_space_warning": bool(bot_settings.get("low_space_warning")),
 		"favorite_dirs": len(bot_settings.get("favorite_dirs") or []),
 		"custom_templates": sum(1 for key in ("template_movie", "template_series", "template_season") if bot_settings.get(key)),
+		"tracker_limits": len(tracker_limits.rules()) if tracker_limits_supported() else 0,
 	}
 	try:
 		match = re.search(r"(\d+)\.", client.test_connection())
@@ -2934,10 +3178,9 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "0")))
 		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "1")))
 	elif action == "ratio":
-		text = get_text("MASS_RATIO_ASK", count)
-		for row in ratio_option_rows(-1, "", lambda value: build_call("confirmMass", "ratio", filter_key, value),
-									build_call("massRatioAsk", filter_key), with_global=True):
-			markup.row(*row)
+		text, markup = build_mass_limits(filter_key, count)
+		edit_message(chat_id, message_id, text, markup)
+		return
 	elif action == "move":
 		text = get_text("MASS_MOVE_ASK_DIR", count)
 		markup = build_dir_markup(
@@ -2952,6 +3195,29 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 	if action != "move":
 		markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=back_call))
 	edit_message(chat_id, message_id, text, markup)
+
+
+def build_mass_limits(filter_key, count, done=None):
+	"""The limits of every torrent of a filter or search: nothing is marked,
+	since each one may have its own, and every choice stays on the screen"""
+	lines = [done, ""] if done else []
+	lines.append(get_text("MASS_LIMITS_TITLE", count))
+	markup = InlineKeyboardMarkup()
+	if client.supports_ratio_limit:
+		lines += ["", get_text("MASS_RATIO_HINT")]
+		for row in ratio_option_rows(-1, "", lambda value: build_call("confirmMass", "ratio", filter_key, value),
+									build_call("massRatioAsk", filter_key), with_global=True):
+			markup.row(*row)
+	if client.supports_torrent_speed_limit:
+		markup.row(
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_DOWN_LIMIT"), callback_data=build_call("massSpeedAsk", filter_key, "down")),
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_UP_LIMIT"), callback_data=build_call("massSpeedAsk", filter_key, "up")),
+		)
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, 0)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
 
 
 def mass_ratio_label(limit):
@@ -2985,7 +3251,18 @@ def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
 			if limit is None and extra != "g":
 				return
 			client.set_ratio_limit(ids, limit)
-			text = get_text("MASS_DONE_RATIO", count, mass_ratio_label(limit))
+			text, markup = build_mass_limits(filter_key, count, done=get_text("MASS_DONE_RATIO", count, mass_ratio_label(limit)))
+			edit_message(chat_id, message_id, text, markup)
+			return
+		elif action == "speed":
+			direction, _, kbps = (extra or "").partition(":")
+			if direction not in ("down", "up") or not kbps.isdigit():
+				return
+			client.set_torrent_speed_limit(ids, direction, int(kbps))
+			done = get_text("MASS_DONE_DOWN" if direction == "down" else "MASS_DONE_UP", count, speed_limit_text(int(kbps)))
+			text, markup = build_mass_limits(filter_key, count, done=done)
+			edit_message(chat_id, message_id, text, markup)
+			return
 		elif action == "delete":
 			client.remove_torrents(ids, delete_data=extra == "1")
 			text = get_text("MASS_DONE_DELETE", count)
@@ -3153,6 +3430,17 @@ def handle_pending_input(message, pending):
 		sent = send_message(chat_id, "⏳", thread_id=thread_id)
 		if sent:
 			do_mass_action(chat_id, sent.message_id, "ratio", pending["filter_key"], f"{limit:g}")
+	elif action == "massSpeed":
+		try:
+			kbps = int(text)
+			if kbps < 0:
+				raise ValueError()
+		except ValueError:
+			send_message(chat_id, get_text("INVALID_NUMBER"), reply_markup=back_markup, thread_id=thread_id)
+			return
+		sent = send_message(chat_id, "⏳", thread_id=thread_id)
+		if sent:
+			do_mass_action(chat_id, sent.message_id, "speed", pending["filter_key"], f"{pending['direction']}:{kbps}")
 	elif action == "massMove":
 		do_mass_move_to(chat_id, pending["filter_key"], text, thread_id=thread_id)
 	elif action == "ratioLimit":
@@ -3176,6 +3464,29 @@ def handle_pending_input(message, pending):
 		try:
 			client.set_torrent_speed_limit([pending["torrent_id"]], pending["direction"], kbps)
 			send_limits_screen(chat_id, thread_id, pending, get_text("LIMIT_SET_OK"), back_markup)
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
+	elif action == "trackerRatio":
+		limit = parse_ratio(text)
+		if limit is None:
+			send_message(chat_id, get_text("RATIO_INVALID", MAX_RATIO_LIMIT), reply_markup=back_markup, thread_id=thread_id)
+			return
+		try:
+			count = set_tracker_rule(pending["tracker"], "ratio", limit)
+			send_tracker_rule_screen(chat_id, thread_id, pending["tracker"], pending["back_filter"], get_text("TRACKER_LIMITS_APPLIED", count))
+		except TorrentClientError as e:
+			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
+	elif action == "trackerSpeed":
+		try:
+			kbps = int(text)
+			if kbps < 0:
+				raise ValueError()
+		except ValueError:
+			send_message(chat_id, get_text("INVALID_NUMBER"), reply_markup=back_markup, thread_id=thread_id)
+			return
+		try:
+			count = set_tracker_rule(pending["tracker"], pending["direction"], kbps)
+			send_tracker_rule_screen(chat_id, thread_id, pending["tracker"], pending["back_filter"], get_text("TRACKER_LIMITS_APPLIED", count))
 		except TorrentClientError as e:
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 	elif action == "globalRatio":
@@ -4102,6 +4413,13 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			action, filter_key, extra = args[0], args[1], args[2]
 			do_mass_action(chat_id, message_id, action, filter_key, extra)
 
+		elif command == "massSpeedAsk":
+			filter_key = args[0]
+			direction = "up" if args[1:2] == ["up"] else "down"
+			ask_for_input(chat_id, user_id, "massSpeed", get_text("MASS_LIMITS_ASK_UP" if direction == "up" else "MASS_LIMITS_ASK_DOWN"),
+						thread_id=thread_id, message_id=message_id, filter_key=filter_key, direction=direction,
+						back_call=build_call("mass", "ratio", filter_key))
+
 		elif command == "massRatioAsk":
 			filter_key = args[0]
 			ask_for_input(chat_id, user_id, "massRatio", get_text("MASS_RATIO_ASK_VALUE"), thread_id=thread_id, message_id=message_id,
@@ -4141,6 +4459,51 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 
 		elif command == "settings":
 			render_settings(chat_id, message_id, args[0] if args else "main")
+
+		elif command == "tlAdd":
+			text, markup = build_tracker_rule_pick()
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command in ("tlRule", "tlRatio", "tlRatioAsk", "tlSpeedAsk", "tlDel", "tlDelOk"):
+			tracker = tracker_from_key(args[0]) if args else None
+			if tracker is None:
+				edit_message(chat_id, message_id, get_text("TRACKER_LIMITS_GONE"), back_close_markup(settings_call("tlimits")))
+				return
+			# The tracker filter the rule was opened from, the last argument of every button
+			back_filter = {"tlRule": args[1:2], "tlRatio": args[2:3], "tlRatioAsk": args[1:2], "tlSpeedAsk": args[2:3],
+						"tlDel": args[1:2], "tlDelOk": args[2:3]}[command]
+			back_filter = back_filter[0] if back_filter else ""
+			rule_call = build_call("tlRule", args[0], *([back_filter] if back_filter else []))
+			done = None
+			if command == "tlRatioAsk":
+				ask_for_input(chat_id, user_id, "trackerRatio", get_text("TRACKER_LIMITS_ASK_RATIO", html.escape(tracker)),
+							thread_id=thread_id, message_id=message_id, tracker=tracker, back_filter=back_filter, back_call=rule_call)
+				return
+			if command == "tlSpeedAsk":
+				direction = "up" if args[1:2] == ["up"] else "down"
+				prompt = "TRACKER_LIMITS_ASK_UP" if direction == "up" else "TRACKER_LIMITS_ASK_DOWN"
+				ask_for_input(chat_id, user_id, "trackerSpeed", get_text(prompt, html.escape(tracker)), thread_id=thread_id,
+							message_id=message_id, tracker=tracker, direction=direction, back_filter=back_filter, back_call=rule_call)
+				return
+			if command == "tlDel":
+				text, markup = build_tracker_rule_delete(tracker, back_filter)
+				edit_message(chat_id, message_id, text, markup)
+				return
+			if command == "tlDelOk":
+				restored = delete_tracker_rule(tracker, restore=args[1:2] == ["1"])
+				text = get_text("TRACKER_LIMITS_DELETED", html.escape(tracker))
+				if restored:
+					text += "\n" + get_text("TRACKER_LIMITS_RESTORED", restored)
+				edit_message(chat_id, message_id, text, back_close_markup(tracker_rule_back(back_filter)))
+				return
+			if command == "tlRatio":
+				value = args[1] if len(args) > 1 else ""
+				limit = None if value == "g" else (-1 if value == "n" else parse_ratio(value))
+				if limit is not None or value == "g":
+					count = set_tracker_rule(tracker, "ratio", limit)
+					done = get_text("TRACKER_LIMITS_APPLIED", count)
+			text, markup = build_tracker_rule_screen(tracker, back_filter, done=done)
+			edit_message(chat_id, message_id, text, markup)
 
 		elif command == "toggleAltSpeed":
 			settings = client.get_settings()
@@ -4443,6 +4806,11 @@ def poll_torrents(states):
 				count_usage("auto_notify_error")
 				notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
 		states[torrent_id] = state
+	if tracker_limits_supported():
+		try:
+			apply_pending_tracker_limits(torrents)
+		except Exception as e:
+			warning(f"Cannot apply the limits per tracker: {e}")
 	return states
 
 

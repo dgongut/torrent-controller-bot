@@ -23,10 +23,11 @@ Control your torrent client from a single place.
 - ✅ Pause, resume, verify, reannounce to the tracker and delete torrents (with or without their data)
 - ✅ Move torrents to another directory with a notice when the move finishes
 - ✅ Per torrent limits: up to which ratio each one seeds (the manager's, no limit, 0.5, 1, 2 or any other value) and its download and upload speed, and the manager's own ratio from the settings
+- ✅ Limits per tracker: ratio and speed for every torrent of a tracker, the ones it already has and the ones that arrive later (for example, seed forever on private trackers and just a little on public ones), from the settings or from the filter of that tracker
 - ✅ Renaming with automatic suggestion for movies and series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
 - ✅ Renaming the folders and files inside a torrent, one by one or in batch, dragging their subtitles along
 - ✅ Complete series: renames the folder, the season subfolders and the episodes in one go
-- ✅ Mass actions over a filter or search: resume, pause, delete, move all or set their ratio limit
+- ✅ Mass actions over a filter or search: resume, pause, delete, move all or set their ratio and speed limits
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
 - ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits
@@ -169,6 +170,7 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 | Alternative speed (turtle mode) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Ratio limit, per torrent and the manager's | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
 | Speed limit per torrent | ✅ | ✅ | ✅ | ❌ ⁶ |
+| Limits per tracker | ✅ | ✅ ⁸ | ✅ ⁸ | ❌ ⁶ |
 | Reannounce to the tracker | ✅ | ✅ | ✅ | ❌ ⁷ |
 | Verify the data | ✅ | ✅ | ✅ | ❌ ² |
 | Smart, manual and automatic renaming | ✅ | ✅ | ✅ | ❌ ³ |
@@ -187,6 +189,8 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 ⁶ Download Station only has a global ratio and global speed limits in its settings; its API cannot change them for a single task.
 
 ⁷ The Download Station API has no way to ask the tracker for peers on demand.
+
+⁸ In their torrent lists, qBittorrent and Deluge only tell the tracker each torrent is working with (Deluge, besides, by its domain: `tracker.example.org` shows as `example.org`). A torrent just added gets the limits of its tracker as soon as it announces for the first time, and one with several trackers, by the one it is using at that moment.
 
 ## Synology Download Station
 
