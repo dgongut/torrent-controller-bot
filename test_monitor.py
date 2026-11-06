@@ -55,6 +55,9 @@ class FakeClient:
 	supports_torrent_speed_limit = False
 	ratio_limit_copied_on_add = False
 	supports_reannounce = False
+	reports_last_activity = True
+	skipped_files_in_size = False
+	file_priority_levels = ()
 	supports_rename = True
 	supports_verify = True
 	supports_categories = False
@@ -1231,8 +1234,12 @@ for auto_replace, notify_completed, expected in ((False, True, "REPLACE_HINT_ASK
 
 # The buttons under the notice
 def press(*parts):
+	return press_call(bot.build_call(*parts))
+
+
+def press_call(call):
 	EDITS.clear()
-	bot.dispatch_callback(1, 100, 1, bot.build_call(*parts))
+	bot.dispatch_callback(1, 100, 1, call)
 	return EDITS[-1] if EDITS else (None, None)
 
 
@@ -1242,20 +1249,21 @@ new = CLIENT.put(movie())
 text, markup = press("replace", new.id)
 check("the confirmation names what is deleted", bot.html.escape(old.name) in text and old.download_dir in text, True)
 check("and the name the new one takes", bot.html.escape(MOVIE_RENAMED) in text and bot.html.escape(new.name) in text, True)
-check("it confirms or goes back", buttons(markup), [f"replaceOk|{new.id}", f"replaceNo|{new.id}"])
+check("it confirms or goes back", [buttons(markup)[0][:len("replaceOk|r")], buttons(markup)[1]], ["replaceOk|r", f"replaceNo|{new.id}"])
+ok_call = buttons(markup)[0]
 check("the confirmation buttons fit in callback_data", all(len(b.encode()) <= bot.MAX_CALLBACK_DATA_BYTES for b in buttons(markup)), True)
 check("asking deletes nothing", removals(), [])
 text, markup = press("replaceNo", new.id)
 check("going back shows the notice again", (text, buttons(markup)),
 	(offer_text(new.name, MOVIE_RENAMED), [f"replace|{new.id}", f"replaceSkip|{new.id}"]))
-text, markup = press("replaceOk", new.id)
+text, markup = press_call(ok_call)
 check("confirming deletes the previous one with its data", removals(), [("remove_torrents", [old.id], True)])
 check("and renames the new one", CLIENT.torrents[new.id].name, MOVIE_RENAMED)
 check("the notice tells it", text, f"{completed_text(MOVIE_NAME)}\n\n{replaced_text([old], MOVIE_RENAMED)}")
 check("with no buttons left", markup, None)
 text, _ = press("replace", new.id)
 check("pressing again finds nothing to replace", bot.get_text("REPLACE_NOTHING") in text, True)
-text, _ = press("replaceOk", new.id)
+text, _ = press_call(ok_call)
 check("confirming again deletes nothing else", len(removals()), 1)
 check("and says so", bot.get_text("REPLACE_NOTHING") in text, True)
 text, _ = press("replace", "f" * 40)
@@ -1270,7 +1278,8 @@ text, markup = press("replaceSkip", new.id)
 check("not replacing leaves the plain completion notice", (text, markup), (completed_text(new.name), None))
 check("and touches nothing", (removals(), renames(), sorted(CLIENT.torrents)), ([], [], sorted([old.id, new.id])))
 text, markup = press("replace", new.id)
-check("pressed again later it still offers to replace", buttons(markup), [f"replaceOk|{new.id}", f"replaceNo|{new.id}"])
+check("pressed again later it still offers to replace", [buttons(markup)[0][:len("replaceOk|r")], buttons(markup)[1]],
+	["replaceOk|r", f"replaceNo|{new.id}"])
 # The torrent is gone: the name in the notice is kept
 del CLIENT.torrents[new.id]
 EDITS.clear()
@@ -1280,10 +1289,28 @@ check("a torrent gone keeps its name in the notice", EDITS[-1], (completed_text(
 fresh()
 old = old_copy()
 new = CLIENT.put(movie())
-press("replace", new.id)
+_, markup = press("replace", new.id)
 del CLIENT.torrents[old.id]
-text, _ = press("replaceOk", new.id)
+text, _ = press_call(buttons(markup)[0])
 check("a previous one deleted meanwhile is not deleted again", (removals(), renames()), ([], []))
+# The confirmation deletes what it listed, never what has turned up since
+fresh()
+old = old_copy()
+new = CLIENT.put(movie())
+_, markup = press("replace", new.id)
+newer_old = old_copy(directory="/media/older")
+text, _ = press_call(buttons(markup)[0])
+check("a confirmation only deletes the torrents it listed", removals(), [("remove_torrents", [old.id], True)])
+check("and leaves the one that turned up after it", newer_old.id in CLIENT.torrents, True)
+# A confirm button from before the confirmation kept what it listed only asks again
+fresh()
+old = old_copy()
+new = CLIENT.put(movie())
+text, markup = press("replaceOk", new.id)
+check("an old confirm button deletes nothing", removals(), [])
+check("and shows the confirmation again, listed now", buttons(markup)[0][:len("replaceOk|r")], "replaceOk|r")
+text, _ = press("replaceOk", "r000000")
+check("an expired confirmation says so and deletes nothing", (text, removals()), (bot.get_text("REPLACE_EXPIRED"), []))
 # A torrent that shares the files is not offered from the button either
 fresh()
 new = CLIENT.put(movie())
@@ -1558,11 +1585,11 @@ bot.dispatch_callback(1, 7, 1, bot.build_call("tlRatio", key, "1"))
 check("pressing a ratio applies it and says to how many", bot.get_text("TRACKER_LIMITS_APPLIED", 1) in EDITS[-1][0], True)
 check("the torrent has it", CLIENT.torrents[public_one.id].ratio_limit, 1)
 filter_key = "t" + bot.new_tracker_context(PUBLIC)
-text, markup = bot.build_list(filter_key, 0)
+text, markup = bot.build_mass_menu(filter_key, 0)
 calls = [b.callback_data for row in markup.keyboard for b in row]
-check("the list of a tracker filter leads to its limits", bot.build_call("tlRule", key, filter_key) in calls, True)
+check("the actions on all of a tracker filter lead to its limits", bot.build_call("tlRule", key, filter_key) in calls, True)
 check("instead of the ratio of all", bot.build_call("mass", "ratio", filter_key) in calls, False)
-text, markup = bot.build_list("all", 0)
+text, markup = bot.build_mass_menu("all", 0)
 check("which the other filters keep", bot.build_call("mass", "ratio", "all") in [b.callback_data for row in markup.keyboard for b in row], True)
 _, markup = bot.build_settings()
 check("the settings group every limit under one row", [b.callback_data for row in markup.keyboard for b in row][0], bot.settings_call("limits"))
@@ -1607,6 +1634,98 @@ for key in ("BUTTON_SETTING_AUTO_REPLACE", "SETTINGS_AUTO_REPLACE", "REPLACE_MOD
 	check(f"{key} has the same placeholders in both languages",
 		sorted(re.findall(r"\$\d", locales["es"].get(key, ""))), sorted(re.findall(r"\$\d", locales["en"].get(key, ""))))
 check("both languages have exactly the same keys", sorted(locales["es"]), sorted(locales["en"]))
+
+# ---------------------------------------------------------------------------
+# REVIEW FIXES: each block is a bug that was reproduced before it was fixed
+# ---------------------------------------------------------------------------
+
+# A recheck is not a download: qBittorrent and Deluge give the progress of the
+# check while it runs, so a finished torrent goes 100 -> 0 -> 100
+for label, steps in (("qBittorrent", [(TorrentStatus.CHECKING, 0.0), (TorrentStatus.CHECKING, 37.0)]),
+					("Deluge", [(TorrentStatus.QUEUED, 0.0), (TorrentStatus.CHECKING, 0.0)])):
+	fresh()
+	rechecked = CLIENT.put(movie(progress=100.0))
+	rechecked.status = TorrentStatus.SEEDING
+	states = poll(None)
+	for status, progress in steps + [(TorrentStatus.SEEDING, 100.0)]:
+		rechecked.status, rechecked.progress = status, progress
+		states = poll(states)
+	check(f"[{label}] a recheck of a finished torrent is not a new completion", texts(), [])
+
+fresh()
+states = poll(None)
+checked = CLIENT.put(movie(progress=0.0))
+checked.status = TorrentStatus.CHECKING
+states = poll(states)
+checked.status, checked.progress = TorrentStatus.SEEDING, 100.0
+states = poll(states)
+check("data that was already there, checked complete, is not announced as downloaded", texts(), [])
+
+fresh()
+states = poll(None)
+queued = CLIENT.put(movie(progress=0.0))
+queued.status = TorrentStatus.QUEUED
+states = poll(states)
+queued.status, queued.progress = TorrentStatus.SEEDING, 100.0
+states = poll(states)
+check("a queued download that finishes is announced", texts(), [completed_text(queued.name)])
+
+fresh()
+nothing_wanted = CLIENT.put(movie(progress=10.0))
+states = poll(None)
+nothing_wanted.progress, nothing_wanted.total_size = 100.0, 0  # Deluge with every file left out
+states = poll(states)
+check("a torrent with every file left out is not announced as finished", texts(), [])
+
+# Replacing: a torrent that is not a whole copy never deletes the previous one
+fresh(auto_rename=True, auto_replace=True)
+old = old_copy(name=SERIES_RENAMED)
+partial = CLIENT.put(series())
+partial.file_priorities = {f"{SERIES_NAME}/Show.Name.S02E02.1080p.mkv": bot.FILE_SKIP}
+states = finish(partial, poll(None))
+check("a pack with episodes left out never replaces the previous one", removals(), [])
+check("it is only announced as completed", texts(), [completed_text(partial.name)])
+fresh(auto_rename=True)
+old = old_copy(name=SERIES_RENAMED)
+partial = CLIENT.put(series())
+partial.file_priorities = {f"{SERIES_NAME}/Show.Name.S02E02.1080p.mkv": bot.FILE_SKIP}
+states = finish(partial, poll(None))
+check("nor is it offered to replace it", texts(), [completed_text(partial.name)])
+fresh(auto_rename=True, auto_replace=True)
+old = old_copy(name=SERIES_RENAMED)
+old.files = [(f"{SERIES_RENAMED}/Show.Name.S02E{n:02d}.mkv", 400, True) for n in range(1, 9)]
+smaller = CLIENT.put(series())
+states = finish(smaller, poll(None))
+check("a torrent with fewer videos never replaces one with more", removals(), [])
+
+# A manager busy right after the delete does not leave the replace half done
+fresh(auto_rename=True, auto_replace=True)
+old = old_copy()
+new = CLIENT.put(movie())
+_real_client_remove = CLIENT.remove_torrents
+_real_client_get = CLIENT.get_torrent
+busy = [0]
+
+
+def remove_then_busy(torrent_ids, delete_data=False):
+	_real_client_remove(torrent_ids, delete_data)
+	busy[0] = 3
+
+
+def busy_get(torrent_id):
+	if busy[0] > 0:
+		busy[0] -= 1
+		raise TorrentClientError("busy deleting")
+	return _real_client_get(torrent_id)
+
+
+CLIENT.remove_torrents = remove_then_busy
+CLIENT.get_torrent = busy_get
+states = finish(new, poll(None))
+CLIENT.get_torrent = _real_client_get
+CLIENT.remove_torrents = _real_client_remove
+check("a manager busy right after the delete does not stop the rename", CLIENT.torrents[new.id].name, MOVIE_RENAMED)
+check("nor the notice of what was done", any(replaced_text([old], MOVIE_RENAMED) in t for t in texts()), True)
 
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")

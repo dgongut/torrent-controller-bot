@@ -6,6 +6,11 @@ from urllib.parse import urlparse
 import transmission_rpc
 
 from torrent_clients.base import (
+	DuplicateTorrentError,
+	FILE_HIGH,
+	FILE_LOW,
+	FILE_NORMAL,
+	FILE_SKIP,
 	RATIO_MODE_GLOBAL,
 	RATIO_MODE_NONE,
 	RATIO_MODE_TORRENT,
@@ -15,6 +20,8 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	capped_progress,
+	clean_ratio,
 	content_root,
 	query_matcher,
 	sort_files,
@@ -24,21 +31,21 @@ from torrent_clients.base import (
 LIGHT_FIELDS = [
 	"id", "name", "status", "error", "errorString", "percentDone",
 	"sizeWhenDone", "rateDownload", "rateUpload", "downloadDir", "addedDate",
-	"trackers", "hashString",
+	"trackers", "hashString", "uploadRatio", "activityDate", "leftUntilDone",
 ]
 
 FULL_FIELDS = LIGHT_FIELDS + [
-	"totalSize", "downloadedEver", "uploadedEver", "uploadRatio", "eta",
+	"totalSize", "downloadedEver", "uploadedEver", "eta",
 	"peersConnected", "peersSendingToUs", "peersGettingFromUs",
 	"files", "isFinished",
-	"secondsSeeding", "doneDate", "activityDate", "seedRatioLimit", "seedRatioMode",
+	"secondsSeeding", "doneDate", "seedRatioLimit", "seedRatioMode",
 	"downloadLimit", "downloadLimited", "uploadLimit", "uploadLimited",
 	"isPrivate", "trackerStats",
 	# get_files() combines these three: without them it raises KeyError
 	"fileStats", "priorities", "wanted",
 ]
 
-SUMMARY_FIELDS = ["id", "status", "error", "percentDone", "rateDownload", "rateUpload"]
+SUMMARY_FIELDS = ["id", "status", "error", "percentDone", "leftUntilDone", "rateDownload", "rateUpload"]
 
 # Generous timeout for move orders: the daemon can be slow to answer the RPC
 # while it is relocating large amounts of data
@@ -60,6 +67,12 @@ STATUS_MAP = {
 	"seed pending": TorrentStatus.QUEUED,
 	"seeding": TorrentStatus.SEEDING,
 }
+
+
+# File priority of Transmission -> normalized one, for the files it downloads
+FILE_PRIORITIES = {-1: FILE_LOW, 0: FILE_NORMAL, 1: FILE_HIGH}
+# Argument of change_torrent that gives each normalized priority
+PRIORITY_ARGUMENTS = {FILE_LOW: "priority_low", FILE_NORMAL: "priority_normal", FILE_HIGH: "priority_high"}
 
 
 HEX_DIGITS = set("0123456789abcdefABCDEF")
@@ -103,6 +116,11 @@ class TransmissionClient(TorrentClient):
 		except Exception:
 			return default
 
+	def _progress(self, torrent):
+		"""percentDone is a share of the wanted bytes: only the bytes left tell
+		a big torrent that lacks a few MB (99.999 %) from a finished one"""
+		return capped_progress((self._raw(torrent, "percentDone", 0) or 0) * 100, self._raw(torrent, "leftUntilDone"))
+
 	def _normalize_status(self, torrent):
 		if self._raw(torrent, "error", 0):
 			return TorrentStatus.ERROR
@@ -141,13 +159,15 @@ class TransmissionClient(TorrentClient):
 
 	def _to_info(self, torrent, full=False, session_ratio_limit=-1):
 		files = []
+		priorities = {}
 		if full:
 			try:
 				for f in torrent.get_files():
 					files.append((f.name, f.size, f.completed))
+					priorities[f.name] = FILE_PRIORITIES.get(int(f.priority), FILE_NORMAL) if f.selected else FILE_SKIP
 				sort_files(files)
 			except Exception:
-				files = []
+				files, priorities = [], {}
 		trackers = []
 		for tracker in self._raw(torrent, "trackers", []) or []:
 			try:
@@ -162,14 +182,14 @@ class TransmissionClient(TorrentClient):
 			id=self._raw(torrent, "hashString", "") or "",
 			name=torrent.name,
 			status=self._normalize_status(torrent),
-			progress=round(self._raw(torrent, "percentDone", 0) * 100, 2),
+			progress=self._progress(torrent),
 			total_size=self._raw(torrent, "sizeWhenDone", 0) or self._raw(torrent, "totalSize", 0),
 			downloaded=self._raw(torrent, "downloadedEver", 0),
 			uploaded=self._raw(torrent, "uploadedEver", 0),
 			download_rate=self._raw(torrent, "rateDownload", 0),
 			upload_rate=self._raw(torrent, "rateUpload", 0),
 			eta=eta if eta is not None and eta >= 0 else -1,
-			ratio=round(self._raw(torrent, "uploadRatio", 0) or 0, 2),
+			ratio=clean_ratio(self._raw(torrent, "uploadRatio", 0)),  # -1 (none yet) and -2 (infinite) are sentinels
 			ratio_limit=self._ratio_limit(torrent, session_ratio_limit),
 			ratio_limit_mode=RATIO_MODES.get(self._raw(torrent, "seedRatioMode", -1), ""),
 			download_limit=self._raw(torrent, "downloadLimit", -1) if self._raw(torrent, "downloadLimited") else -1,
@@ -188,6 +208,7 @@ class TransmissionClient(TorrentClient):
 			completed_date=self._raw(torrent, "doneDate", 0) or None,  # 0 while not done
 			last_activity=self._raw(torrent, "activityDate", 0) or None,  # 0 never
 			files=files,
+			file_priorities=priorities,
 			trackers=trackers,
 		)
 		return info
@@ -218,7 +239,7 @@ class TransmissionClient(TorrentClient):
 		upload_rate = 0
 		for t in torrents:
 			counts[self._normalize_status(t)] += 1
-			if self._raw(t, "percentDone", 0) >= 1:
+			if self._progress(t) >= 100:
 				completed += 1
 			rate_download = self._raw(t, "rateDownload", 0)
 			download_rate += rate_download
@@ -230,6 +251,7 @@ class TransmissionClient(TorrentClient):
 				uploading += 1
 
 		free_space = self.get_free_space(session.download_dir)
+		current, cumulative = self._transfer_stats()
 		return SessionSummary(
 			counts=dict(counts),
 			total=len(torrents),
@@ -240,7 +262,24 @@ class TransmissionClient(TorrentClient):
 			upload_rate=upload_rate,
 			free_space=free_space,
 			alt_speed_enabled=bool(session.alt_speed_enabled),
+			session_downloaded=current.get("downloadedBytes", -1),
+			session_uploaded=current.get("uploadedBytes", -1),
+			session_seconds=current.get("secondsActive", -1),
+			total_downloaded=cumulative.get("downloadedBytes", -1),
+			total_uploaded=cumulative.get("uploadedBytes", -1),
+			total_seconds=cumulative.get("secondsActive", -1),
+			session_count=cumulative.get("sessionCount", -1),
 		)
+
+	def _transfer_stats(self):
+		"""Raw stats of the current session and of all of them, empty when the
+		daemon does not answer: the dashboard still shows without them"""
+		try:
+			fields = self.client.session_stats().fields
+		except Exception:
+			return {}, {}
+		return (fields.get("current-stats") or fields.get("current_stats") or {},
+			fields.get("cumulative-stats") or fields.get("cumulative_stats") or {})
 
 	def get_torrents(self, status=None, query=None):
 		try:
@@ -276,17 +315,24 @@ class TransmissionClient(TorrentClient):
 			kwargs = {}
 			if download_dir:
 				kwargs["download_dir"] = download_dir
-			if magnet:
-				torrent = self.client.add_torrent(magnet, **kwargs)
-			elif torrent_data:
-				torrent = self.client.add_torrent(torrent_data, **kwargs)
-			else:
+			if not (magnet or torrent_data):
 				raise TorrentClientError("No magnet or torrent data provided")
-			return self.get_torrent(torrent.hashString) or self._to_info(torrent)
+			# Transmission answers a torrent it already has with that one, leaving
+			# it where it was, and transmission-rpc hands it back exactly like a
+			# new one: only the hashes from before the add tell them apart
+			before = {self._hash(t) for t in self.client.get_torrents(arguments=["id", "hashString"])}
+			torrent = self.client.add_torrent(magnet or torrent_data, **kwargs)
+			torrent_hash = self._hash(torrent)
+			if torrent_hash in before:
+				raise DuplicateTorrentError(f"Torrent already in Transmission: {torrent.name}", torrent_id=torrent_hash)
+			return self.get_torrent(torrent_hash) or self._to_info(torrent)
 		except TorrentClientError:
 			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error adding torrent: {e}")
+
+	def _hash(self, torrent):
+		return (self._raw(torrent, "hashString", "") or "").lower()
 
 	def set_ratio_limit(self, torrent_ids, limit):
 		try:
@@ -369,6 +415,24 @@ class TransmissionClient(TorrentClient):
 			raise
 		except Exception as e:
 			raise TorrentClientError(f"Error verifying torrent {torrent_id}: {e}")
+
+	def set_file_priority(self, torrent_id, paths, priority):
+		try:
+			torrent = self.client.get_torrent(rpc_id(torrent_id), arguments=["id", "files"])
+			# The id of a file for Transmission is its position in its own list
+			wanted = set(paths)
+			indexes = [i for i, f in enumerate(self._raw(torrent, "files", []) or []) if f.get("name") in wanted]
+			if not indexes:
+				raise PermanentTorrentError(f"No such files in torrent {torrent_id}")
+			if priority == FILE_SKIP:
+				self.client.change_torrent(rpc_id(torrent_id), files_unwanted=indexes)
+			else:
+				self.client.change_torrent(rpc_id(torrent_id), files_wanted=indexes,
+					**{PRIORITY_ARGUMENTS[priority]: indexes})
+		except PermanentTorrentError:
+			raise
+		except Exception as e:
+			raise TorrentClientError(f"Error setting the priority of the files of {torrent_id}: {e}")
 
 	def rename_torrent(self, torrent_id, new_name):
 		try:

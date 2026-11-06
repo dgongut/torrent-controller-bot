@@ -1,13 +1,20 @@
 from torrent_clients.base import (
+	DuplicateTorrentError,
+	FILE_HIGH,
+	FILE_LOW,
+	FILE_NORMAL,
+	FILE_SKIP,
 	PermanentTorrentError,
 	RATIO_MODE_GLOBAL,
 	RATIO_MODE_NONE,
 	RATIO_MODE_TORRENT,
+	RestartRequiredError,
 	TorrentClient,
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
 	SessionSummary,
 	content_root,
+	expected_torrent_ids,
 )
 from torrent_clients.factory import create_client

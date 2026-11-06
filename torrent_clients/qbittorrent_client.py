@@ -10,6 +10,11 @@ from urllib.parse import urlparse
 import requests
 
 from torrent_clients.base import (
+	DuplicateTorrentError,
+	FILE_HIGH,
+	FILE_NORMAL,
+	FILE_SKIP,
+	PermanentTorrentError,
 	RATIO_MODE_GLOBAL,
 	RATIO_MODE_NONE,
 	RATIO_MODE_TORRENT,
@@ -18,7 +23,10 @@ from torrent_clients.base import (
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
+	capped_progress,
+	clean_ratio,
 	content_root,
+	expected_torrent_ids,
 	query_matcher,
 	sort_files,
 )
@@ -30,6 +38,19 @@ TRACKER_WORKING = 2
 TRACKER_FAILED = (4, 5, 6)  # Not working, tracker error (5.0+), unreachable (5.0+)
 TEMP_TAG_PREFIX = "tcb-"
 TEMP_TAG_RE = re.compile(rf"^{TEMP_TAG_PREFIX}[0-9a-f]{{8}}$")
+# What qBittorrent 5.x answers when it does not add a torrent: it already has
+# it, or the magnet link cannot be read. Older versions answer "Fails."
+HTTP_CONFLICT = 409
+ADD_FAILED = "Fails."
+NOT_THE_API = "is a proxy or a login page in between?"
+
+
+class QBittorrentHTTPError(TorrentClientError):
+	"""qBittorrent answered with an HTTP error status"""
+
+	def __init__(self, message, status_code):
+		super().__init__(message)
+		self.status_code = status_code
 
 
 def _num(value, default):
@@ -64,9 +85,21 @@ def _timestamp(value):
 	return value if value > 0 else None
 
 
+def _progress(t):
+	"""progress is a share of the wanted bytes: only the bytes left tell a big
+	torrent that lacks a few MB (99.999 %) from a finished one"""
+	return capped_progress(_num(t.get("progress"), 0) * 100, _num(t.get("amount_left"), None))
+
+
+def _duplicate(existing):
+	"""DuplicateTorrentError for the torrent qBittorrent already had, as torrents/info lists it"""
+	return DuplicateTorrentError(f"Torrent already in qBittorrent: {existing.get('name', '')}", torrent_id=existing.get("hash"))
+
+
 STATUS_MAP = {
 	"downloading": TorrentStatus.DOWNLOADING,
 	"metaDL": TorrentStatus.DOWNLOADING,
+	"forcedMetaDL": TorrentStatus.DOWNLOADING,  # Force started while it fetches the metadata
 	"stalledDL": TorrentStatus.DOWNLOADING,
 	"forcedDL": TorrentStatus.DOWNLOADING,
 	"allocating": TorrentStatus.DOWNLOADING,
@@ -80,6 +113,7 @@ STATUS_MAP = {
 	"checkingDL": TorrentStatus.CHECKING,
 	"checkingUP": TorrentStatus.CHECKING,
 	"checkingResumeData": TorrentStatus.CHECKING,
+	"queuedForChecking": TorrentStatus.CHECKING,  # Older versions, still known to the 5.x web UI
 	"moving": TorrentStatus.CHECKING,
 	"queuedDL": TorrentStatus.QUEUED,
 	"queuedUP": TorrentStatus.QUEUED,
@@ -88,7 +122,20 @@ STATUS_MAP = {
 }
 
 
+def _file_priority(value):
+	"""qBittorrent file priority -> normalized one: 0 is not downloaded, 1 is
+	normal, 6 high and 7 maximal. It has nothing below normal"""
+	value = _num(value, 1)
+	if value <= 0:
+		return FILE_SKIP
+	return FILE_HIGH if value >= 6 else FILE_NORMAL
+
+
+FILE_PRIORITY_VALUES = {FILE_SKIP: 0, FILE_NORMAL: 1, FILE_HIGH: 6}
+
+
 class QBittorrentClient(TorrentClient):
+	file_priority_levels = (FILE_SKIP, FILE_NORMAL, FILE_HIGH)
 	supports_categories = True
 
 	def __init__(self, host, port, username=None, password=None, protocol="http"):
@@ -123,11 +170,32 @@ class QBittorrentClient(TorrentClient):
 		except Exception as e:
 			raise TorrentClientError(f"qBittorrent request failed ({endpoint}): {e}")
 		if response.status_code >= 400:
-			raise TorrentClientError(f"qBittorrent error {response.status_code} on {endpoint}: {response.text[:200]}")
+			raise QBittorrentHTTPError(
+				f"qBittorrent error {response.status_code} on {endpoint}: {response.text[:200]}", response.status_code)
 		return response
 
 	def _get(self, endpoint, params=None):
 		return self._request("GET", endpoint, params=params)
+
+	def _get_json(self, endpoint, params=None, kind=None):
+		"""GET whose answer is JSON, of the given type when there is one. A
+		reverse proxy or a login page in front of qBittorrent answers 200 with
+		a web page instead, which must fail like any other unusable answer"""
+		response = self._get(endpoint, params=params)
+		try:
+			data = response.json()
+		except ValueError:
+			raise TorrentClientError(f"qBittorrent answered {endpoint} with something that is not JSON: {NOT_THE_API}")
+		if kind is not None and not isinstance(data, kind):
+			raise TorrentClientError(f"qBittorrent answered {endpoint} with something unexpected: {NOT_THE_API}")
+		return data
+
+	def _version(self):
+		version = self._get("app/version").text.strip()
+		# Anything else answering there with 200 (a proxy, a login page...) is not qBittorrent
+		if not re.match(r"v?\d", version) or "<" in version or len(version) > 64:
+			raise TorrentClientError(f"qBittorrent answered app/version with something that is not a version: {NOT_THE_API}")
+		return f"qBittorrent {version.lstrip('v')}"
 
 	def _post(self, endpoint, data=None, timeout=REQUEST_TIMEOUT, **kwargs):
 		return self._request("POST", endpoint, data=data, timeout=timeout, **kwargs)
@@ -156,14 +224,14 @@ class QBittorrentClient(TorrentClient):
 			id=t.get("hash", ""),
 			name=t.get("name", ""),
 			status=STATUS_MAP.get(state, TorrentStatus.PAUSED),
-			progress=round(float(t.get("progress", 0)) * 100, 2),
+			progress=_progress(t),
 			total_size=t.get("size", 0) or t.get("total_size", 0),
 			downloaded=t.get("downloaded", 0),
 			uploaded=t.get("uploaded", 0),
 			download_rate=t.get("dlspeed", 0),
 			upload_rate=t.get("upspeed", 0),
 			eta=eta,
-			ratio=round(float(t.get("ratio", 0) or 0), 2),
+			ratio=clean_ratio(t.get("ratio", 0)),
 			# max_* are the limits that apply, whether set on the torrent or global
 			ratio_limit=_limit(t.get("max_ratio")),
 			ratio_limit_mode=_ratio_mode(t.get("ratio_limit")),
@@ -204,7 +272,7 @@ class QBittorrentClient(TorrentClient):
 		trackers, errors, working = [], [], False
 		seeders, leechers = -1, -1
 		try:
-			for tracker in self._get("torrents/trackers", params={"hash": torrent_hash}).json():
+			for tracker in self._get_json("torrents/trackers", params={"hash": torrent_hash}, kind=list):
 				url = tracker.get("url", "")
 				if url.startswith("**"):  # Pseudo-entries: DHT, PeX, LSD
 					continue
@@ -224,16 +292,15 @@ class QBittorrentClient(TorrentClient):
 
 	def test_connection(self):
 		try:
-			version = self._get("app/version").text.strip()
-			return f"qBittorrent {version.lstrip('v')}"
+			return self._version()
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Cannot connect to qBittorrent: {e}")
 
 	def get_summary(self):
 		try:
-			torrents = self._get("torrents/info").json()
-			transfer = self._get("transfer/info").json()
-			maindata = self._get("sync/maindata").json()
+			torrents = self._get_json("torrents/info", kind=list)
+			transfer = self._get_json("transfer/info", kind=dict)
+			maindata = self._get_json("sync/maindata", kind=dict)
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting summary: {e}")
 
@@ -243,7 +310,7 @@ class QBittorrentClient(TorrentClient):
 		downloading = 0
 		for t in torrents:
 			counts[STATUS_MAP.get(t.get("state", ""), TorrentStatus.PAUSED)] += 1
-			if float(t.get("progress", 0)) >= 1:
+			if _progress(t) >= 100:
 				completed += 1
 			if int(t.get("upspeed", 0) or 0) > 0:
 				uploading += 1
@@ -261,11 +328,15 @@ class QBittorrentClient(TorrentClient):
 			upload_rate=transfer.get("up_info_speed", 0),
 			free_space=server_state.get("free_space_on_disk", -1),
 			alt_speed_enabled=self._alt_speed_enabled(),
+			session_downloaded=transfer.get("dl_info_data", -1),
+			session_uploaded=transfer.get("up_info_data", -1),
+			total_downloaded=server_state.get("alltime_dl", -1),
+			total_uploaded=server_state.get("alltime_ul", -1),
 		)
 
 	def get_torrents(self, status=None, query=None):
 		try:
-			torrents = self._get("torrents/info").json()
+			torrents = self._get_json("torrents/info", kind=list)
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error listing torrents: {e}")
 
@@ -283,22 +354,26 @@ class QBittorrentClient(TorrentClient):
 
 	def get_torrent(self, torrent_id):
 		try:
-			torrents = self._get("torrents/info", params={"hashes": torrent_id}).json()
+			torrents = self._get_json("torrents/info", params={"hashes": torrent_id}, kind=list)
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting torrent {torrent_id}: {e}")
 		if not torrents:
 			return None
 		t = torrents[0]
 		files = []
+		priorities = {}
 		try:
-			for f in self._get("torrents/files", params={"hash": torrent_id}).json():
+			for f in self._get_json("torrents/files", params={"hash": torrent_id}, kind=list):
 				size = f.get("size", 0)
 				files.append((f.get("name", ""), size, int(size * float(f.get("progress", 0)))))
+				priorities[f.get("name", "")] = _file_priority(f.get("priority"))
 			sort_files(files)
 		except TorrentClientError:
-			files = []
+			files, priorities = [], {}
 		trackers, swarm, tracker_error = self._trackers(torrent_id)
-		return self._to_info(t, files=files, trackers=trackers, tracker_error=tracker_error, swarm=swarm)
+		info = self._to_info(t, files=files, trackers=trackers, tracker_error=tracker_error, swarm=swarm)
+		info.file_priorities = priorities
+		return info
 
 	def add_torrent(self, magnet=None, torrent_data=None, download_dir=None, category=None):
 		tag = f"{TEMP_TAG_PREFIX}{uuid.uuid4().hex[:8]}"  # Unique tag to find the new hash
@@ -311,24 +386,41 @@ class QBittorrentClient(TorrentClient):
 		elif download_dir:
 			data["savepath"] = download_dir
 		try:
+			files = None
 			if magnet:
 				data["urls"] = magnet
-				self._post("torrents/add", data=data)
 			elif torrent_data:
-				self._post("torrents/add", data=data, files={"torrents": ("upload.torrent", torrent_data)})
+				files = {"torrents": ("upload.torrent", torrent_data)}
 			else:
 				raise TorrentClientError("No magnet or torrent data provided")
-
+			try:
+				response = self._post("torrents/add", data=data, files=files)
+			except QBittorrentHTTPError as e:
+				if e.status_code != HTTP_CONFLICT:
+					raise
+				raise self._refusal(magnet, torrent_data, e)
+			try:
+				answer = response.json()
+			except ValueError:
+				answer = response.text.strip()
 			torrent_hash = None
-			for _ in range(10):
-				torrents = self._get("torrents/info", params={"tag": tag}).json()
-				if torrents:
-					torrent_hash = torrents[0].get("hash")
-					break
-				time.sleep(0.5)
+			if isinstance(answer, dict):
+				# qBittorrent 5.x tells what it added
+				added = answer.get("added_torrent_ids") or []
+				if added:
+					torrent_hash = added[0]
+				elif answer.get("failure_count") and not answer.get("success_count") and not answer.get("pending_count"):
+					raise self._refusal(magnet, torrent_data, answer)
+			elif answer == ADD_FAILED:
+				raise self._refusal(magnet, torrent_data, answer)
 			if not torrent_hash:
-				raise TorrentClientError("Torrent added but not found (duplicate?)")
-			return self.get_torrent(torrent_hash)
+				torrent_hash = self._find_added(tag, magnet, torrent_data)
+			for _ in range(10):
+				info = self.get_torrent(torrent_hash)
+				if info:
+					return info
+				time.sleep(0.5)
+			raise TorrentClientError(f"Torrent added but not found: {torrent_hash}")
 		except TorrentClientError:
 			raise
 		except Exception as e:
@@ -337,6 +429,42 @@ class QBittorrentClient(TorrentClient):
 			# deleteTags (not removeTags) so the tag also disappears from
 			# qBittorrent's global tag list instead of piling up there
 			self._delete_tags([tag])
+
+	def _existing_torrent(self, magnet, torrent_data):
+		"""The torrent (as torrents/info lists it) qBittorrent already has under
+		an id the magnet or .torrent would get, or None"""
+		ids = expected_torrent_ids(magnet, torrent_data)
+		if not ids:
+			return None
+		try:
+			torrents = self._get_json("torrents/info", params={"hashes": "|".join(ids)}, kind=list)
+		except TorrentClientError:
+			return None
+		return torrents[0] if torrents else None
+
+	def _refusal(self, magnet, torrent_data, answer):
+		"""Error of an add qBittorrent did not do: DuplicateTorrentError when it
+		already has the torrent, which is what it refuses most"""
+		existing = self._existing_torrent(magnet, torrent_data)
+		if existing:
+			return _duplicate(existing)
+		return PermanentTorrentError(f"qBittorrent did not add the torrent ({answer})")
+
+	def _find_added(self, tag, magnet, torrent_data):
+		"""Hash of the torrent just added under the temporary tag, for versions
+		whose answer does not tell it. Some of them do not tell a torrent they
+		already had either, so not finding it can be a duplicate"""
+		for _ in range(10):
+			torrents = self._get_json("torrents/info", params={"tag": tag}, kind=list)
+			if torrents:
+				return torrents[0].get("hash")
+			time.sleep(0.5)
+		existing = self._existing_torrent(magnet, torrent_data)
+		if existing is None:
+			raise TorrentClientError("Torrent added but not found")
+		if tag not in [t.strip() for t in (existing.get("tags") or "").split(",")]:
+			raise _duplicate(existing)
+		return existing.get("hash")  # It is the new one, it just took longer to show up
 
 	def _delete_tags(self, tags):
 		if not tags:
@@ -350,7 +478,7 @@ class QBittorrentClient(TorrentClient):
 		"""Delete leftover temporary tags from previous runs (older versions
 		only removed them from the torrent, so they stayed in the tag list)"""
 		try:
-			tags = self._get("torrents/tags").json()
+			tags = self._get_json("torrents/tags", kind=list)
 		except Exception:
 			return
 		self._delete_tags([t for t in tags if TEMP_TAG_RE.match(t)])
@@ -369,7 +497,7 @@ class QBittorrentClient(TorrentClient):
 			# The same call sets the seeding time limits and, since qBittorrent
 			# 5.x, what to do when one is reached (it refuses the call without
 			# them): each torrent is sent back its own so only the ratio changes
-			current = {t.get("hash"): t for t in self._get("torrents/info", params={"hashes": "|".join(torrent_ids)}).json()}
+			current = {t.get("hash"): t for t in self._get_json("torrents/info", params={"hashes": "|".join(torrent_ids)}, kind=list)}
 			ratio = -2 if limit is None else (-1 if limit < 0 else round(float(limit), 2))
 			for torrent_id in torrent_ids:
 				t = current.get(torrent_id, {})
@@ -401,7 +529,7 @@ class QBittorrentClient(TorrentClient):
 
 	def get_global_ratio_limit(self):
 		try:
-			prefs = self._get("app/preferences").json()
+			prefs = self._get_json("app/preferences", kind=dict)
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting ratio limit: {e}")
 		return _limit(prefs.get("max_ratio")) if prefs.get("max_ratio_enabled") else -1
@@ -431,12 +559,27 @@ class QBittorrentClient(TorrentClient):
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error verifying torrent {torrent_id}: {e}")
 
+	def set_file_priority(self, torrent_id, paths, priority):
+		try:
+			files = self._get_json("torrents/files", params={"hash": torrent_id}, kind=list)
+			wanted = set(paths)
+			# The index comes with each file since qBittorrent 4.2, before that it is its position
+			indexes = [str(f.get("index", i)) for i, f in enumerate(files) if f.get("name") in wanted]
+			if not indexes:
+				raise PermanentTorrentError(f"No such files in torrent {torrent_id}")
+			self._post("torrents/filePrio", data={
+				"hash": torrent_id, "id": "|".join(indexes), "priority": FILE_PRIORITY_VALUES[priority]})
+		except TorrentClientError as e:
+			if isinstance(e, PermanentTorrentError):
+				raise
+			raise TorrentClientError(f"Error setting the priority of the files of {torrent_id}: {e}")
+
 	def rename_torrent(self, torrent_id, new_name):
 		try:
-			torrents = self._get("torrents/info", params={"hashes": torrent_id}).json()
+			torrents = self._get_json("torrents/info", params={"hashes": torrent_id}, kind=list)
 			if not torrents:
 				raise TorrentClientError("Torrent not found")
-			files = self._get("torrents/files", params={"hash": torrent_id}).json()
+			files = self._get_json("torrents/files", params={"hash": torrent_id}, kind=list)
 			paths = [f.get("name", "") for f in files]
 			self._post("torrents/rename", data={"hash": torrent_id, "name": new_name})
 			# The path on disk has to come from the file list: qBittorrent sanitizes
@@ -480,7 +623,7 @@ class QBittorrentClient(TorrentClient):
 
 	def get_categories(self):
 		try:
-			categories = self._get("torrents/categories").json()
+			categories = self._get_json("torrents/categories")
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting categories: {e}")
 		if not isinstance(categories, dict):
@@ -509,7 +652,7 @@ class QBittorrentClient(TorrentClient):
 
 	def get_download_dirs(self):
 		try:
-			torrents = self._get("torrents/info").json()
+			torrents = self._get_json("torrents/info", kind=list)
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting download dirs: {e}")
 		counts = Counter()
@@ -524,23 +667,22 @@ class QBittorrentClient(TorrentClient):
 
 	def get_default_download_dir(self):
 		try:
-			return self._get("app/preferences").json().get("save_path", "")
+			return self._get_json("app/preferences", kind=dict).get("save_path", "")
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting default download dir: {e}")
 
 	def get_free_space(self, path):
 		try:
-			server_state = self._get("sync/maindata").json().get("server_state", {})
+			server_state = self._get_json("sync/maindata", kind=dict).get("server_state", {})
 			return server_state.get("free_space_on_disk", -1)
 		except TorrentClientError:
 			return -1
 
 	def get_settings(self):
 		try:
-			prefs = self._get("app/preferences").json()
-			version = self._get("app/version").text.strip()
+			prefs = self._get_json("app/preferences", kind=dict)
 			return {
-				"version": f"qBittorrent {version.lstrip('v')}",
+				"version": self._version(),
 				"alt_speed_enabled": self._alt_speed_enabled(),
 				"alt_speed_down": (prefs.get("alt_dl_limit", 0) or 0) // 1024,
 				"alt_speed_up": (prefs.get("alt_up_limit", 0) or 0) // 1024,
@@ -563,7 +705,7 @@ class QBittorrentClient(TorrentClient):
 	def set_speed_limit(self, direction, kbps, enabled):
 		try:
 			if kbps is None:
-				prefs = self._get("app/preferences").json()
+				prefs = self._get_json("app/preferences", kind=dict)
 				current = prefs.get("dl_limit" if direction == "down" else "up_limit", 0) or 0
 				kbps = current // 1024
 			limit = int(kbps) * 1024 if enabled and int(kbps) > 0 else 0

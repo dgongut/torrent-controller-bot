@@ -16,8 +16,9 @@
 
 Lleva el control de tu gestor de torrents desde un único lugar.
 
-- ✅ Panel de control con estado general: velocidades, espacio libre y torrents agrupados por estado
-- ✅ Listado de torrents con filtros (descargando, compartiendo, pausados, completados, con error...) y paginación
+- ✅ Panel de control con estado general: velocidades, espacio libre, datos transferidos en la sesión y desde siempre, y torrents agrupados por estado
+- ✅ Tamaño total de los torrents de cada listado, filtro o búsqueda
+- ✅ Listado de torrents con filtros (descargando, compartiendo, pausados, completados, con error...) y paginación, ordenable por fecha, nombre, tamaño, progreso, ratio, velocidad o última actividad
 - ✅ Búsqueda de torrents por nombre o por ruta
 - ✅ Añadir torrents enviando un fichero `.torrent`, un enlace magnet o una URL a un fichero `.torrent`, eligiendo el directorio de descarga
 - ✅ Pausar, reanudar, verificar, reanunciar al tracker y borrar torrents (con o sin sus datos)
@@ -26,6 +27,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Límites por tracker: ratio y velocidad para todos los torrents de un tracker, los que ya tiene y los que vayan llegando (por ejemplo, compartir sin fin en los privados y poco en los públicos), desde los ajustes o desde el filtro de ese tracker
 - ✅ Renombrado con sugerencia automática para películas y series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
 - ✅ Renombrado de las carpetas y archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
+- ✅ Elegir qué archivos se descargan y con qué prioridad, uno a uno o una carpeta entera (por ejemplo, bajar solo unos capítulos de una temporada), viendo cuánto lleva cada archivo
 - ✅ Series completas: renombra de una vez la carpeta, las subcarpetas de temporada y los episodios
 - ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar, mover todos o fijarles el límite de ratio y de velocidad
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
@@ -140,7 +142,7 @@ Si descargas algo que ya tenías (una copia mejor de la misma película, por eje
 
 ❌ **No sustituir** deja los dos torrents como están y el aviso como un aviso de completado normal, sin botones.
 
-Con **«Sustituir sin preguntar si el nombre ya existe»** (dentro del renombrado automático, desactivado por defecto) lo hace solo al terminar la descarga y te cuenta lo que ha borrado. Nunca se sustituye un torrent que comparte ficheros con el nuevo, porque borrar sus datos borraría también la descarga nueva.
+Con **«Sustituir sin preguntar si el nombre ya existe»** (dentro del renombrado automático, desactivado por defecto) lo hace solo al terminar la descarga y te cuenta lo que ha borrado. Nunca se sustituye un torrent que comparte ficheros con el nuevo, porque borrar sus datos borraría también la descarga nueva. Tampoco sustituye nada una descarga de la que has dejado archivos sin bajar, ni una con menos vídeos que el torrent anterior: no es una copia completa de lo que borraría. Y la confirmación borra exactamente lo que lista, aunque mientras tanto aparezca otro torrent con ese nombre.
 
 ## Carpeta de la serie
 
@@ -167,6 +169,7 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Mover los datos a otra carpeta | ✅ | ✅ | ✅ | ✅ |
 | Borrar el torrent con sus datos | ✅ | ✅ | ✅ | ✅ |
 | Espacio libre y aviso de disco | ✅ | ✅ | ✅ | ✅ |
+| Estadísticas de transferencia, de la sesión y desde siempre | ✅ | ✅ | ⚠️ ⁹ | ❌ ⁹ |
 | Límites de velocidad | ✅ | ✅ | ✅ | ✅ |
 | Velocidad alternativa (modo tortuga) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Límite de ratio, por torrent y del gestor | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
@@ -176,6 +179,8 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Verificar los datos | ✅ | ✅ | ✅ | ❌ ² |
 | Renombrado inteligente, manual y automático | ✅ | ✅ | ✅ | ❌ ³ |
 | Categorías | ❌ ⁴ | ✅ | ❌ ⁴ | ❌ ⁴ |
+| Ordenar los listados | ✅ | ✅ | ✅ | ✅ ¹⁰ |
+| Elegir los archivos a descargar y su prioridad | ✅ | ✅ ¹¹ | ✅ | ✅ ¹² |
 
 ¹ Ni Deluge ni Download Station tienen modo de velocidad alternativa. Los límites de velocidad normales sí funcionan en ambos.
 
@@ -192,6 +197,14 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 ⁷ La API de Download Station no tiene ninguna forma de pedir pares al tracker a demanda.
 
 ⁸ En su lista de torrents, qBittorrent y Deluge solo dicen el tracker con el que está trabajando cada uno (Deluge, además, por su dominio: `tracker.ejemplo.org` sale como `ejemplo.org`). Un torrent recién añadido recibe los límites de su tracker en cuanto lo anuncia por primera vez, y uno con varios trackers, según el que esté usando en ese momento.
+
+⁹ Transmission lleva la cuenta de lo bajado y subido, el tiempo activo y los arranques, tanto de la sesión como desde siempre; qBittorrent, lo bajado y subido de ambas. Deluge solo cuenta lo de la sesión, desde que arrancó el demonio, y la API de Download Station no da estas cifras.
+
+¹⁰ Download Station no dice cuándo fue la última actividad de una tarea, así que con él no se puede ordenar por eso.
+
+¹¹ qBittorrent no tiene prioridad baja: un archivo se descarga con prioridad normal o alta, o no se descarga.
+
+¹² Hace falta DSM 7. Download Station sigue contando en el tamaño de una tarea los archivos que no se descargan.
 
 ## Download Station de Synology
 
@@ -230,9 +243,7 @@ Esos datos van en `TORRENT_CLIENT_USER` y `TORRENT_CLIENT_PASSWORD`. El puerto e
 |TORRENT_CLIENT_PASSWORD |❌| Contraseña del gestor de torrents, si tiene autenticación |
 |TORRENT_CLIENT_PROTOCOL |❌| Protocolo de conexión, http o https. Por defecto http |
 |TORRENT_CLIENT_RPC_PATH |❌| Ruta del RPC. Por defecto /transmission/rpc (Transmission) o /webapi (Synology) |
-|TORRENTS_PER_PAGE |❌| Número de torrents por página en los listados. Por defecto 10 |
-|DASHBOARD_REFRESH_SECONDS |❌| Segundos entre refrescos automáticos del panel de control, las listas y la ficha de un torrent. Por defecto 2 |
-|DASHBOARD_REFRESH_DURATION |❌| Segundos que dura el refresco automático del panel de control, las listas y la ficha de un torrent. Por defecto 60 |
+|TORRENTS_PER_PAGE |❌| Número de torrents por página en los listados, entre 1 y 90. Por defecto 10 |
 |TELEMETRY |❌| `false` para desactivar las [estadísticas anónimas](#estadísticas-anónimas) sin pasar por `/settings`. Lo normal es desactivarlas desde `/settings`; esto es para quien prefiera dejarlo fijado en el compose |
 
 ## Ejemplo de Docker-Compose para su ejecución normal

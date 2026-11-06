@@ -4,6 +4,7 @@ Unknown keys are ignored and missing keys fall back to DEFAULTS,
 so upgrading the bot never breaks an existing settings file.
 """
 
+import copy
 import json
 import os
 import threading
@@ -31,7 +32,13 @@ DEFAULTS = {
 	"template_movie": "",  # "" = built-in default template
 	"template_series": "",
 	"template_season": "",  # Season packs (series without episode)
+	"list_sort": "added",  # Order of the torrent lists, a key of LIST_SORTS in the bot
+	"list_sort_reverse": False,  # The opposite of the natural order of list_sort
 	"telemetry": True,  # Anonymous usage statistics, see the TELEMETRY section of the bot
+	# Limits per tracker, {hostname: rule}, kept by tracker_limits. It has to be
+	# here: _load only reads back the keys listed, so a missing one was dropped
+	# on every restart and wiped from the file on the next save
+	"tracker_limits": {},
 }
 
 _lock = threading.Lock()
@@ -40,7 +47,9 @@ _settings = None
 
 def _load():
 	global _settings
-	settings = dict(DEFAULTS)
+	# A deep copy: the defaults hold a list and a dict that must never be
+	# changed through a setting that still has its default value
+	settings = copy.deepcopy(DEFAULTS)
 	try:
 		with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
 			stored = json.load(file)
@@ -66,17 +75,19 @@ def _save():
 
 
 def get(key):
+	"""The value of a setting. Lists and dicts come as copies, so a caller
+	that changes what it got cannot change the setting behind set()'s back"""
 	with _lock:
 		if _settings is None:
 			_load()
-		return _settings.get(key, DEFAULTS.get(key))
+		return copy.deepcopy(_settings.get(key, DEFAULTS.get(key)))
 
 
 def set(key, value):
 	with _lock:
 		if _settings is None:
 			_load()
-		_settings[key] = value
+		_settings[key] = copy.deepcopy(value)
 		_save()
 
 

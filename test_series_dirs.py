@@ -217,6 +217,81 @@ check("backslashes are kept", dirs("Mad.Men.S02E01", [("Mad.Men.S01E01", "D:\\TV
 check("a Windows series folder is named", series_auto_dir(series_dir_candidates("Mad.Men.S02E01",
 	[("Mad.Men.S01E01", "D:\\TV\\Mad Men", 1)])), "D:\\TV\\Mad Men")
 
+# Numbers that are no season: a year, or more digits than a season ever has.
+# The folder is left as it is, and nothing breaks on the way
+MYTH = [("MythBusters.S10E01.1080p", "/tv/MythBusters/Season 2010", 1)]
+check("a season named after its year is no season 20",
+	series_dir_candidates("MythBusters.S11E01.1080p", MYTH), [("/tv/MythBusters/Season 2010", False)])
+check("so it is only offered", series_auto_dir(series_dir_candidates("MythBusters.S11E01.1080p", MYTH)), None)
+check("the same goes for a favorite", dirs("MythBusters.S11E01.1080p", [], known_dirs=["/tv/MythBusters/Season 2010"]), [])
+for folder in ("Season 2010", "Season 001", "Season 100", "Temporada 2010"):
+	check(f"'{folder}' is left as it is", dirs("Mad.Men.S02E01", [("Mad.Men.S01E01", f"/tv/Mad Men/{folder}", 1)]),
+		[f"/tv/Mad Men/{folder}"])
+	check(f"'{folder}' is no season", key(folder), None)
+check("Open Season is a movie, not season 20", series_identity("Open.Season.2006.1080p.BluRay.x264-GRP"), None)
+check("nor is Killing Season", series_identity("Killing.Season.2013.1080p.BluRay"), None)
+check("Season 2 still is one", key("Mad.Men.Season.2.1080p"), ("mad men", "", 2))
+
+# A folder named after the series and its season: the season is swapped as
+# well, never sending a new season into last season's folder
+FIRE13 = [("Chicago Fire - Temporada 13 [HDTV][Cap.1310]", "/media/series/Chicago Fire - Temporada 13", 1)]
+FIRE14 = "Chicago Fire - Temporada 14 [HDTV][Cap.1404]"
+check("the next season of a 'Show - Temporada N' folder",
+	series_dir_candidates(FIRE14, FIRE13), [("/media/series/Chicago Fire - Temporada 14", True)])
+check("which is where it goes without asking", series_auto_dir(series_dir_candidates(FIRE14, FIRE13)),
+	"/media/series/Chicago Fire - Temporada 14")
+check("never into last season's", "/media/series/Chicago Fire - Temporada 13" in dirs("Chicago.Fire.S14E04", FIRE13), False)
+check("the same season stays in it", dirs("Chicago Fire - Temporada 13 [HDTV][Cap.1311]", FIRE13),
+	["/media/series/Chicago Fire - Temporada 13"])
+check("a release name as the folder", series_dir_candidates("Show.Name.S02E01", [("Show.Name.S01E01", "/tv/Show.Name.S01", 1)]),
+	[("/tv/Show.Name.S02", True)])
+check("keeping its padding", dirs("Show.Name.S10E01", [("Show.Name.S09E01", "/tv/Show.Name.S09", 1)]), ["/tv/Show.Name.S10"])
+check("from 9 to 10", dirs("Chicago.Fire.S10E01", [("Chicago.Fire.S09E01", "/media/Chicago Fire - Temporada 9", 1)]),
+	["/media/Chicago Fire - Temporada 10"])
+check("with the year of the show", dirs("Doctor.Who.2005.S02E01", [("Doctor.Who.2005.S01E01", "/tv/Doctor Who (2005) - Season 1", 1)]),
+	["/tv/Doctor Who (2005) - Season 2"])
+check("digits in the title are not the season", dirs("9-1-1.S02E01", [("9-1-1.S01E01", "/tv/9-1-1 - Temporada 1", 1)]),
+	["/tv/9-1-1 - Temporada 2"])
+check("with backslashes", dirs("Chicago.Fire.S14E01", [("Chicago.Fire.S13E01", "D:\\TV\\Chicago Fire - Temporada 13", 1)]),
+	["D:\\TV\\Chicago Fire - Temporada 14"])
+check("a favorite named that way is followed too",
+	dirs("Chicago.Fire.S14E01", [], known_dirs=["/media/series/Chicago Fire - Temporada 13"]), ["/media/series/Chicago Fire - Temporada 14"])
+check("a pack of several seasons goes next to the season folders, asking first",
+	series_dir_candidates("Chicago.Fire.S01-S03.1080p", FIRE13), [("/media/series", False)])
+check("the season folder of another show is left as it is, and only offered",
+	series_dir_candidates("Chicago.Fire.S14E01", [("Chicago.Fire.S13E01", "/media/series/Chicago Med - Temporada 9", 1)]),
+	[("/media/series/Chicago Med - Temporada 9", False)])
+check("a folder for part of another season is no place for it",
+	dirs("Stranger.Things.S05E01", [("Stranger.Things.S04E01", "/tv/Stranger Things S04 Vol 1", 1)]), [])
+check("but it is for that season",
+	dirs("Stranger.Things.S04E08", [("Stranger.Things.S04E01", "/tv/Stranger Things S04 Vol 1", 1)]), ["/tv/Stranger Things S04 Vol 1"])
+
+# An older season: the number is written the way the folders write it, which
+# a number with no leading zero cannot tell. 'Temporada 2' is what sits next
+# to 'Temporada 13', never 'Temporada 02'
+check("an older season of a 'Temporada 13' folder",
+	dirs("Chicago.Fire.S02E01", [("Chicago.Fire.S13E01", "/tv/Chicago Fire/Temporada 13", 1)]), ["/tv/Chicago Fire/Temporada 2"])
+check("named after the show too", dirs("Chicago.Fire.S02E01", FIRE13), ["/media/series/Chicago Fire - Temporada 2"])
+check("a padded folder stays padded", dirs("Mad.Men.S02E01", [("Mad.Men.S09E01", "/tv/Mad Men/Season 09", 1)]),
+	["/tv/Mad Men/Season 02"])
+check("and so does a compact marker", dirs("Show.Name.S02E01", [("Show.Name.S13E01", "/tv/Show.Name.S13", 1)]), ["/tv/Show.Name.S02"])
+check("a compact one with a single digit", dirs("Show.Name.S10E01", [("Show.Name.S9E01", "/tv/Show.Name.S9", 1)]), ["/tv/Show.Name.S10"])
+# An English ordinal goes with its number
+for season, folder in [(2, "2nd Season"), (3, "3rd Season"), (4, "4th Season"), (11, "11th Season"), (12, "12th Season"),
+						(21, "21st Season"), (22, "22nd Season")]:
+	check(f"'1st Season' for season {season}",
+		dirs(f"Show.Name.S{season:02d}E01", [("Show.Name.S01E01", "/tv/Show Name/1st Season", 1)]), [f"/tv/Show Name/{folder}"])
+check("an ordinal folder named after the show", series_dir_candidates("Show.Name.S02E01",
+	[("Show.Name.S01E01", "/tv/Show Name 1st Season", 1)]), [("/tv/Show Name 2nd Season", True)])
+# A spaced dash between 'Season' and its number
+check("a 'Season - 13' folder", dirs("Show.Name.S14E01", [("Show.Name.S13E01", "/tv/Show Name/Season - 13", 1)]),
+	["/tv/Show Name/Season - 14"])
+check("is named", series_auto_dir(series_dir_candidates("Show.Name.S14E01", [("Show.Name.S13E01", "/tv/Show Name/Season - 13", 1)])),
+	"/tv/Show Name/Season - 14")
+check("a 'Show - Season - 1' name", key("Show - Season - 1 - 1080p"), ("show", "", 1))
+# A pack whose dash number may be ten seasons is still that show's
+check("a 'Season 1 - 10' pack", (key("Friends Season 1 - 10 [1080p BluRay x265]") or ("",))[0], "friends")
+
 # The same series written differently
 VARIANTS = ["Chicago.Fire.S14E01", "chicago fire 14x02", "CHICAGO_FIRE_S14E03", "Chicago Fire - 14x05 - Título",
 			"[Grupo] Chicago Fire S14E06 [1080p]", "14x07 - Chicago Fire - 1080p.mkv"]
@@ -304,6 +379,10 @@ class FakeClient:
 		for torrent_id in torrent_ids:
 			self.torrents[torrent_id].download_dir = new_dir
 
+	def rename_torrent(self, torrent_id, new_name):
+		self.calls.append(("rename", torrent_id, new_name))
+		self.torrents[torrent_id].name = new_name
+
 	def get_free_space(self, path):
 		return 1024 ** 4
 
@@ -365,7 +444,7 @@ bot.bot.send_message = _send
 bot.bot.edit_message_text = lambda text, chat_id, message_id, **kw: SCREENS.append(("edit", text, kw.get("reply_markup"))) or True
 bot.bot.edit_message_reply_markup = lambda chat_id, message_id, reply_markup=None: SCREENS.append(("markup", None, reply_markup)) or True
 NOTIFIED = []
-bot.notify = lambda text, chat_id=None, thread_id=None, reply_markup=None: NOTIFIED.append((text, reply_markup))
+bot.notify = lambda text, chat_id=None, thread_id=None, reply_markup=None: NOTIFIED.append((text, reply_markup)) or _Sent()
 
 
 def fresh(**settings):
@@ -725,6 +804,30 @@ check("a new season goes straight to its new season folder",
 	[c for c in CLIENT.calls if c[0] == "add_torrent"], [("add_torrent", "/tv/Mad Men/Season 02", None)])
 
 fresh(auto_download=True, auto_move_series=True)
+CLIENT.put("Chicago Fire - Temporada 13 [HDTV][Cap.1310]", "/media/series/Chicago Fire - Temporada 13")
+CLIENT.added = "Chicago Fire - Temporada 14 [HDTV][Cap.1404]"
+bot.start_add_flow(1, CLIENT.added, magnet="m")
+check("and so it does when the folder is named after the show too, not into last season's",
+	[c for c in CLIENT.calls if c[0] in ("add_torrent", "move")], [("add_torrent", "/media/series/Chicago Fire - Temporada 14", None)])
+
+# 'Season 2010' is no season 20: nothing breaks, and that folder is only offered
+fresh(auto_download=True, auto_move_series=True)
+CLIENT.put("MythBusters.S10E01.1080p", "/tv/MythBusters/Season 2010")
+CLIENT.added = "MythBusters.S11E01.1080p"
+bot.start_add_flow(1, CLIENT.added, magnet="m")
+check("a season folder named after its year does not break the automatic add",
+	[c for c in CLIENT.calls if c[0] in ("add_torrent", "move")], [("add_torrent", "/downloads", None)])
+check("its folder is only offered", bot.get_text("SERIES_SUGGEST_ONE", "/tv/MythBusters/Season 2010", "MythBusters") in last()[1], True)
+fresh()
+CLIENT.put("MythBusters.S10E01.1080p", "/tv/MythBusters/Season 2010")
+pending_id = bot.new_pending_torrent("MythBusters.S11E01.1080p", magnet="m")
+bot.ask_download_dir(1, pending_id, "MythBusters.S11E01.1080p")
+check("nor the folder picker", series_buttons(last()[2]), ["✨ /tv/MythBusters/Season 2010"])
+stray = CLIENT.put("MythBusters.S11E02.1080p", "/downloads")
+press(bot.build_call("move", stray.id, config.FILTER_ALL, 0))
+check("nor the move screen", series_buttons(last()[2]), ["✨ /tv/MythBusters/Season 2010"])
+
+fresh(auto_download=True, auto_move_series=True)
 CLIENT.put("Doctor.Who.1963.S01E01", "/tv/Doctor Who (1963)")
 CLIENT.put("Doctor.Who.2005.S01E01", "/tv/Doctor Who (2005)")
 CLIENT.added = "Doctor.Who.S02E01"
@@ -830,7 +933,9 @@ chicago()
 torrent = external("Chicago.Fire.S14E04.1080p")
 check("with external on, an external torrent is moved (it is already in the manager)",
 	[c for c in CLIENT.calls if c[0] == "move"], [("move", [torrent.id], "/media/SERIES/Chicago Fire")])
-text, markup = NOTIFIED[0]
+check("the notice goes out at once saying where it is going",
+	NOTIFIED[0][0].endswith(bot.get_text("SERIES_MOVING", "/media/SERIES/Chicago Fire")), True)
+_, text, markup = last()  # The move, delivered in the background, edits the notice
 check("the notice tells the final folder", "📂 <code>/media/SERIES/Chicago Fire</code>" in text, True)
 check("not the one it arrived in", "/downloads" in text, False)
 check("and why", text.endswith(bot.get_text("SERIES_PLACED", "Chicago Fire")), True)
@@ -846,7 +951,7 @@ fresh(notify_external_added=False, auto_download=True, auto_move_series=True, au
 chicago()
 torrent = external("Chicago.Fire.S14E04.1080p")
 check("a move is told even with the external notice off", len(NOTIFIED), 1)
-check("since the torrent changed without anyone asking", "📂 <code>/media/SERIES/Chicago Fire</code>" in NOTIFIED[0][0], True)
+check("since the torrent changed without anyone asking", "📂 <code>/media/SERIES/Chicago Fire</code>" in last()[1], True)
 external("Some.Movie.2025.1080p")
 check("but a movie still says nothing", len(NOTIFIED), 1)
 external("Doctor.Who.S01E01")
@@ -856,14 +961,51 @@ fresh(notify_external_added=True, auto_download=True, auto_move_series=True, aut
 chicago()
 CLIENT.fail_move = TorrentClientError("busy")
 torrent = external("Chicago.Fire.S14E04.1080p")
-check("a failed external move falls back to suggesting", "💡" in NOTIFIED[0][0], True)
-check("telling the folder it is really in", "📂 <code>/downloads</code>" in NOTIFIED[0][0], True)
+check("a failed external move is told in its notice", last()[1].endswith(bot.get_text("MOVE_GIVE_UP", "busy")), True)
+check("without the undo and keep buttons of a move that happened", last()[2], None)
+check("telling the folder it is really in", "📂 <code>/downloads</code>" in last()[1], True)
 
 fresh(notify_external_added=False, auto_download=True, auto_move_series=True, auto_move_series_external=True)
 chicago()
 CLIENT.fail_move = TorrentClientError("busy")
 external("Chicago.Fire.S14E04.1080p")
-check("and with the notice off, a failed move is not told", NOTIFIED, [])
+check("with the notice off a failed move is told too: the bot tried to move its data",
+	(len(NOTIFIED), last()[1].endswith(bot.get_text("MOVE_GIVE_UP", "busy"))), (1, True))
+CLIENT.fail_move = None
+
+# The monitor does not wait for the data to move: a manager still moving it
+# when the order times out is told as moving, then as moved once it answers
+fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=True)
+chicago()
+CLIENT.fail_move = TorrentClientError("timed out")
+_real_client_move = CLIENT.move_torrents
+_moves = []
+
+
+def _times_out_once(torrent_ids, new_dir):
+	_moves.append(new_dir)
+	if len(_moves) == 1:
+		raise TorrentClientError("timed out")
+	CLIENT.fail_move = None
+	return _real_client_move(torrent_ids, new_dir)
+
+
+CLIENT.move_torrents = _times_out_once
+torrent = external("Chicago.Fire.S14E04.1080p")
+CLIENT.move_torrents = _real_client_move
+check("a move that timed out is retried, not told as staying behind", "📂 <code>/media/SERIES/Chicago Fire</code>" in last()[1], True)
+check("and ends told as placed", last()[1].endswith(bot.get_text("SERIES_PLACED", "Chicago Fire")), True)
+
+# Managers report when a torrent was added as a unix number: the tie still goes to the most recent
+fresh()
+CLIENT.put("Show.Name.S01E01.1080p", "/a/Show Name", added=1_700_000_000)
+CLIENT.put("Show.Name.S01E02.1080p", "/b/Show Name", added=1_800_000_000)
+check("a tie goes to the most recent with the unix times managers report", bot.series_dirs("Show.Name.S01E03.1080p")[0], "/b/Show Name")
+# A folder the parser cannot make sense of does not take the screens down
+_real_candidates = bot.series_dir_candidates
+bot.series_dir_candidates = lambda *a, **k: next(iter([]))
+check("a parser failure only means no suggestion", bot.series_candidates("Show.Name.S01E03.1080p"), [])
+bot.series_dir_candidates = _real_candidates
 
 fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=True)
 chicago()
@@ -1025,6 +1167,42 @@ message = type("M", (), {"chat": type("C", (), {"id": 1})(), "message_thread_id"
 bot.handle_pending_input(message, pending)
 check("the limit is set", (CLIENT.session["speed_limit_down"], CLIENT.session["speed_limit_down_enabled"]), (800, True))
 check("and the speed screen comes back", SCREENS[-1][1].startswith(f"{bot.get_text('SETTINGS_UPDATED')}\n\n{bot.get_text('SETTINGS_SPEED_TITLE')}"), True)
+
+# --- Names the parser cannot tell apart ------------------------------------------
+# A pack that may be ten seasons ('Friends Season 1 - 10') must not take the
+# name of its tenth episode: renamed that way, the episode would take it for an
+# older copy of itself and the automatic replace would delete the whole pack
+def with_files(name, directory, *paths):
+	torrent = CLIENT.put(name, directory)
+	CLIENT.torrents[torrent.id].files = [(path, 1000, True) for path in paths]
+	return CLIENT.get_torrent(torrent.id)
+
+
+PREFIX = "T" if bot.LANGUAGE.lower() == "es" else "S"
+fresh(auto_rename=True)
+PACK = "Friends Season 1 - 10 [1080p BluRay x265]"
+pack = with_files(PACK, "/tv", f"{PACK}/Season 1/Friends.S01E01.1080p.BluRay.x265.mkv",
+				f"{PACK}/Season 10/Friends.S10E01.1080p.BluRay.x265.mkv")
+check("a pack that may be ten seasons keeps its name", bot.auto_rename_torrent(pack), (None, None))
+episode = with_files("Friends.S01E10.1080p.BluRay.x265-GRP", "/tv",
+					"Friends.S01E10.1080p.BluRay.x265-GRP/Friends.S01E10.1080p.BluRay.x265-GRP.mkv")
+check("so the tenth episode replaces nothing", bot.replace_targets(episode), (None, []))
+check("and nothing is renamed", [c for c in CLIENT.calls if c[0] == "rename"], [])
+
+# The files and folders of a torrent agree on the title, and a sample clip
+# listed first leaves the name to the episode it samples
+fresh()
+wolf = with_files("Wolf.Pack.S01-S02.1080p.WEB", "/tv", "Wolf.Pack.S01-S02.1080p.WEB/Season 1/01.mkv",
+				"Wolf.Pack.S01-S02.1080p.WEB/Season 1/02.mkv")
+files, folders, skipped = bot.build_full_plan(wolf)
+check("the files of Wolf Pack keep the whole title", [new for _, new in files],
+	["1x01 - Wolf Pack - 1080p.mkv", "1x02 - Wolf Pack - 1080p.mkv"])
+check("as their folder does", [new for _, new in folders], [f"{PREFIX}1 - Wolf Pack - 1080p"])
+SAMPLED = "Show.Name.S01.720p.HDTV.x264-GRP"
+sampled = with_files(SAMPLED, "/tv", f"{SAMPLED}/sample.show.name.s01e01.720p.hdtv.x264-grp.mkv",
+					f"{SAMPLED}/show.name.s01e01.720p.hdtv.x264-grp.mkv")
+check("a sample clip listed first leaves the name to its episode", bot.build_full_plan(sampled),
+	([(f"{SAMPLED}/show.name.s01e01.720p.hdtv.x264-grp.mkv", "1x01 - Show Name - 720p.mkv")], [], 0))
 
 # --- Locales -----------------------------------------------------------------
 import json

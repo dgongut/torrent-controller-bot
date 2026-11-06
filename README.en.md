@@ -16,8 +16,9 @@
 
 Control your torrent client from a single place.
 
-- ✅ Dashboard with overall status: speeds, free space and torrents grouped by state
-- ✅ Torrent list with filters (downloading, seeding, paused, completed, with errors...) and pagination
+- ✅ Dashboard with overall status: speeds, free space, data transferred this session and all time, and torrents grouped by state
+- ✅ Total size of the torrents in every listing, filter or search
+- ✅ Torrent list with filters (downloading, seeding, paused, completed, with errors...) and pagination, sortable by date, name, size, progress, ratio, speed or last activity
 - ✅ Search torrents by name or by path
 - ✅ Add torrents by sending a `.torrent` file, a magnet link or a URL to a `.torrent` file, choosing the download directory
 - ✅ Pause, resume, verify, reannounce to the tracker and delete torrents (with or without their data)
@@ -26,6 +27,7 @@ Control your torrent client from a single place.
 - ✅ Limits per tracker: ratio and speed for every torrent of a tracker, the ones it already has and the ones that arrive later (for example, seed forever on private trackers and just a little on public ones), from the settings or from the filter of that tracker
 - ✅ Renaming with automatic suggestion for movies and series (`The.Matrix.1999.1080p.mkv` → `The Matrix (1999) - 1080p.mkv`)
 - ✅ Renaming the folders and files inside a torrent, one by one or in batch, dragging their subtitles along
+- ✅ Choose which files are downloaded and with what priority, one by one or a whole folder at once (for example, only some episodes of a season), seeing how far each file has got
 - ✅ Complete series: renames the folder, the season subfolders and the episodes in one go
 - ✅ Mass actions over a filter or search: resume, pause, delete, move all or set their ratio and speed limits
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
@@ -139,7 +141,7 @@ When you download something you already had (a better copy of the same movie, sa
 
 ❌ **Do not replace** leaves both torrents as they are and the notice as a plain completion notice, with no buttons.
 
-With **"Replace without asking when the name exists"** (under the automatic rename, off by default) it does it on its own when the download finishes and tells you what it deleted. A torrent sharing files with the new one is never replaced, since deleting its data would delete the new download too.
+With **"Replace without asking when the name exists"** (under the automatic rename, off by default) it does it on its own when the download finishes and tells you what it deleted. A torrent sharing files with the new one is never replaced, since deleting its data would delete the new download too. Nor does anything get replaced by a download with files left out, or with fewer videos than the old torrent: it is not a whole copy of what would be deleted. And the confirmation deletes exactly what it lists, even if another torrent with that name turns up meanwhile.
 
 ## Series folder
 
@@ -166,6 +168,7 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 | Move the data to another folder | ✅ | ✅ | ✅ | ✅ |
 | Delete the torrent along with its data | ✅ | ✅ | ✅ | ✅ |
 | Free space and low disk warning | ✅ | ✅ | ✅ | ✅ |
+| Transfer statistics, this session and all time | ✅ | ✅ | ⚠️ ⁹ | ❌ ⁹ |
 | Speed limits | ✅ | ✅ | ✅ | ✅ |
 | Alternative speed (turtle mode) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Ratio limit, per torrent and the manager's | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
@@ -175,6 +178,8 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 | Verify the data | ✅ | ✅ | ✅ | ❌ ² |
 | Smart, manual and automatic renaming | ✅ | ✅ | ✅ | ❌ ³ |
 | Categories | ❌ ⁴ | ✅ | ❌ ⁴ | ❌ ⁴ |
+| Sort the lists | ✅ | ✅ | ✅ | ✅ ¹⁰ |
+| Choose the files to download and their priority | ✅ | ✅ ¹¹ | ✅ | ✅ ¹² |
 
 ¹ Neither Deluge nor Download Station has an alternative speed mode. Regular speed limits do work on both.
 
@@ -191,6 +196,14 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 ⁷ The Download Station API has no way to ask the tracker for peers on demand.
 
 ⁸ In their torrent lists, qBittorrent and Deluge only tell the tracker each torrent is working with (Deluge, besides, by its domain: `tracker.example.org` shows as `example.org`). A torrent just added gets the limits of its tracker as soon as it announces for the first time, and one with several trackers, by the one it is using at that moment.
+
+⁹ Transmission keeps count of what was downloaded and uploaded, the time active and the number of starts, both for the session and all time; qBittorrent, what was downloaded and uploaded in both. Deluge only counts the session, since the daemon started, and the Download Station API does not give these figures.
+
+¹⁰ Download Station does not tell when a task was last active, so it cannot sort by that.
+
+¹¹ qBittorrent has no low priority: a file is downloaded with normal or high priority, or not at all.
+
+¹² Needs DSM 7. Download Station still counts the files left out in the size of a task.
 
 ## Synology Download Station
 
@@ -229,9 +242,7 @@ Those credentials go into `TORRENT_CLIENT_USER` and `TORRENT_CLIENT_PASSWORD`. T
 |TORRENT_CLIENT_PASSWORD |❌| Torrent client password, if it has authentication |
 |TORRENT_CLIENT_PROTOCOL |❌| Connection protocol, http or https. Default http |
 |TORRENT_CLIENT_RPC_PATH |❌| RPC path. Default /transmission/rpc (Transmission) or /webapi (Synology) |
-|TORRENTS_PER_PAGE |❌| Number of torrents per page in the lists. Default 10 |
-|DASHBOARD_REFRESH_SECONDS |❌| Seconds between automatic refreshes of the dashboard, the lists and a torrent screen. Default 2 |
-|DASHBOARD_REFRESH_DURATION |❌| Seconds the automatic refresh of the dashboard, the lists and a torrent screen lasts. Default 60 |
+|TORRENTS_PER_PAGE |❌| Number of torrents per page in the lists, from 1 to 90. Default 10 |
 |TELEMETRY |❌| `false` to turn the [anonymous statistics](#anonymous-statistics) off without going through `/settings`. Turning them off from `/settings` is the usual way; this is for those who prefer to pin it in the compose file |
 
 ## Docker-Compose example for normal execution

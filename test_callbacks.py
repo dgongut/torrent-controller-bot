@@ -111,6 +111,7 @@ def fake_torrent(torrent_id=TORRENT_ID):
 	return TorrentInfo(id=torrent_id, name=name, status=TorrentStatus.SEEDING,
 					progress=100.0, total_size=1024, downloaded=1024, uploaded=512, ratio=0.5,
 					download_dir=DIRS[0], files=list(files),
+					file_priorities=dict(PROFILE.get("priorities") or {}),
 					category=category, auto_managed=PROFILE["auto_managed"],
 					trackers=["tracker.example.org", "otro.tracker.example.net"])
 
@@ -127,6 +128,12 @@ class FakeClient:
 	ratio_limit_copied_on_add = False
 	supports_torrent_speed_limit = True
 	supports_reannounce = True
+	reports_last_activity = True
+	skipped_files_in_size = False
+	file_priority_levels = ("skip", "low", "normal", "high")
+
+	def set_file_priority(self, torrent_id, paths, priority):
+		CALLS.append(("set_file_priority", torrent_id, sorted(paths), priority))
 
 	def test_connection(self):
 		return "qBittorrent 5.1.0 (fake)"
@@ -323,7 +330,7 @@ def tracker_filter():
 
 # "cerrar" just deletes the message and "noop" does nothing, so they lead nowhere
 SKIPPED = {"cerrar", "noop"}
-MAX_STEPS = 2000
+MAX_STEPS = 3000
 
 
 def normalize(call):
@@ -335,6 +342,8 @@ def normalize(call):
 			parts.append("<ctx>")
 		elif re.fullmatch(r"t[0-9a-f]{6}", part):
 			parts.append("t<ctx>")
+		elif re.fullmatch(r"[mr][0-9a-f]{6}", part):
+			parts.append(f"{part[0]}<ctx>")  # What a mass action or a replace counted
 		else:
 			parts.append(part)
 	return "|".join(parts)
@@ -401,7 +410,8 @@ for label, profile in PROFILES.items():
 					"move", "moveToDir", "files", "file", "fileAuto", "mass", "confirmMass",
 					"settings", "toggleSetting", "favDirsMenu", "tplMenu", "trackers", "goto",
 					"categories", "catMenu", "catSet", "folder", "folderManual", "filesAll", "filesAllOk",
-					"ratioMenu", "ratioSet", "globalRatioSet", "reannounce", "massSpeedAsk", "tlAdd", "tlRule", "tlRatio", "tlDel", "tlDelOk"):
+					"ratioMenu", "ratioSet", "globalRatioSet", "reannounce", "massSpeedAsk", "tlAdd", "tlRule", "tlRatio", "tlDel", "tlDelOk",
+					"sort", "sortSet", "filePrio", "folderPrio"):
 		check(f"[{label}] the crawler reached the {command} screen", command in reached, True)
 	if profile["files"] is SERIES_FILES:
 		check(f"[{label}] the crawler reached the folder suggestion", "folderAuto" in reached, True)
@@ -514,7 +524,7 @@ season_texts = [b.text for row in season_screen[1].keyboard for b in row]
 check("a season folder lists its episodes", sum(t.startswith("🎬") for t in season_texts), bot_module.FILES_PER_PAGE)
 up = [b.callback_data for row in season_screen[1].keyboard for b in row if b.text.startswith("⬆️")]
 check("a season folder can go up to the torrent folder",
-	up, [bot_module.build_call("files", ctx, folders.index(SERIES_NAME), 0)])
+	up, [bot_module.build_call("files", ctx, bot_module.folder_ref(folders, folders.index(SERIES_NAME)), 0)])
 
 # Renaming the season folder being browsed leaves the torrent and its files alone
 CALLS.clear()
@@ -537,6 +547,119 @@ renamed = [(p.replace("Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2", "T1 - Mad Men
 after = bot_module.torrent_folders(fake_torrent().__class__(**{**fake_torrent().__dict__, "files": renamed}))
 check("the torrent folder keeps its index after a season is renamed",
 	after.index(SERIES_NAME), folders.index(SERIES_NAME))
+
+# Choosing what to download: leaving out and the priority are two things on
+# screen. A whole season left out, then one episode back in
+get_text = bot_module.get_text
+season_paths = sorted(p for p, _, _ in SERIES_FILES if p.startswith(season + "/"))
+all_paths = sorted(p for p, _, _ in SERIES_FILES)
+other_paths = sorted(set(all_paths) - set(season_paths))
+
+
+def texts(screen):
+	return [b.text for row in screen[1].keyboard for b in row]
+
+
+CALLS.clear()
+screen = press(bot_module.build_call("folderPrio", ctx, folders.index(season), 0))
+check("the folder screen counts every file inside", get_text("FOLDER_PRIORITY_TITLE",
+	"Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2", len(season_paths)) in screen[0], True)
+check("and how many are downloaded", get_text("FOLDER_WANTED_COUNT", len(season_paths), 0) in screen[0], True)
+check("with everything downloaded it only offers to download none",
+	(get_text("BUTTON_FOLDER_WANT_ALL") in texts(screen), get_text("BUTTON_FOLDER_SKIP_ALL") in texts(screen)), (False, True))
+check("the priority they all share is marked", "✅ " + get_text("PRIORITY_NORMAL") in texts(screen), True)
+check("the priorities share one row", [len(row) for row in screen[1].keyboard][:2], [1, 3])
+screen = press(bot_module.build_call("folderPrio", ctx, folders.index(season), 0, "s"))
+check("downloading none of a folder leaves out every file inside it",
+	CALLS, [("set_file_priority", TORRENT_ID, season_paths, "skip")])
+check("and the folder screen stays", screen[0].startswith(get_text("FOLDER_PRIORITY_TITLE", "Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2", len(season_paths))), True)
+
+PROFILE["priorities"] = {path: "skip" for path in season_paths}
+screen = press(bot_module.build_call("files", ctx, folders.index(season), 0))
+check("a file left out shows no share, it is not going anywhere",
+	any("%" in b.text for row in screen[1].keyboard for b in row if b.callback_data.startswith("file|")), False)
+check("the files left out are marked in the list",
+	all(b.text.startswith("⏭️ ") for row in screen[1].keyboard for b in row if b.callback_data.startswith("file|")), True)
+check("the folder says how much of it is downloaded", get_text("FILES_WANTED", 0, len(season_paths), "0.0B") in screen[0], True)
+screen = press(bot_module.build_call("folderPrio", ctx, folders.index(season), 0))
+check("a folder with nothing downloaded only offers to download all",
+	[t for t in texts(screen) if t not in (get_text("BUTTON_BACK"), get_text("BUTTON_CLOSE"))], [get_text("BUTTON_FOLDER_WANT_ALL")])
+check("and says nothing about priorities", get_text("FOLDER_PRIORITY_HINT") in screen[0], False)
+check("a manager that counts the files left out in the size does not say it", get_text("FOLDER_SKIPPED_IN_SIZE") in screen[0], False)
+bot_module.client.skipped_files_in_size = True
+check("Download Station warns that it still counts them", get_text("FOLDER_SKIPPED_IN_SIZE") in press(bot_module.build_call("folderPrio", ctx, folders.index(season), 0))[0], True)
+PROFILE["priorities"] = {}
+check("but not when nothing is left out", get_text("FOLDER_SKIPPED_IN_SIZE") in press(bot_module.build_call("folderPrio", ctx, folders.index(season), 0))[0], False)
+PROFILE["priorities"] = {path: "skip" for path in season_paths}
+bot_module.client.skipped_files_in_size = False
+screen = press(bot_module.build_call("folderPrio", ctx, folders.index(SERIES_NAME), 0))
+check("a folder half downloaded offers both", (get_text("BUTTON_FOLDER_WANT_ALL") in texts(screen),
+	get_text("BUTTON_FOLDER_SKIP_ALL") in texts(screen)), (True, True))
+check("and counts both", get_text("FOLDER_WANTED_COUNT", len(other_paths), len(season_paths)) in screen[0], True)
+CALLS.clear()
+press(bot_module.build_call("folderPrio", ctx, folders.index(SERIES_NAME), 0, "h"))
+check("a priority on a folder only goes to the files downloaded",
+	CALLS, [("set_file_priority", TORRENT_ID, other_paths, "high")])
+CALLS.clear()
+press(bot_module.build_call("folderPrio", ctx, folders.index(SERIES_NAME), 0, "d"))
+check("downloading all only brings back the files left out, with the normal priority",
+	CALLS, [("set_file_priority", TORRENT_ID, season_paths, "normal")])
+CALLS.clear()
+press(bot_module.build_call("folderPrio", ctx, folders.index(SERIES_NAME), 0, "s"))
+check("downloading none only touches the files downloaded",
+	CALLS, [("set_file_priority", TORRENT_ID, other_paths, "skip")])
+
+episode = SERIES_FILES.index(next(f for f in SERIES_FILES if f[0] == season_paths[0]))
+screen = press(bot_module.build_call("file", ctx, folders.index(season), 0, episode))
+check("a file left out says so", get_text("FILE_SKIPPED") in screen[0], True)
+_, episode_size, episode_done = SERIES_FILES[episode]
+check("a file says how much of it is on disk", get_text("FILE_PROGRESS", f"{episode_done / episode_size * 100:.1f}",
+	bot_module.sizeof_fmt(episode_done), bot_module.sizeof_fmt(episode_size)) in screen[0], True)
+check("and shows no priority", get_text("FILE_PRIORITY", get_text("PRIORITY_NORMAL")) in screen[0], False)
+check("only offering to download it",
+	[b.callback_data for row in screen[1].keyboard for b in row if b.callback_data.startswith("filePrio|")],
+	[bot_module.file_call("filePrio", ctx, folders.index(season), 0, episode, SERIES_FILES[episode][0], "d")])
+CALLS.clear()
+screen = press(bot_module.build_call("filePrio", ctx, folders.index(season), 0, episode, "d"))
+check("a single file can be brought back", CALLS, [("set_file_priority", TORRENT_ID, [season_paths[0]], "normal")])
+check("and its screen stays", screen[0].startswith(f"<b>{bot_module.file_basename(season_paths[0])}</b>"), True)
+CALLS.clear()
+press(bot_module.build_call("filePrio", ctx, folders.index(season), 0, episode, "zz"))
+check("an unknown priority does nothing", CALLS, [])
+PROFILE["priorities"] = {}
+screen = press(bot_module.build_call("file", ctx, folders.index(season), 0, episode))
+check("a downloaded file says so with its priority", (get_text("FILE_DOWNLOADED") in screen[0],
+	get_text("FILE_PRIORITY", get_text("PRIORITY_NORMAL")) in screen[0]), (True, True))
+rows = [[b.callback_data.split("|")[-1] for b in row] for row in screen[1].keyboard if row[0].callback_data.startswith("filePrio|")]
+check("its priorities share a row and leaving it out goes apart", rows, [["l", "n", "h"], ["s"]])
+bot_module.client.file_priority_levels = ("skip", "normal")
+screen = press(bot_module.build_call("file", ctx, folders.index(season), 0, episode))
+check("a manager with a single priority shows none", (get_text("FILE_PRIORITY", get_text("PRIORITY_NORMAL")) in screen[0],
+	[b.callback_data.split("|")[-1] for row in screen[1].keyboard for b in row if b.callback_data.startswith("filePrio|")]), (False, ["s"]))
+del bot_module.client.file_priority_levels
+del PROFILE["priorities"]
+
+# A manager that cannot rename (Download Station) still chooses the files, and
+# one that can do neither has no files screen at all
+bot_module.client.supports_rename = False
+screen = press(bot_module.build_call("files", ctx, folders.index(SERIES_NAME), 0))
+texts = [b.text for row in screen[1].keyboard for b in row]
+check("without renaming the files screen has no rename buttons",
+	(get_text("BUTTON_FOLDER_RENAME") in texts, get_text("BUTTON_FILES_RENAME_ALL") in texts), (False, False))
+check("but it still chooses what is downloaded", get_text("BUTTON_FOLDER_PRIORITY") in texts, True)
+bot_module.client.supports_rename = True
+check("the folder buttons share a row", [[b.text for b in row] for row in press(bot_module.build_call("files", ctx, folders.index(SERIES_NAME), 0))[1].keyboard
+	if any(b.callback_data.startswith("folderPrio|") for b in row)], [[get_text("BUTTON_FOLDER_PRIORITY"), get_text("BUTTON_FOLDER_RENAME")]])
+bot_module.client.supports_rename = False
+screen = press(bot_module.build_call("file", ctx, folders.index(season), 0, episode))
+check("nor has a file screen", any(b.callback_data.startswith(("fileManual|", "fileAuto|")) for row in screen[1].keyboard for b in row), False)
+check("the torrent screen offers the files", any(c.startswith("files|") for c in callbacks_of(press(bot_module.build_call("info", TORRENT_ID, config.FILTER_ALL, 0))[1])), True)
+bot_module.client.file_priority_levels = ()
+check("with neither the torrent screen has no files button", any(c.startswith("files|") for c in callbacks_of(press(bot_module.build_call("info", TORRENT_ID, config.FILTER_ALL, 0))[1])), False)
+bot_module.client.supports_rename = True
+check("a manager that cannot choose files hides it in the files screen",
+	get_text("BUTTON_FOLDER_PRIORITY") in [b.text for row in press(bot_module.build_call("files", ctx, folders.index(SERIES_NAME), 0))[1].keyboard for b in row], False)
+del bot_module.client.file_priority_levels
 
 PROFILE.update(PROFILES["plain names"])
 
@@ -699,11 +822,17 @@ def run_live_refresher(message_id, build):
 
 update_text = bot_module.get_text("BUTTON_UPDATE")
 autoupdating = bot_module.get_text("DASHBOARD_AUTOUPDATING")
+live_ctx = bot_module.new_nav_context(TORRENT_ID, config.FILTER_ALL, 0)
+live_root = bot_module.torrent_folders(fake_torrent()).index(bot_module.torrent_root(fake_torrent()))
 for name, call, build in (
 		("list", bot_module.build_call("list", config.FILTER_ALL, 0),
 			lambda refreshing: bot_module.build_list(config.FILTER_ALL, 0, refreshing)),
 		("torrent", bot_module.build_call("info", TORRENT_ID, config.FILTER_ALL, 0),
-			lambda refreshing: bot_module.build_detail(TORRENT_ID, config.FILTER_ALL, 0, refreshing))):
+			lambda refreshing: bot_module.build_detail(TORRENT_ID, config.FILTER_ALL, 0, refreshing)),
+		("file list", bot_module.build_call("files", live_ctx, bot_module.folder_ref(bot_module.torrent_folders(fake_torrent()), live_root), 0),
+			lambda refreshing: bot_module.build_files(live_ctx, TORRENT_ID, config.FILTER_ALL, 0, live_root, 0, refreshing)),
+		("file", bot_module.file_call("file", live_ctx, live_root, 0, 0, FILES[0][0]),
+			lambda refreshing: bot_module.build_file_screen(TORRENT_ID, live_ctx, live_root, 0, 0, refreshing))):
 	bot_module.live_views.clear()
 	screen = press(call)
 	check(f"the {name} becomes the live screen", bot_module.live_views.get((CHAT_ID, None), {}).get("message_id"), MESSAGE_ID)
@@ -717,6 +846,19 @@ for name, call, build in (
 	check(f"the {name} ends with its last update time", autoupdating in last_text, False)
 	check(f"the {name} ends with the update button on the left", last_markup.keyboard[-1][0].text, update_text)
 	check(f"the {name} update button repaints the same screen", last_markup.keyboard[-1][0].callback_data, call)
+
+# What a live screen shows can vanish while it repaints: the screen says so and
+# stops, instead of being left behind saying it updates itself
+press(bot_module.build_call("file", live_ctx, live_root, 0, 0))
+# The torrent lost files meanwhile: the index points past the end of its list
+edits = run_live_refresher(MESSAGE_ID, lambda refreshing: bot_module.build_file_screen(TORRENT_ID, live_ctx, live_root, 0, len(FILES), refreshing))
+check("a file that vanishes is said to be gone", [e[0] for e in edits], [bot_module.get_text("FILE_NOT_FOUND")])
+check("and its screen goes back to the files", callbacks_of(edits[-1][1])[0], bot_module.build_call("files", live_ctx, live_root, 0))
+press(bot_module.build_call("list", config.FILTER_ALL, 0))
+def expired_list(refreshing):
+	raise bot_module.ExpiredContext()
+edits = run_live_refresher(MESSAGE_ID, expired_list)
+check("an expired list says so instead of a stale footer", [e[0] for e in edits], [bot_module.get_text("SEARCH_EXPIRED")])
 
 # A button pressed on the live message stops it without painting over it
 bot_module.live_views.clear()
@@ -1027,7 +1169,7 @@ check("an unauthorized /start@OwnBot is still refused", send_command("/start@Own
 # A command for another bot must not cancel nor answer a pending text input
 bot_module.set_pending_input(GROUP_ID, 1, "search")
 send_command("/list@OtherBot")
-check("/list@OtherBot keeps the pending input", bot_module.pop_pending_input(GROUP_ID, 1), {"action": "search"})
+check("/list@OtherBot keeps the pending input", (bot_module.pop_pending_input(GROUP_ID, 1) or {}).get("action"), "search")
 
 # When Telegram cannot say who this bot is, every command is taken as its own
 def unreachable():
@@ -1328,15 +1470,21 @@ check("a manager that cannot reannounce has no button", any(c.startswith("reanno
 bot_module.client.supports_reannounce = True
 
 # Limits of every torrent of a filter: ratio, download and upload
-list_calls = callbacks_of(press(bot_module.build_call("list", config.FILTER_ALL, 0))[1])
+def mass_menu(filter_key=config.FILTER_ALL):
+	return press(bot_module.build_call("massMenu", filter_key, 0))
+
+
+list_calls = callbacks_of(mass_menu()[1])
 mass_ratio = bot_module.build_call("mass", "ratio", config.FILTER_ALL)
-check("the list offers the limits of all", mass_ratio in list_calls, True)
-check("named limits", get_text("BUTTON_MASS_LIMITS") in labelled(press(bot_module.build_call("list", config.FILTER_ALL, 0))[1]), True)
+check("the actions on all offer the limits of all", mass_ratio in list_calls, True)
+check("named limits", get_text("BUTTON_MASS_LIMITS") in labelled(mass_menu()[1]), True)
 screen = press(mass_ratio)
 check("it shows the limits of all of them", screen[0].startswith(get_text("MASS_LIMITS_TITLE", len(TORRENT_IDS))), True)
 check("with nothing marked", sum(label.startswith("✅") for label in labelled(screen[1])), 0)
-check("and the speed of each one", [labelled(screen[1]).get(get_text(k)) for k in ("BUTTON_TORRENT_DOWN_LIMIT", "BUTTON_TORRENT_UP_LIMIT")],
-	[bot_module.build_call("massSpeedAsk", config.FILTER_ALL, d) for d in ("down", "up")])
+speed_asks = [labelled(screen[1]).get(get_text(k)) for k in ("BUTTON_TORRENT_DOWN_LIMIT", "BUTTON_TORRENT_UP_LIMIT")]
+check("and the speed of each one, for the torrents counted on the screen",
+	[(c or "").split("|")[0] + "|" + (c or "").split("|")[-1] for c in speed_asks], ["massSpeedAsk|down", "massSpeedAsk|up"])
+check("the limits of all carry what they counted, not the filter", all(c.split("|")[1].startswith("m") for c in speed_asks), True)
 check("back goes to the list", labelled(screen[1]).get(get_text("BUTTON_BACK")), bot_module.build_call("list", config.FILTER_ALL, 0))
 for label, expected, said in ((get_text("BUTTON_RATIO_NONE"), -1, get_text("NO_LIMIT")), ("0.5", 0.5, "0.5"),
 							(get_text("BUTTON_RATIO_GLOBAL"), None, get_text("BUTTON_RATIO_GLOBAL"))):
@@ -1356,7 +1504,7 @@ check("a typed ratio is set on all of them", CALLS, [("set_ratio_limit", TORRENT
 check("and confirmed", EDITS[-1][0].split("\n")[0], get_text("MASS_DONE_RATIO", len(TORRENT_IDS), "1.5"))
 for direction, done_key, typed, said in (("down", "MASS_DONE_DOWN", "300", "300 KB/s"), ("up", "MASS_DONE_UP", "0", get_text("NO_LIMIT"))):
 	bot_module.pending_inputs.clear()
-	press(bot_module.build_call("massSpeedAsk", config.FILTER_ALL, direction))
+	press(speed_asks[0 if direction == "down" else 1])
 	pending = bot_module.pop_pending_input(CHAT_ID, 1)
 	check(f"cancelling the typed {direction} limit of all goes back to the limits", pending["back_call"], mass_ratio)
 	CALLS.clear()
@@ -1366,7 +1514,11 @@ for direction, done_key, typed, said in (("down", "MASS_DONE_DOWN", "300", "300 
 	check(f"and the {direction} limit is confirmed on the limits", (EDITS[-1][0].split("\n")[0],
 		get_text("MASS_LIMITS_TITLE", len(TORRENT_IDS)) in EDITS[-1][0]), (get_text(done_key, len(TORRENT_IDS), said), True))
 bot_module.pending_inputs.clear()
-press(bot_module.build_call("massSpeedAsk", config.FILTER_ALL, "down"))
+old_button = press(bot_module.build_call("massSpeedAsk", config.FILTER_ALL, "down"))
+check("a limits button from before the confirmations kept their torrents shows the limits again, counted now",
+	(bot_module.pop_pending_input(CHAT_ID, 1), old_button[0].startswith(get_text("MASS_LIMITS_TITLE", len(TORRENT_IDS)))), (None, True))
+bot_module.pending_inputs.clear()
+press(speed_asks[0])
 pending = bot_module.pop_pending_input(CHAT_ID, 1)
 CALLS.clear()
 message.text = "mucho"
@@ -1374,10 +1526,10 @@ bot_module.handle_pending_input(message, pending)
 check("a speed that is not a number sets nothing", CALLS, [])
 
 bot_module.client.supports_ratio_limit = False
-check("without ratio limits the limits of all are only the speed", (mass_ratio in callbacks_of(press(bot_module.build_call("list", config.FILTER_ALL, 0))[1]),
+check("without ratio limits the limits of all are only the speed", (mass_ratio in callbacks_of(mass_menu()[1]),
 	get_text("BUTTON_RATIO_NONE") in labelled(press(mass_ratio)[1])), (True, False))
 bot_module.client.supports_torrent_speed_limit = False
-check("and with no limits at all there are no limits of all", mass_ratio in callbacks_of(press(bot_module.build_call("list", config.FILTER_ALL, 0))[1]), False)
+check("and with no limits at all there are no limits of all", mass_ratio in callbacks_of(mass_menu()[1]), False)
 check("a manager without per torrent limits has no limits button",
 	any(c.startswith("ratioMenu|") for c in detail_buttons()), False)
 bot_module.client.supports_torrent_speed_limit = True
@@ -1422,6 +1574,614 @@ bot_module.client.ratio_limit_copied_on_add = True
 check("Deluge warns that it only applies to new torrents", get_text("SETTINGS_RATIO_ONLY_NEW") in bot_module.build_settings("ratio")[0], True)
 del bot_module.client.ratio_limit_copied_on_add
 bot_module.client.global_ratio = 2.0
+
+# Order of the lists: every criterion, turned around, with the unknown values last
+def sort_sample():
+	return [TorrentInfo(id="a", name="beta", status=TorrentStatus.SEEDING, total_size=10, progress=100.0, ratio=2.0,
+					added_date=300, last_activity=None, download_rate=0, upload_rate=5),
+			TorrentInfo(id="b", name="Alfa", status=TorrentStatus.DOWNLOADING, total_size=30, progress=40.0, ratio=0.1,
+					added_date=200, last_activity=50, download_rate=100, upload_rate=0),
+			TorrentInfo(id="c", name="gamma", status=TorrentStatus.PAUSED, total_size=20, progress=70.0, ratio=1.0,
+					added_date=100, last_activity=90, download_rate=0, upload_rate=0)]
+
+
+def sorted_ids(key, reverse=False):
+	bot_module.bot_settings.set("list_sort", key)
+	bot_module.bot_settings.set("list_sort_reverse", reverse)
+	return [t.id for t in bot_module.sort_torrents(sort_sample())]
+
+
+check("the lists open newest first", sorted_ids("added"), ["a", "b", "c"])
+check("oldest first", sorted_ids("added", True), ["c", "b", "a"])
+check("by name, whatever the case", sorted_ids("name"), ["b", "a", "c"])
+check("by name backwards", sorted_ids("name", True), ["c", "a", "b"])
+check("largest first", sorted_ids("size"), ["b", "c", "a"])
+check("smallest first", sorted_ids("size", True), ["a", "c", "b"])
+check("most advanced first", sorted_ids("progress"), ["a", "c", "b"])
+check("highest ratio first", sorted_ids("ratio"), ["a", "c", "b"])
+check("fastest first, down and up together", sorted_ids("speed"), ["b", "a", "c"])
+check("ties keep the newest first", sorted_ids("speed", True), ["c", "a", "b"])
+check("recent activity first, the never active last", sorted_ids("activity"), ["c", "b", "a"])
+check("old activity first, the never active still last", sorted_ids("activity", True), ["b", "c", "a"])
+bot_module.bot_settings.set("list_sort", "nonsense")
+check("an unknown order falls back to the newest first", bot_module.current_sort()[0], "added")
+
+bot_module.bot_settings.set("list_sort", "added")
+bot_module.bot_settings.set("list_sort_reverse", False)
+screen = press(bot_module.build_call("list", config.FILTER_ALL, 0))
+sort_button = labelled(screen[1])[get_text("BUTTON_SORT", get_text("SORT_ADDED_SHORT"))]
+screen = press(sort_button)
+check("the sort menu marks the current order", "✅ " + get_text("SORT_ADDED_SHORT") in labelled(screen[1]), True)
+screen = press(labelled(screen[1])[get_text("SORT_SIZE_SHORT")])
+check("choosing an order keeps the menu open", screen[0], get_text("SORT_TITLE", get_text("SORT_SIZE")))
+check("with the mark moved to it", "✅ " + get_text("SORT_SIZE_SHORT") in labelled(screen[1]), True)
+check("and keeps it", bot_module.current_sort(), ("size", False))
+screen = press(labelled(screen[1])[get_text("BUTTON_SORT_REVERSE")])
+check("reversing right away turns the chosen order around", bot_module.current_sort(), ("size", True))
+check("and the mark shows the reversed order", "✅ " + get_text("SORT_SIZE_REVERSE_SHORT") in labelled(screen[1]), True)
+screen = press(labelled(screen[1])[get_text("BUTTON_SORT_REVERSE")])
+check("reversing twice goes back to the natural order", bot_module.current_sort(), ("size", False))
+screen = press(labelled(screen[1])[get_text("BUTTON_SORT_REVERSE")])
+screen = press(labelled(screen[1])["✅ " + get_text("SORT_SIZE_REVERSE_SHORT")])
+check("pressing the marked order leaves it as it is", bot_module.current_sort(), ("size", True))
+screen = press(labelled(screen[1])[get_text("BUTTON_BACK")])
+check("back opens the list on its first page", screen[0].startswith(bot_module.get_text("LIST_TITLE", bot_module.get_filter_label(config.FILTER_ALL), len(TORRENT_IDS), 1, 2)), True)
+check("the list shows the order in its button", get_text("BUTTON_SORT", get_text("SORT_SIZE_REVERSE_SHORT")) in labelled(screen[1]), True)
+screen = press(labelled(press(labelled(screen[1])[get_text("BUTTON_SORT", get_text("SORT_SIZE_REVERSE_SHORT"))])[1])[get_text("SORT_NAME_SHORT")])
+check("another order starts in its natural direction", bot_module.current_sort(), ("name", False))
+# The list keeps a single row for what is not a torrent nor a page: the order
+# and the menu of the actions on all, which has every one of them
+screen = press(bot_module.build_call("list", config.FILTER_ALL, 1))
+rows = [[b.callback_data.split("|")[0] for b in row] for row in screen[1].keyboard]
+check("the list has the order and the actions on all in one row", ["sort", "massMenu"] in rows, True)
+check("and no action on all of its own", any(c in ("mass", "tlRule") for row in rows for c in row), False)
+check("after it only the bottom row", rows[-1], ["list", "dashboard", "cerrar"] if rows[-1][0] == "list" else ["dashboard", "cerrar"])
+screen = press(labelled(screen[1])[get_text("BUTTON_MASS_MENU")])
+calls = callbacks_of(screen[1])
+check("the actions on all say how many torrents they cover",
+	screen[0].startswith(get_text("MASS_MENU_TITLE", bot_module.get_filter_label(config.FILTER_ALL), len(TORRENT_IDS))), True)
+check("the actions on all are all there", [c for c in calls if c.startswith("mass|")],
+	[bot_module.build_call("mass", a, config.FILTER_ALL) for a in ("resume", "pause", "move", "ratio", "delete")])
+check("their back goes to the page they were opened from", calls[-2], bot_module.build_call("list", config.FILTER_ALL, 1))
+tf = tracker_filter()
+calls = callbacks_of(press(bot_module.build_call("massMenu", tf, 0))[1])
+check("on a tracker the limits of the tracker replace the limits of all",
+	(any(c.startswith("tlRule|") for c in calls), bot_module.build_call("mass", "ratio", tf) in calls), (True, False))
+bot_module.bot_settings.set("list_sort", "added")
+bot_module.bot_settings.set("list_sort_reverse", False)
+menu = bot_module.build_sort_menu(config.FILTER_ALL)[1]
+check("the sort menu shows the orders in two columns", [len(row) for row in menu.keyboard], [2, 2, 2, 1, 1, 2])
+CALLS.clear()
+
+bot_module.client.reports_last_activity = False
+check("the activity order is not offered when the manager does not report it",
+	get_text("SORT_ACTIVITY_SHORT") in labelled(bot_module.build_sort_menu(config.FILTER_ALL)[1]), False)
+bot_module.bot_settings.set("list_sort", "activity")
+check("and a stored activity order falls back to the newest first", bot_module.current_sort()[0], "added")
+bot_module.client.reports_last_activity = True
+bot_module.bot_settings.set("list_sort", "added")
+bot_module.bot_settings.set("list_sort_reverse", False)
+
+# ---------------------------------------------------------------------------
+# REVIEW FIXES: each block is a bug that was reproduced before it was fixed
+# ---------------------------------------------------------------------------
+
+import subprocess
+import threading
+
+PROFILE.update({"name": None, "files": None, "auto_managed": False, "priorities": None})
+_real_start_add_flow = bot_module.start_add_flow
+_real_get_torrents = bot_module.client.get_torrents
+
+
+def finishes(function, seconds=3):
+	"""Whether function returns within seconds (a hang must fail, not block the tests)"""
+	done = threading.Event()
+	threading.Thread(target=lambda: (function(), done.set()), daemon=True).start()
+	return done.wait(seconds)
+
+
+def tg_message(text="", thread=None, topic=False, chat_type="supergroup", user_id=1, chat_id=CHAT_ID):
+	"""A message as telebot builds it: outside a forum a reply still carries
+	message_thread_id (the id of the message it answers), with is_topic_message false"""
+	return types.SimpleNamespace(text=text, chat=types.SimpleNamespace(id=chat_id, type=chat_type),
+								from_user=types.SimpleNamespace(id=user_id), message_thread_id=thread, is_topic_message=topic,
+								message_id=900, entities=None, caption_entities=None, caption=None, document=None)
+
+
+# get_text fills every placeholder in one pass: a value holding "$2" keeps it
+check("a value holding $2 is not filled in again", get_text("MOVE_OK", "Price$2Off", "/dest").count("Price$2Off"), 1)
+
+# Topics: only a topic message is in a topic
+check("a reply outside a forum is not in a topic", bot_module.message_thread(tg_message(thread=501)), None)
+check("a topic message is", bot_module.message_thread(tg_message(thread=7, topic=True)), 7)
+check("and General is no topic", bot_module.message_thread(tg_message(thread=1, topic=True)), None)
+bot_module.pending_inputs.clear()
+press(bot_module.build_call("search"))
+SENDS.clear()
+bot_module.handle_text(tg_message("Some.Movie", thread=MESSAGE_ID))
+check("the answer to a prompt in a group without topics is answered without a thread", SENDS[-1:], [(CHAT_ID, None)])
+bot_module.pending_inputs.clear()
+bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("search"), thread_id=7)
+SENDS.clear()
+bot_module.handle_text(tg_message("Some.Movie", thread=7, topic=True))
+check("and in a forum topic it stays in that topic", SENDS[-1:], [(CHAT_ID, 7)])
+bot_module.live_views.clear()
+bot_module.live_messages.clear()
+bot_module.pending_inputs.clear()
+bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("list", config.FILTER_ALL, 0), thread_id=7)
+goto = next(c for c in callbacks_of(EDITS[-1][1]) if c.startswith("goto|"))
+bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, goto, thread_id=7)
+bot_module.handle_text(tg_message("2", thread=7, topic=True))
+check("a page jump in a topic keeps the list live in that topic", bot_module.live_views.get((CHAT_ID, 7), {}).get("message_id"), MESSAGE_ID)
+check("and registers nothing outside it", (CHAT_ID, None) in bot_module.live_views, False)
+
+# A question waits a while, in its own topic, and gives way to anything else
+bot_module.pending_inputs.clear()
+bot_module.set_pending_input(CHAT_ID, 1, "search", thread_id=7)
+check("a question is not answered from another topic", bot_module.pop_pending_input(CHAT_ID, 1, thread_id=9), None)
+check("and still waits for its own", (bot_module.pop_pending_input(CHAT_ID, 1, thread_id=7) or {}).get("action"), "search")
+bot_module.set_pending_input(CHAT_ID, 1, "search")
+bot_module.pending_inputs[(CHAT_ID, 1)]["ts"] -= config.INPUT_TTL + 1
+check("an old question is not waited for", bot_module.pop_pending_input(CHAT_ID, 1), None)
+bot_module.set_pending_input(CHAT_ID, 1, "massMove", mass_ctx="m000000")
+press_button(bot_module.build_call("dashboard"))
+check("a button pressed meanwhile drops the question", bot_module.pending_inputs.get((CHAT_ID, 1)), None)
+bot_module.set_pending_input(GROUP_ID, 1, "rename", torrent_id=TORRENT_ID)
+send_command("/list")
+check("a command drops it too", bot_module.pending_inputs.get((GROUP_ID, 1)), None)
+added = []
+bot_module.start_add_flow = lambda chat_id, name, magnet=None, data=None, thread_id=None: added.append(magnet)
+pasted = "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=New.Movie.2024.1080p"
+bot_module.set_pending_input(CHAT_ID, 1, "massMove", mass_ctx="m000000")
+CALLS.clear()
+bot_module.handle_text(tg_message(pasted))
+check("a magnet pasted while a question waits is added", added, [pasted])
+check("and not taken as the answer", ([c for c in CALLS if c[0] == "move_torrents"], bot_module.pending_inputs.get((CHAT_ID, 1))), ([], None))
+bot_module.start_add_flow = _real_start_add_flow
+
+# Mass actions act on what their confirmation counted
+counted = press(bot_module.build_call("mass", "delete", config.FILTER_ALL))
+delete_with_data = labelled(counted[1])[get_text("BUTTON_DELETE_WITH_DATA")]
+check("the delete confirmation carries what it counted, not the filter", delete_with_data.split("|")[2][0], "m")
+newcomer = fake_torrent(TORRENT_IDS[1])
+newcomer.id = "f" * 40
+bot_module.client.get_torrents = lambda status=None, query=None: [fake_torrent(t) for t in TORRENT_IDS[2:]] + [newcomer]
+CALLS.clear()
+press(delete_with_data)
+check("confirming deletes only the torrents counted that are still there", CALLS, [("remove_torrents", TORRENT_IDS[2:], True)])
+bot_module.client.get_torrents = lambda status=None, query=None: [newcomer]
+CALLS.clear()
+done = press(delete_with_data)
+check("with none of them left nothing is deleted", (CALLS, done[0]), ([], get_text("MASS_GONE")))
+bot_module.client.get_torrents = _real_get_torrents
+move_screen = press(bot_module.build_call("mass", "move", config.FILTER_ALL))
+bot_module.client.get_torrents = lambda status=None, query=None: [fake_torrent(t) for t in TORRENT_IDS[:2]] + [newcomer]
+CALLS.clear()
+press(next(c for c in callbacks_of(move_screen[1]) if c.startswith("massMoveDir|")))
+real_sleep(0.3)  # The move goes out on a worker thread
+check("moving all moves only the torrents counted", [c[1] for c in CALLS if c[0] == "move_torrents"], [TORRENT_IDS[:2]])
+bot_module.client.get_torrents = _real_get_torrents
+CALLS.clear()
+old_button = press(bot_module.build_call("confirmMass", "delete", config.FILTER_ALL, "1"))
+check("a confirm button from before deletes nothing and asks again", (CALLS, old_button[0]),
+	([], get_text("MASS_CONFIRM_DELETE", len(TORRENT_IDS))))
+expired = press(bot_module.build_call("confirmMass", "delete", "m000000", "1"))
+check("an expired confirmation deletes nothing", (CALLS, expired[0]), ([], get_text("MASS_EXPIRED")))
+
+# Folder and category ids are the same in every run
+dir_id = bot_module.get_dir_id(DIRS[3])
+check("a folder id does not depend on the order folders were seen", dir_id, bot_module._stable_id(DIRS[3]))
+bot_module._dir_by_id.clear()  # What a restart leaves
+check("after a restart an old folder button still finds its folder", bot_module.get_dir_by_id(dir_id), DIRS[3])
+check("and a button from before the stable ids finds none", bot_module.get_dir_by_id("2"), None)
+cat_id = bot_module.get_cat_id(CATEGORIES[1][0])
+bot_module._cat_by_id.clear()
+check("a category button also survives a restart", bot_module.get_cat_by_id(cat_id), CATEGORIES[1][0])
+
+# The buttons of a file follow it when a rename reorders the list
+moved = fake_torrent()
+paths = [p for p, _, _ in moved.files]
+check("a file is found by its position and hash", bot_module.resolve_file(moved, 1, bot_module.file_key(paths[1]))[1], paths[1])
+moved.files = [moved.files[1], moved.files[0]] + moved.files[2:]
+check("after a reorder it is found where it went", bot_module.resolve_file(moved, 1, bot_module.file_key(paths[1]))[:2], (0, paths[1]))
+moved.files = [(p + ".renamed", s, c) if p == paths[1] else (p, s, c) for p, s, c in moved.files]
+check("and a renamed one is gone, never another file", bot_module.resolve_file(moved, 0, bot_module.file_key(paths[1])), None)
+file_ctx = bot_module.new_nav_context(TORRENT_ID, config.FILTER_ALL, 0)
+file_root = bot_module.torrent_folders(fake_torrent()).index(bot_module.torrent_root(fake_torrent()))
+CALLS.clear()
+press(bot_module.build_call("filePrio", file_ctx, file_root, 0, 0, bot_module.file_key(FILES[0][0] + ".gone"), "s"))
+check("a skip button whose file is gone leaves every file alone", [c for c in CALLS if c[0] == "set_file_priority"], [])
+press(bot_module.file_call("filePrio", file_ctx, file_root, 0, 0, FILES[0][0], "s"))
+check("and with its file there it acts on that one", [c for c in CALLS if c[0] == "set_file_priority"],
+	[("set_file_priority", TORRENT_ID, [FILES[0][0]], "skip")])
+
+# Live screens: a press on a message stops its own refresher, wherever it was registered
+bot_module.live_views.clear()
+bot_module.live_messages.clear()
+press(bot_module.build_call("list", config.FILTER_ALL, 0))
+generation = bot_module.live_messages[(CHAT_ID, MESSAGE_ID)]
+bot_module.start_live_view(CHAT_ID, MESSAGE_ID + 1, None, bot_module.build_dashboard)
+bot_module.stop_live_view(CHAT_ID, MESSAGE_ID)
+EDITS.clear()
+real_live_refresher(CHAT_ID, None, MESSAGE_ID, generation, lambda refreshing: bot_module.build_list(config.FILTER_ALL, 0, refreshing))
+check("a replaced screen whose button was pressed is not painted over", EDITS, [])
+bot_module.live_messages.clear()
+bot_module.start_live_view(CHAT_ID, MESSAGE_ID, None, bot_module.build_dashboard)
+generation = bot_module.live_messages[(CHAT_ID, MESSAGE_ID)]
+bot_module.stop_live_view(CHAT_ID, MESSAGE_ID, 7)
+EDITS.clear()
+real_live_refresher(CHAT_ID, None, MESSAGE_ID, generation, bot_module.build_dashboard)
+check("a press stops the refresher of its message whatever topic it was registered under", EDITS, [])
+bot_module.live_messages.clear()
+press(bot_module.build_call("list", config.FILTER_ALL, 0))
+generation = bot_module.live_messages[(CHAT_ID, MESSAGE_ID)]
+press_button(bot_module.build_call("noop"))
+check("a dead arrow does not stop the screen repainting itself", bot_module.live_messages.get((CHAT_ID, MESSAGE_ID)), generation)
+press_button(bot_module.build_call("dashboard"))
+check("a real button does", bot_module.live_messages.get((CHAT_ID, MESSAGE_ID)) != generation, True)
+bot_module.live_messages.clear()
+bot_module.start_live_view(CHAT_ID, MESSAGE_ID, None, bot_module.build_dashboard, "refreshDashboard")
+generation = bot_module.live_messages[(CHAT_ID, MESSAGE_ID)]
+
+
+def failing_last(refreshing):
+	if not refreshing:
+		raise torrent_clients.TorrentClientError("manager restarting")
+	return bot_module.build_dashboard(refreshing)
+
+
+EDITS.clear()
+real_live_refresher(CHAT_ID, None, MESSAGE_ID, generation, failing_last, "refreshDashboard")
+check("a last repaint that fails says so", EDITS[-1][0], get_text("CONNECTION_ERROR", "manager restarting"))
+check("with the button to try again", callbacks_of(EDITS[-1][1])[0], "refreshDashboard")
+bot_module.live_messages.clear()
+bot_module.bot_settings.set("list_sort", "speed")
+speeds = {torrent_id: position for position, torrent_id in enumerate(TORRENT_IDS)}
+
+
+def with_speeds(status=None, query=None):
+	torrents = [fake_torrent(t) for t in TORRENT_IDS]
+	for torrent in torrents:
+		torrent.download_rate = speeds[torrent.id]
+	return torrents
+
+
+bot_module.client.get_torrents = with_speeds
+order = {}
+first = [c for c in callbacks_of(bot_module.build_list(config.FILTER_ALL, 0, True, order)[1]) if c.startswith("info|")]
+for torrent_id in speeds:
+	speeds[torrent_id] = -speeds[torrent_id]
+again = [c for c in callbacks_of(bot_module.build_list(config.FILTER_ALL, 0, True, order)[1]) if c.startswith("info|")]
+check("a live list keeps its order while it repaints", again, first)
+anew = [c for c in callbacks_of(bot_module.build_list(config.FILTER_ALL, 0, False)[1]) if c.startswith("info|")]
+check("and a new one sorts again", anew != first, True)
+bot_module.client.get_torrents = _real_get_torrents
+bot_module.bot_settings.set("list_sort", "added")
+
+# Telegram calls that cannot do what was asked are handled, not painted as errors
+removed_markups = []
+
+
+def refuse_delete(*a, **k):
+	raise FakeTelegramError("Bad Request: message can't be deleted for everyone")
+
+
+bot_module.bot.delete_message = refuse_delete
+bot_module.bot.edit_message_reply_markup = lambda chat_id, message_id, reply_markup=None: removed_markups.append(message_id) or True
+press(bot_module.build_call("cerrar"))
+check("closing a message too old to delete leaves it without buttons", removed_markups, [MESSAGE_ID])
+
+
+def not_modified(*a, **k):
+	raise FakeTelegramError("Bad Request: message is not modified")
+
+
+bot_module.bot.edit_message_reply_markup = not_modified
+EDITS.clear()
+press(bot_module.build_call("serKeep"))
+check("a second Keep paints no error over the notice", EDITS, [])
+bot_module.bot.delete_message = lambda *a, **k: True
+bot_module.bot.edit_message_reply_markup = lambda *a, **k: True
+
+# Adding
+taken = bot_module.new_pending_torrent("Some.Movie.2024.1080p", magnet="magnet:?xt=urn:btih:" + "b" * 40)
+bot_module.pop_pending_torrent(taken)
+bot_module._adding.add(taken)  # The folder was chosen: the add is under way
+bot_module.live_messages.clear()
+EDITS.clear()
+press(bot_module.build_call("cancelAdd", taken))
+check("cancelling an add already under way does not put a dashboard over its result", (EDITS, bot_module.live_messages), ([], {}))
+bot_module._adding.discard(taken)
+expired_add = bot_module.new_pending_torrent("Some.Movie.2024.1080p", magnet="magnet:?xt=urn:btih:" + "e" * 40)
+bot_module.pending_torrents.clear()  # What a restart leaves
+EDITS.clear()
+press(bot_module.build_call("cancelAdd", expired_add))
+check("cancelling an add the bot forgot still clears the prompt", bool(EDITS) and EDITS[-1][0].startswith(get_text("DASHBOARD_TITLE", 12)[:10]), True)
+_real_add = bot_module.client.add_torrent
+
+
+def duplicate(**kwargs):
+	raise torrent_clients.DuplicateTorrentError("already there", torrent_id=TORRENT_ID)
+
+
+bot_module.client.add_torrent = duplicate
+pending_id = bot_module.new_pending_torrent("Some.Movie.2024.1080p", magnet="magnet:?xt=urn:btih:" + "c" * 40)
+done = press(bot_module.build_call("addTo", pending_id, bot_module.get_dir_id(DIRS[0])))
+check("adding a torrent already there names the one there", done[0], get_text("ADD_DUPLICATE", bot_module.html.escape(fake_torrent().name)))
+check("and leaves no late add waiting for it", "c" * 40 in bot_module._late_adds, False)
+
+
+def refuse_add(**kwargs):
+	raise torrent_clients.TorrentClientError("invalid torrent")
+
+
+bot_module.client.add_torrent = refuse_add
+check("a negative length in a .torrent is not looped on", finishes(lambda: bot_module.torrent_data_hash(b"d-3:abce")), True)
+check("nor one inside the info dict", bot_module.torrent_data_hash(b"d4:infod-3:abceee") if finishes(
+	lambda: bot_module.torrent_data_hash(b"d4:infod-3:abceee")) else "hangs", None)
+
+
+def corrupt_add():
+	try:
+		bot_module.add_torrent_from_bot(late_add={"chat_id": CHAT_ID}, torrent_data=b"d4:infod-3:abceee")
+	except torrent_clients.TorrentClientError:
+		pass
+
+
+check("a corrupt .torrent the manager refuses does not hang the add", finishes(corrupt_add), True)
+check("and the add lock is free afterwards", bot_module._bot_adds_lock.acquire(timeout=1), True)
+bot_module._bot_adds_lock.release()
+bot_module.client.add_torrent = _real_add
+
+
+def document(name, chat_type, user_id=1):
+	sent = tg_message(chat_type=chat_type, user_id=user_id)
+	sent.document = types.SimpleNamespace(file_name=name, file_size=10, file_id="file")
+	return sent
+
+
+SENDS.clear()
+bot_module.handle_document(document("photo.jpg", "supergroup"))
+bot_module.handle_document(document("Movie.torrent", "supergroup", user_id=STRANGER_ID))
+check("in a group a file that is not for the bot gets no answer", SENDS, [])
+bot_module.handle_document(document("photo.jpg", "private"))
+check("in private it is told it is not a .torrent", len(SENDS), 1)
+_real_test_connection = bot_module.client.test_connection
+
+
+def proxy_page():
+	raise torrent_clients.TorrentClientError("qBittorrent error 502 on app/version: <html><title>Bad Gateway</title></html>")
+
+
+bot_module.client.test_connection = proxy_page
+EDITS.clear()
+bot_module.command_version(tg_message("/version"))
+check("/version escapes the error of a proxy", "&lt;html&gt;" in EDITS[-1][0], True)
+bot_module.client.test_connection = _real_test_connection
+
+
+class FakeResponse:
+	def __init__(self, status=200, location=None, chunks=(), delay=0):
+		self.status_code = status
+		self.headers = {"Location": location} if location else {}
+		self.is_redirect = location is not None
+		self.chunks = list(chunks)
+		self.delay = delay
+
+	def raise_for_status(self):
+		pass
+
+	def iter_content(self, chunk_size=1):
+		for chunk in self.chunks:
+			real_sleep(self.delay)
+			yield chunk
+
+	def close(self):
+		pass
+
+
+_real_requests_get = bot_module.requests.get
+redirected = "magnet:?xt=urn:btih:" + "d" * 40 + "&dn=Redirected.Movie"
+bot_module.requests.get = lambda url, **kw: FakeResponse(302, location=redirected)
+try:
+	bot_module.download_torrent_from_url("http://indexer.local/download/1")
+	fail("a redirect to a magnet is taken as a download")
+except bot_module.MagnetRedirect as redirect:
+	check("a link that redirects to a magnet gives the magnet", redirect.magnet, redirected)
+added.clear()
+bot_module.start_add_flow = lambda chat_id, name, magnet=None, data=None, thread_id=None: added.append(magnet)
+bot_module.add_url_from_message(tg_message("http://indexer.local/download/1", chat_type="private"), "http://indexer.local/download/1")
+check("and that magnet is added", added, [redirected])
+bot_module.start_add_flow = _real_start_add_flow
+bot_module.URL_DOWNLOAD_DEADLINE = 0.3
+bot_module.requests.get = lambda url, **kw: FakeResponse(200, chunks=[b"d"] * 50, delay=0.1)
+started = time.monotonic()
+try:
+	bot_module.download_torrent_from_url("http://slow.local/file.torrent")
+	fail("a download past its deadline is not given up")
+except ValueError:
+	pass
+check("a server that trickles is given up at the deadline", time.monotonic() - started < 2, True)
+bot_module.URL_DOWNLOAD_DEADLINE = config.URL_DOWNLOAD_DEADLINE
+bot_module.requests.get = _real_requests_get
+
+# Templates with path characters or absurd padding are refused with their reason
+for template, key, detail in (("{title}/{year}", "TPL_ERROR_INVALID_CHAR", "/"),
+							("{episode.100000000}", "TPL_ERROR_PADDING_TOO_WIDE", "episode.100000000")):
+	bot_module.pending_inputs.clear()
+	press(bot_module.build_call("tplEdit", "movie"))
+	pending = bot_module.pop_pending_input(CHAT_ID, 1)
+	EDITS.clear()
+	message.text = template
+	bot_module.handle_pending_input(message, pending)
+	check(f"the template {template!r} is refused with its reason", EDITS[-1][0].startswith(get_text(key, bot_module.html.escape(detail))), True)
+	check(f"and the template {template!r} is not saved", bot_module.bot_settings.get("template_movie"), "")
+	bot_module.bot_settings.set("template_movie", "")
+
+# Limits per tracker
+tracker_limits = bot_module.tracker_limits
+_real_rules = tracker_limits.rules
+tracker_limits.rules = lambda: {f"tracker{n:03d}.example.org": dict(tracker_limits.EMPTY_RULE, ratio=1.0) for n in range(150)}
+text, markup = bot_module.build_settings_tracker_limits()
+check("150 tracker rules fit in a keyboard Telegram accepts", len(callbacks_of(markup)) <= BUTTONS_LIMIT, True)
+check("with pages", any(c.startswith("tlPage|") for c in callbacks_of(markup)), True)
+second = press(bot_module.build_call("tlPage", 1))
+check("the next page has the next rules", "tracker020.example.org" in " ".join(b.text for row in second[1].keyboard for b in row), True)
+tracker_limits.rules = _real_rules
+tracker_limits.reset_for_tests()
+ruled = "tracker.example.org"
+tracker_limits.set_field(ruled, "ratio", 1.0)
+tracker_limits.mark_applied(TORRENT_IDS, ruled)
+_real_set_ratio = bot_module.client.set_ratio_limit
+
+
+def busy_ratio(torrent_ids, limit):
+	raise torrent_clients.TorrentClientError("busy")
+
+
+tracker_limits.set_field(ruled, "up", 50)
+CALLS.clear()
+bot_module.client.set_ratio_limit = busy_ratio
+try:
+	bot_module.set_tracker_rule(ruled, "ratio", 2.0)
+	fail("a failed rule change is not told")
+except torrent_clients.TorrentClientError:
+	pass
+bot_module.client.set_ratio_limit = _real_set_ratio
+CALLS.clear()
+bot_module.apply_pending_tracker_limits([fake_torrent(t) for t in TORRENT_IDS])
+check("a rule change the manager failed to apply is applied by the monitor, that field only",
+	CALLS, [("set_ratio_limit", TORRENT_IDS, 2.0)])
+CALLS.clear()
+bot_module.apply_pending_tracker_limits([fake_torrent(t) for t in TORRENT_IDS])
+check("and only once", CALLS, [])
+# A torrent the rule has not reached yet gets the rest of it with a hand-set limit
+tracker_limits.forget(ruled)
+ratio_ctx = bot_module.new_nav_context(TORRENT_ID, config.FILTER_ALL, 0)
+CALLS.clear()
+press(bot_module.build_call("ratioSet", ratio_ctx, "0.5"))
+check("a ratio set by hand before the rule reached the torrent: the rest of the rule is given now",
+	CALLS, [("set_ratio_limit", [TORRENT_ID], 0.5), ("set_torrent_speed_limit", [TORRENT_ID], "up", 50)])
+check("and the monitor leaves its ratio alone",
+	TORRENT_ID in [i for tracker, ids in tracker_limits.pending([fake_torrent(t) for t in TORRENT_IDS]) for i in ids], False)
+tracker_limits.delete_rule(ruled)
+tracker_limits.set_field("persist.example.org", "ratio", 3.0)
+bot_module.bot_settings._settings = None  # What a restart does
+check("tracker rules survive a restart", "persist.example.org" in tracker_limits.rules(), True)
+bot_module.bot_settings.set("notify_errors", True)
+with open(bot_module.bot_settings.SETTINGS_FILE, encoding="utf-8") as stored:
+	check("and saving another setting keeps them on disk", "persist.example.org" in json.load(stored).get("tracker_limits", {}), True)
+tracker_limits.delete_rule("persist.example.org")
+check("settings hand out copies", bot_module.bot_settings.get("favorite_dirs") is bot_module.bot_settings.get("favorite_dirs"), False)
+
+# A move retried after a newer order for the same torrents gives up
+attempts = []
+
+
+def busy_then_newer(torrent_ids, new_dir):
+	attempts.append(new_dir)
+	if len(attempts) == 1:
+		bot_module.register_move_order(torrent_ids)  # Meanwhile the user moved them elsewhere
+	raise torrent_clients.TorrentClientError("busy")
+
+
+_real_move = bot_module.client.move_torrents
+bot_module.client.move_torrents = busy_then_newer
+EDITS.clear()
+bot_module.deliver_move_order(CHAT_ID, [TORRENT_ID], "/old/target", "moving", "moved", message_id=MESSAGE_ID)
+real_sleep(0.5)
+check("a move superseded by a newer order is not retried", attempts, ["/old/target"])
+check("and says so", EDITS[-1][0], get_text("MOVE_SUPERSEDED"))
+bot_module.client.move_torrents = _real_move
+
+# The check that a name is free and the rename happen together
+held = []
+_real_rename = bot_module.client.rename_torrent
+bot_module.client.rename_torrent = lambda torrent_id, new_name: held.append(bot_module._rename_lock.locked())
+bot_module.auto_rename_torrent(TorrentInfo(id="9" * 40, name="Some.Movie.2030.1080p.BluRay.x264.mkv", status=TorrentStatus.SEEDING))
+check("an automatic rename checks the name and renames in one go", held, [True])
+bot_module.client.rename_torrent = _real_rename
+
+
+# Second review round
+# A folder button follows its folder, and acts on nothing once it is gone
+folders = bot_module.torrent_folders(PROFILE_SERIES := fake_torrent())  # plain profile: one folder
+plain_root = bot_module.folder_ref(folders, folders.index(bot_module.torrent_root(PROFILE_SERIES)))
+check("a folder button carries its key", plain_root.split(".")[1], bot_module.folder_key(bot_module.torrent_root(PROFILE_SERIES)))
+moved_series = TorrentInfo(id="8" * 40, name="Pack", status=TorrentStatus.SEEDING,
+							files=[("Pack/A/1.mkv", 1, 0), ("Pack/B/2.mkv", 1, 0)])
+pack_folders = bot_module.torrent_folders(moved_series)
+b_ref = bot_module.folder_ref(pack_folders, pack_folders.index("Pack/B"))
+moved_series.files = [("Pack/0/1.mkv", 1, 0), ("Pack/B/2.mkv", 1, 0)]  # A renamed to 0 sorts first now
+check("a folder renamed elsewhere does not change where a button points", bot_module.get_torrent_folder(moved_series, b_ref), "Pack/B")
+moved_series.files = [("Pack/0/1.mkv", 1, 0), ("Pack/C/2.mkv", 1, 0)]
+check("a folder that is gone acts on nothing", bot_module.get_torrent_folder(moved_series, b_ref, strict=True), None)
+check("and browsing it shows the torrent folder", bot_module.get_torrent_folder(moved_series, b_ref), "Pack")
+# A refusal is not a connection error
+check("a refusal is told as such", bot_module.client_error_text(torrent_clients.PermanentTorrentError("cannot verify")),
+	get_text("ACTION_REFUSED", "cannot verify"))
+check("a manager to restart is told so", bot_module.add_error_text(torrent_clients.RestartRequiredError("restart Deluge")),
+	get_text("MANAGER_RESTART_REQUIRED", "restart Deluge"))
+
+
+def refused(**kwargs):
+	raise torrent_clients.PermanentTorrentError("qBittorrent did not add the torrent")
+
+
+bot_module.client.add_torrent = refused
+bot_module._late_adds.clear()
+try:
+	bot_module.add_torrent_from_bot(late_add={"chat_id": CHAT_ID}, magnet="magnet:?xt=urn:btih:" + "7" * 40)
+except torrent_clients.TorrentClientError:
+	pass
+check("an add refused for good is not waited for", bot_module._late_adds, {})
+bot_module.client.add_torrent = _real_add
+# Folders that had a button survive a restart, even ones nothing else knows
+new_season = "/media/series/Show - Temporada 14"
+season_id = bot_module.get_dir_id(new_season)
+bot_module._dir_by_id.clear()
+bot_module._dir_ids_loaded[0] = False  # What a restart leaves
+check("a folder button from before a restart finds a folder no torrent is in yet", bot_module.get_dir_by_id(season_id), new_season)
+# A download past its deadline has its connection cut, not left reading
+closed = []
+
+
+class StuckResponse(FakeResponse):
+	def iter_content(self, chunk_size=1):
+		while not closed:
+			real_sleep(0.05)
+		raise ValueError("connection closed")
+		yield b""
+
+	def close(self):
+		closed.append(True)
+
+
+bot_module.URL_DOWNLOAD_DEADLINE = 0.3
+bot_module.requests.get = lambda url, **kw: StuckResponse(200)
+try:
+	bot_module.download_torrent_from_url("http://stuck.local/file.torrent")
+except ValueError:
+	pass
+check("a download past its deadline has its connection closed", closed, [True])
+bot_module.URL_DOWNLOAD_DEADLINE = config.URL_DOWNLOAD_DEADLINE
+bot_module.requests.get = _real_requests_get
+
+# Environment values that used to crash the start, or break the lists
+def config_with(**env):
+	run = subprocess.run([sys.executable, "-c", "import config; print(config.TORRENTS_PER_PAGE, config.TORRENT_CLIENT_HOST, "
+						"config.TORRENT_CLIENT_PROTOCOL, len(config.CONFIG_WARNINGS))"],
+						cwd=REPO, env=dict(os.environ, **env), capture_output=True, text=True)
+	return run.stdout.split()
+
+
+check("an empty TORRENTS_PER_PAGE falls back to 10", config_with(TORRENTS_PER_PAGE="")[0], "10")
+check("0 is raised to 1, with a warning", config_with(TORRENTS_PER_PAGE="0")[::3], ["1", "1"])
+check("more than a keyboard holds is lowered to 90", config_with(TORRENTS_PER_PAGE="500")[0], "90")
+check("not a number falls back to 10", config_with(TORRENTS_PER_PAGE="diez")[0], "10")
+check("an empty host and protocol take their defaults", config_with(TORRENT_CLIENT_HOST="", TORRENT_CLIENT_PROTOCOL=" ")[1:3], ["localhost", "http"])
+check("HTTPS in capitals is understood", config_with(TORRENT_CLIENT_PROTOCOL="HTTPS")[2], "https")
 
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")

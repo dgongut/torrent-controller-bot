@@ -4,8 +4,8 @@ Extracts as much metadata as possible from a release name (title, year,
 season/episode, resolution, HDR, extension, language, codecs, source and
 release group) and renders user-defined templates with these constructs:
   {field}    required field: if missing, no suggestion is produced
-  {field.N}  same, but zero-padded to N digits (only 'season' and
-             'episode_number' support this; e.g. {episode.3} -> "007")
+  {field.N}  same, but zero-padded to N digits, 4 at most (only 'season'
+             and 'episode_number' support this; e.g. {episode.3} -> "007")
   [ ... ]    optional block: dropped entirely (literals included) when any
              field inside it has no value
 Field names are accepted both in Spanish and English."""
@@ -24,14 +24,17 @@ SUBTITLE_EXTENSIONS = {"srt", "ass", "ssa", "sub", "idx", "vtt", "sup"}
 # start a word, so it is never the last letter of the title ('Lost01E01')
 _SEASON_MARK = r'(?:[Ss]|(?<![A-Za-z0-9])[Tt])'
 
-# Episode patterns: S01E03 / T01E03, 1x03, Temporada 2 Capitulo 3 / T2 Cap 03,
-# Cap.103 / Capitulo 103
+# Episode patterns: S01E03 / T01E03 / S01Ep03, 1x03, Temporada 2 Capitulo 3 /
+# T2 Cap 03 / S02.Episode.5 / Season 1 E05 / Season 1 EP5, Cap.103 / Capitulo
+# 103. 'Cap' has to start a word and its number has to end: 'Kneecap.2024' or
+# 'Nightcap.1080p' hold no episode. A bare 'E' after a long season ('Season 1
+# E05') has to be glued to its number: 'Temporada 1 e 2' is Portuguese for 'and'
 EPISODE_PATTERNS = [
-	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee](\d{1,3})'),
+	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee][Pp]?(\d{1,3})'),
 	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})(?!\d)'),
-	re.compile(r'(?:[Tt]emporada|[Ss]eason|(?<![A-Za-z0-9])[Tt])[\s._-]*(\d{1,2})[\s._-]*'
-		r'(?:[Cc]ap(?:[íi]tulo)?|[Ee]pisodio|[Ee]pisode|[Ee]p)[\s._-]*(\d{1,4})(?!\d)'),
-	re.compile(r'[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})'),
+	re.compile(r'(?:(?<![A-Za-z])(?:temporada|season)|(?<![A-Za-z0-9])t|(?<![A-Za-z0-9])s(?=\d))[\s._-]*(\d{1,2})[\s._-]*'
+		r'(?:(?:cap(?:[íi]tulo)?|episodio|episode|ep)[\s._-]*|e(?=\d))(\d{1,4})(?!\d)', re.IGNORECASE),
+	re.compile(r'(?<![A-Za-z0-9])[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})(?!\d)'),
 ]
 _SEASON_AND_EPISODE = 2  # Index of the 'Temporada 2 Capitulo 3' pattern
 _CHAPTER = 3  # Index of the 'Cap.103' pattern
@@ -47,19 +50,46 @@ _BARE_EPISODE_PATTERNS = [
 ]
 
 # Season-only patterns (packs): S02, Temporada 2, Temporada Completa 2,
-# 2ª Temporada / 1a Temporada, Season 2, T2
+# 2ª Temporada / 1a Temporada, 2nd Season, Season 2, T2. The number has to end
+# where the digits do: 'Season 2010' is no season 20. The ordinal goes before
+# 'Season N', so in '2nd Season - 05' the season is the 2 and not the 05
 SEASON_ONLY_PATTERNS = [
 	re.compile(r'\b[Ss](\d{1,2})\b(?![\s._-]?[Ee]\d)'),
-	re.compile(r'[Tt]emporada(?:[\s._-]+[Cc]ompleta)?[\s._-]+(\d{1,2})(?!\d)'),
+	re.compile(r'(?<![A-Za-z])[Tt]emporada(?:[\s._-]+[Cc]ompleta)?[\s._-]+(\d{1,2})(?!\d)'),
 	re.compile(r'(?<![A-Za-z0-9])(\d{1,2})(?:ª|º|[ao])?[\s._-]*[Tt]emporada\b'),
-	re.compile(r'[Ss]eason[\s._-]+(\d{1,2})'),
+	re.compile(r'(?<![A-Za-z0-9])(\d{1,2})(?:st|nd|rd|th)[\s._-]*[Ss]eason\b'),
+	re.compile(r'(?<![A-Za-z])[Ss]eason[\s._-]+(\d{1,2})(?!\d)'),
 	re.compile(r'\bT(\d{1,2})\b(?![\s._-]?[Ee]\d)'),
 ]
+_BARE_T_SEASON = SEASON_ONLY_PATTERNS[-1]
+
+# 'T2.Trainspotting.2017': a T and a number in front of a title is how some
+# movie titles start, while Spanish releases put the season behind the title
+# ('Serie.Name.T2'). Only read as a title when nothing but words follows it
+# (no ' - ' as in the renamed 'T2 - Serie') and the name carries a year
+_TITLE_T = re.compile(r'T[1-9]\d?[._ ]+[A-Za-z]')
+
+# '[SubsPlease] Show S2 - 05.mkv': anime releases write the episode behind the
+# season after a spaced dash. Two or three digits, as they always pad it, and
+# only in the name of a video or with a version ('05v2'): a single digit, or
+# the name of a folder ('Friends Season 1 - 10'), could just as well be a range
+# of seasons. Their batches carry the range of episodes the same way: 'Show S2
+# (01-24)'
+_SEASON_DASH_EPISODE = re.compile(r'[\s._]+[-–][\s._]+(\d{2,3})([vV]\d{1,2})?(?![A-Za-z0-9]|[.,]\d)')
+_SEASON_EPISODE_RANGE = re.compile(
+	r'[\s._]+(?:[-–][\s._]+)?[\[(]?(\d{2,3})[\s._]*[-–~][\s._]*(\d{2,3})[\])]?(?![A-Za-z0-9]|[.,]\d)')
+
+# What makes that number a list or a count of episodes instead of one: '01 al
+# 10', '01 & 02', '01, 02', '01+02', '10 Episodes', '10 Capitulos'
+_MORE_EPISODES = re.compile(
+	r'[\s._]*(?:[-–~&+,]|(?<![A-Za-z])(?:al?|y|to|and|et|und)(?![A-Za-z]))[\s._]*\d{1,3}(?![\dpPiIkKbBxX])'
+	r'|[\s._]+(?:episod(?:e|io)s|cap[ií]tulos|chapters|eps|caps)(?![A-Za-z])', re.IGNORECASE)
 
 # Multi-episode/multi-season packs: S04E01-E08, S01E01E02, 1x01-02, S01-S08
 # (or with T), Temporadas 1-5, Temporada Completa 1 a 5, Seasons 1-5
 _EPISODE_RANGE_PATTERNS = [
-	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee](\d{1,3})(?:[\s._-]?-[\s._-]?[Ee]?|[Ee])(\d{1,3})(?![\dpP])'),
+	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee][Pp]?(\d{1,3})'
+		r'(?:[\s._-]?-[\s._-]?(?:[Ee][Pp]?)?|[Ee][Pp]?)(\d{1,3})(?![\dpP])'),
 	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})-(?:\1[xX])?(\d{2,3})(?![\dpP])'),
 ]
 _SEASON_RANGE_PATTERNS = [
@@ -72,7 +102,8 @@ _SEASON_RANGE_PATTERNS = [
 ]
 
 # 'Cap.201_207': every episode from the first to the second, same season
-_CHAPTER_RANGE_PATTERN = re.compile(r'[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})[\s._]*[_-][\s._]*(?:[Cc]ap(?:[íi]tulo)?[\s._-]?)?(\d{3,4})(?!\d)')
+_CHAPTER_RANGE_PATTERN = re.compile(
+	r'(?<![A-Za-z0-9])[Cc]ap(?:[íi]tulo)?[\s._-]?(\d{3,4})[\s._]*[_-][\s._]*(?:[Cc]ap(?:[íi]tulo)?[\s._-]?)?(\d{3,4})(?!\d)')
 
 # Download sites stamped at the start of the name: 'www.Site.com - Title',
 # '[ www.Site.com ] - Title', '(www.Site.org) Title'
@@ -145,8 +176,17 @@ _SOURCES = [
 	(re.compile(r'\bHDTV\b', re.IGNORECASE), "HDTV"),
 	(re.compile(r'\bDVDRip\b', re.IGNORECASE), "DVDRip"),
 	(re.compile(r'\bHDRip\b', re.IGNORECASE), "HDRip"),
-	(re.compile(r'\bWEB\b', re.IGNORECASE), "WEB-DL"),
 ]
+
+# A bare 'WEB' (a WEB-DL) is also an English word ('Charlottes.Web.2006',
+# 'Web.of.Lies.S01E01'), so it is handled apart from the other sources: see
+# _find_bare_web
+_BARE_WEB = re.compile(r'\bWEB\b', re.IGNORECASE)
+_YEAR_TOKEN = re.compile(r'(?:^|[\s._\-(\[])(?:19|20)\d{2}(?=[\s._\-)\]]|$)')
+
+# Tokens that are metadata: the title ends at the first one
+_META_PATTERNS = ([p for p, _ in _REMUX_PATTERNS] + [p for p, _ in _RESOLUTION_PATTERNS]
+	+ [p for p, _ in _SOURCES] + [p for p, _ in _VIDEO_CODECS] + [_HDR_PATTERN])
 
 # Streaming platform/provider tags. They are metadata, not part of the episode
 # title (Episodio 7.NF.WEB-DL...). Matched only as standalone tokens, so a word
@@ -186,6 +226,66 @@ _LANGUAGES = [
 
 _GROUP_PATTERN = re.compile(r'-([A-Za-z0-9]{2,20})\s*$')
 _GROUP_BLACKLIST = {"dl", "hd", "ma", "rip", "x264", "x265", "264", "265"}
+
+# The text a name drops because no field holds it: from the season marker of a
+# season pack, or the year of a movie, up to the metadata. Only what every
+# sibling carries alike may go unnoticed there: an edition ('Extended'), a
+# release flag ('REPACK'), a language, the audio ('AC3.5.1', 'DD51'). Anything
+# else may be just what tells a release apart from the next one, and renaming
+# it would give them all the same suggestion: a number ('S2 - 5', the '11.05'
+# of an air date), a part ('Vol.1', 'CD1'), an episode ('E05', '1of7'), extra
+# material ('Recap', 'Behind the Scenes') or a sports event ('Round20', 'Mexico
+# Race', 'Chiefs at Bills'). So these are listed, not the others
+_DROPPED_AUDIO = re.compile(
+	r'(?<![A-Za-z0-9])(?:DD\+?|DDPA?|E[\s._-]?AC[\s._-]?3D?|AC[\s._-]?3D?|DTS(?:[\s._-]?HD)?(?:[\s._-]?MA)?(?:[\s._:-]?X)?'
+	r'|DTSD|(?:HE[\s._-]?)?AAC(?:[\s._-]?LC)?|True[\s._-]?HD|FLAC|OPUS|L?PCM|MP[23])(?:[\s._-]?[1-9](?:[.,]?[01])?)?'
+	r'(?![A-Za-z0-9])', re.IGNORECASE)
+_DROPPED_CHANNELS = re.compile(r'(?<![0-9])[1-9][.,][01](?![0-9])')
+_DROPPED_YEAR = re.compile(r'(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])')
+_DROPPED_CRC = re.compile(r'\[[0-9A-Fa-f]{8}\]')
+_DROPPED_SITE = re.compile(
+	r'(?<![A-Za-z0-9])www\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,6}(?![A-Za-z0-9])', re.IGNORECASE)
+# Shared only as a whole: 'Special', 'Final', 'Open' or a number on their own
+# are no edition ('10 bit', '60 fps' and '6 CH' are no stray number either)
+_DROPPED_PHRASES = re.compile(
+	r'(?<![A-Za-z0-9])(?:special[\s._-]+(?:extended[\s._-]+)?edition|edici[oó]n[\s._-]+especial|final[\s._-]+cut'
+	r'|open[\s._-]?matte|criterion[\s._-]+collection|pre[\s._-]?dvd|h(?:alf)?[\s._-]?(?:sbs|ou|tab)'
+	r'|[0-9]{1,2}[\s._-]?bits?|[0-9]{2,3}[\s._-]?fps|[1-9](?:[.,][01])?[\s._-]?ch(?:annels?)?'
+	r'|[0-9]{1,3}(?:st|nd|rd|th|º|ª|o)?[\s._-]*(?:anniversary|aniversario))(?![A-Za-z0-9])', re.IGNORECASE)
+_SHARED_TOKEN = re.compile(r'[0-9]{1,2}bits?|hi10p?|[1-9]ch|v[1-9]|[0-9]{2,3}fps|(?:repack|proper|rerip)[1-9]')
+_SHARED_WORDS = frozenset((
+	# Editions and cuts
+	"extended extendida extendido unrated uncut uncensored censored remastered remaster remasterizada remasterizado "
+	"remasterised restored restaurada restaurado theatrical cinema cine imax enhanced directors director dc cut "
+	"version edition edicion montaje collectors coleccionista ultimate definitive definitiva criterion deluxe redux "
+	"roadshow anniversary aniversario alternate alt despecialized colorized colourized om oar ws fs widescreen "
+	"fullscreen 3d sbs hsbs hou se ce ue "
+	# Release flags and subtitles
+	"proper repack rerip real internal int limited ltd retail hybrid readnfo read nfo nfofix dirfix syncfix subfix "
+	"audiofix festival stv docu dubbed dub dubs subbed sub subs subtitled subtitles subtitulos subtitulado "
+	"subtitulada forced forzados hc hardsub hardsubs hardcoded softsub softsubs multisub multisubs msub msubs esub "
+	"esubs korsub complete completa completo full "
+	# Sources and video
+	"cam camrip hdcam ts telesync hdts tc telecine hdtc scr screener dvdscr bdscr ddc workprint wp r5 dvd "
+	"dvdr dvd5 dvd9 bd bd25 bd50 bd66 bd100 bdmv iso vhs vhsrip tvrip satrip dvb dvbrip dsr dsrip pdtv sdtv ppv vod "
+	"predvd rip microhd fullhd uhdrip line mic md ld hq ntsc pal secam sdr hlg hfr mpeg mpeg2 mpeg4 vc1 fps "
+	# Audio
+	"audio dolby digital plus atmos stereo mono surround ch ma "
+	# Languages
+	"multi multilang dual dl ml vo vos vose vost vostfr vf vff vfq vfi vfb vf2 subfrench truefrench french fr fra "
+	"fre castellano cast latino lat spanish spa esp es espanol ingles ing english eng en frances aleman italiano "
+	"japones coreano chino ruso portugues german ger deu de italian ita it nordic swedish swe danish dan norwegian "
+	"nor finnish fin icelandic dutch nl nld flemish polish pol pl czech cze cz slovak hungarian hun romanian rom "
+	"bulgarian bul greek gre turkish tur russian rus ru ukrainian ukr arabic ara hebrew heb persian farsi thai "
+	"vietnamese vie indonesian ind malay filipino tagalog hindi hin tamil tam telugu tel malayalam mal kannada "
+	"bengali punjabi marathi urdu chinese chi chs cht mandarin cantonese japanese jap jpn jp korean kor kr "
+	"portuguese por pt ptbr br brazilian catalan cat galician basque euskera serbian croatian org "
+	# What joins them
+	"and y et und con with mas the of del la el los las le les en sin"
+).split())
+# A season pack is the whole season anyway, while a movie followed by them may
+# be a pack of several ('Movie.2001.Collection' next to 'Movie.2001')
+_PACK_WORDS = _SHARED_WORDS | frozenset("series serie season temporada pack batch collection coleccion saga".split())
 
 CANONICAL_FIELDS = {
 	"title", "episode_title", "year", "chapter", "season", "episode_number", "resolution",
@@ -290,13 +390,53 @@ def _find_episode(name, skip_span=None):
 	return None
 
 
+def _has_year(name):
+	return bool(re.search(r'\((19|20)\d{2}', name) or _YEAR_PLAIN.search(name))
+
+
 def _find_season_only(name):
-	"""Returns (season, match_start) or None"""
+	"""Returns the match of the season marker (the season in group 1) or None"""
 	for pattern in SEASON_ONLY_PATTERNS:
-		match = pattern.search(name)
-		if match:
-			return int(match.group(1)), match.start()
+		for match in pattern.finditer(name):
+			if pattern is _BARE_T_SEASON and match.start() == 0 and _TITLE_T.match(name) and _has_year(name):
+				continue
+			return match
 	return None
+
+
+def _find_bare_web(name, boundary):
+	"""The first bare 'WEB' that is the source tag, or None. It is one when the
+	title is over by then (it comes after boundary, the episode or season
+	marker or the first metadata, or after a year) or when more metadata
+	follows it ('Show.WEB.1080p'). Anywhere else it is a word of the title"""
+	for match in _BARE_WEB.finditer(name):
+		if match.start() >= boundary or _YEAR_TOKEN.search(name, 0, match.start()):
+			return match
+		following = _TAG_SEPARATORS.match(name, match.end()).end()
+		if any(pattern.match(name, following) for pattern in _META_PATTERNS):
+			return match
+	return None
+
+
+def _tells_apart(dropped, group="", pack=False):
+	"""True when the text a name drops may tell the release apart from its
+	siblings: it holds anything but what all of them carry (see _SHARED_WORDS,
+	and _PACK_WORDS for a pack: a season or a range of years). group is the
+	release group, which ends the name when no metadata does.
+	The audio goes first, with its channels ('DD51', 'AC3.5.1'), so they are
+	never read as a stray number"""
+	text = re.sub(r"['’´`]", "", dropped)
+	if re.search(r'[A-Za-z]', group) and text.rstrip().endswith(f"-{group}"):
+		text = text.rstrip()[:-len(group) - 1]
+	for pattern in (_DROPPED_SITE, _DROPPED_PHRASES, _DROPPED_AUDIO, _DROPPED_CHANNELS, _DROPPED_YEAR, _DROPPED_CRC,
+					_PLATFORM_TAG_PATTERN):
+		text = pattern.sub(" ", text)
+	shared = _PACK_WORDS if pack else _SHARED_WORDS
+	for token in re.findall(r'[^\W_]+', text):
+		word = _series_text(token)
+		if word not in shared and not _SHARED_TOKEN.fullmatch(word):
+			return True
+	return False
 
 
 def _find_first(patterns, name):
@@ -387,8 +527,9 @@ def _clean_title(title_part):
 	title = re.sub(r'_', ' ', title)
 
 	# Preserve dots in acronyms (J.F.K.) and numbers (20.000). Every letter of
-	# an acronym stands alone, so 'Parte V.Un nuevo' is just a word separator
-	title = re.sub(r'([A-Z])\.(?=[A-Z](?:[\s._-]|$))', r'\1§PUNTO§', title)
+	# an acronym stands alone on both sides, so 'Parte V.Un nuevo' and
+	# 'Episode IV.A New Hope' are just word separators
+	title = re.sub(r'(?<![A-Za-z0-9])([A-Z])\.(?=[A-Z](?:[\s._-]|$))', r'\1§PUNTO§', title)
 	title = re.sub(r'(\d)\.(?=\d)', r'\1§PUNTO§', title)
 
 	# Replace remaining dots (word separators) with spaces
@@ -464,8 +605,11 @@ def _detect_group(name):
 def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	"""Extracts all detectable metadata from a release name.
 	Returns a dict with all CANONICAL_FIELDS (empty string when missing)
-	plus 'is_series' (bool). season_prefix is used for the 'chapter' field
-	on season-only packs (T2 in Spanish, S2 in English).
+	plus 'is_series' (bool) and 'ambiguous' (bool): the name drops something
+	that tells it apart from its siblings and no field holds ('S04.Vol.1',
+	an air date), so no name built from the fields is safe for it.
+	season_prefix is used for the 'chapter' field on season-only packs (T2
+	in Spanish, S2 in English).
 	allow_bare_episode enables matching episode numbers without a season
 	marker, only safe when the caller already knows it is a series file"""
 	name, ext = _split_extension(filename)
@@ -474,11 +618,13 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	fields = {key: "" for key in CANONICAL_FIELDS}
 	fields["extension"] = ext
 	fields["is_series"] = False
+	fields["ambiguous"] = False
 
 	# Episode/season detection determines the title boundary
 	title_end = len(name)
 	episode_end = None
 	episode_span = None
+	pack_end = None  # End of the marker of a season pack: what follows it is dropped
 	episode_range = _find_first(_EPISODE_RANGE_PATTERNS, name)
 	chapter_range = None if episode_range else _find_chapter_range(name)
 	chapter_year = _find_chapter_year(name)
@@ -510,23 +656,44 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 		fields["season"] = f"{s1}-{s2}"
 		fields["chapter"] = f"{season_prefix}{s1}-{season_prefix}{s2}"
 		title_end = season_range.start()
+		pack_end = season_range.end()
 	else:
-		season_info = _find_season_only(name)
-		if season_info:
-			season, start = season_info
+		season_match = _find_season_only(name)
+		if season_match:
+			season = int(season_match.group(1))
 			fields["is_series"] = True
 			fields["season"] = str(season)
-			fields["chapter"] = f"{season_prefix}{season}"
-			title_end = start
+			title_end = season_match.start()
+			episodes = _SEASON_EPISODE_RANGE.match(name, season_match.end())
+			dash_episode = _SEASON_DASH_EPISODE.match(name, season_match.end())
+			# Anything else leaves the number to the pack, whose name it makes
+			# ambiguous: 'Season 1 - 10' may be ten seasons, '01 al 10' or
+			# '10 Episodes' are several episodes
+			if dash_episode and (not (ext or dash_episode.group(2)) or _MORE_EPISODES.match(name, dash_episode.end())):
+				dash_episode = None
+			if episodes and int(episodes.group(1)) < int(episodes.group(2)):
+				ep1, ep2 = int(episodes.group(1)), int(episodes.group(2))
+				fields["episode_number"] = f"{ep1}-{ep2}"
+				fields["chapter"] = f"{season}x{ep1:02d}-{ep2:02d}"
+			elif dash_episode:
+				episode = int(dash_episode.group(1))
+				fields["episode_number"] = str(episode)
+				fields["chapter"] = f"{season}x{episode:02d}"
+				episode_end = dash_episode.end()
+				episode_span = (season_match.start(), episode_end)
+			else:
+				fields["chapter"] = f"{season_prefix}{season}"
+				pack_end = season_match.end()
 
 	# The title also ends at the first metadata token (resolution, source...)
 	meta_start = len(name)
-	for patterns in ([p for p, _ in _REMUX_PATTERNS], [p for p, _ in _RESOLUTION_PATTERNS],
-						[p for p, _ in _SOURCES], [p for p, _ in _VIDEO_CODECS], [_HDR_PATTERN]):
-		for pattern in patterns:
-			match = pattern.search(name)
-			if match and match.start() < meta_start:
-				meta_start = match.start()
+	for pattern in _META_PATTERNS:
+		match = pattern.search(name)
+		if match and match.start() < meta_start:
+			meta_start = match.start()
+	web = _find_bare_web(name, min(title_end, meta_start))
+	if web and web.start() < meta_start:
+		meta_start = web.start()
 	if meta_start < title_end:
 		title_end = meta_start
 
@@ -560,9 +727,11 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 
 	# Year: range (collections) > parentheses > last plain year before the
 	# metadata tags (in "Blade Runner 2049 2017" the release year is 2017)
+	year_end = None
 	year_range = _YEAR_RANGE.search(name)
 	if year_range:
 		fields["year"] = f"{year_range.group(1)}-{year_range.group(3)}"
+		year_end = year_range.end()
 		if year_range.start() < title_end:
 			title_end = year_range.start()
 	else:
@@ -575,6 +744,7 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 			year_match = before_meta[-1] if before_meta else (plain_years[0] if plain_years else None)
 		if year_match:
 			fields["year"] = re.search(r'(19|20)\d{2}', year_match.group()).group()
+			year_end = year_match.end()
 			if year_match.start() < title_end:
 				title_end = year_match.start()
 
@@ -584,8 +754,19 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	fields["language"] = _detect_from_list(name, _LANGUAGES)
 	fields["video_codec"] = _detect_from_list(name, _VIDEO_CODECS)
 	fields["audio_codec"] = _detect_audio(name)
-	fields["source"] = _detect_from_list(name, _SOURCES)
+	fields["source"] = _detect_from_list(name, _SOURCES) or ("WEB-DL" if web else "")
 	fields["group"] = _detect_group(name)
+
+	# An episode is told apart by its number. A season pack or a movie only by
+	# its title and season or year, so whatever else it carries before the
+	# metadata must not tell it apart from its siblings ('S04.Vol.1' and
+	# 'S04.Vol.2', 'Show.2024.11.05' and 'Show.2024.11.06'). Whatever names a
+	# pack of several is fine in a season pack, or after a range of years
+	if not fields["episode_number"]:
+		dropped_from = pack_end if fields["is_series"] else year_end
+		pack = fields["is_series"] or "-" in fields["year"]
+		if dropped_from is not None and _tells_apart(name[dropped_from:meta_start], fields["group"], pack):
+			fields["ambiguous"] = True
 	return fields
 
 
@@ -599,6 +780,16 @@ _TOKEN_PATTERN = re.compile(r'\{([^{}\[\].]+)(?:\.(\d+))?\}')
 # therefore be zero-padded with the {field.N} syntax
 _PADDABLE_FIELDS = {"season", "episode_number"}
 
+# No season or episode needs more digits than this
+_MAX_PADDING = 4
+
+# A rendered name cannot be longer than this anyway: a template saved before
+# _MAX_PADDING existed must not make the bot build a huge string
+_MAX_RENDER_PADDING = 255
+
+# Line and paragraph breaks (a newline, U+2028...) and other control characters
+_CONTROL_CATEGORIES = {"Cc", "Zl", "Zp"}
+
 
 def _resolve_field(raw_name):
 	return FIELD_ALIASES.get(raw_name.strip().lower())
@@ -610,11 +801,49 @@ def _apply_padding(value, width):
 	return "-".join(part.zfill(width) if part.isdigit() else part for part in value.split("-"))
 
 
+def _literal_text(template):
+	"""The pieces of the template between its field tokens"""
+	last = 0
+	for match in _TOKEN_PATTERN.finditer(template):
+		yield template[last:match.start()]
+		last = match.end()
+	yield template[last:]
+
+
+def _invalid_text(text):
+	"""The first thing in the text that has no place in a file name, as the
+	user should see it: a path separator, a '..' (a path component that leaves
+	the folder) or a control character such as a line break ('\\n'). None
+	when there is nothing of the kind"""
+	for index, char in enumerate(text):
+		if char in "/\\":
+			return char
+		if text.startswith("..", index):
+			return ".."
+		if unicodedata.category(char) in _CONTROL_CATEGORIES:
+			return repr(char)[1:-1]
+	return None
+
+
+def _is_safe_name(name):
+	"""A rendered name is a single file or folder name: no path separator, no
+	control character and not a '.' or '..' that points somewhere else"""
+	return name not in (".", "..") and not any(
+		char in "/\\" or unicodedata.category(char) in _CONTROL_CATEGORIES for char in name)
+
+
 def validate_template(template):
 	"""Raises TemplateError if the template is malformed. Returns the list of
-	canonical fields used"""
+	canonical fields used. The codes: empty, invalid_char (detail: the text
+	that cannot be in a file name), nested_brackets, unbalanced_brackets,
+	unbalanced_braces, unknown_field (detail: the field), padding_not_allowed
+	(detail: the field) and padding_too_wide (detail: the token, 'episode.10')"""
 	if not template.strip():
 		raise TemplateError("empty")
+	for text in _literal_text(template):
+		invalid = _invalid_text(text)
+		if invalid:
+			raise TemplateError("invalid_char", invalid)
 	depth = 0
 	for char in template:
 		if char == "[":
@@ -636,6 +865,8 @@ def validate_template(template):
 			raise TemplateError("unknown_field", raw_name.strip())
 		if padding and field not in _PADDABLE_FIELDS:
 			raise TemplateError("padding_not_allowed", raw_name.strip())
+		if padding and int(padding) > _MAX_PADDING:
+			raise TemplateError("padding_too_wide", f"{raw_name.strip()}.{padding}")
 		used.append(field)
 	if not used:
 		raise TemplateError("empty")
@@ -654,6 +885,8 @@ def _render_fragment(fragment, fields):
 			return None
 		padding = match.group(2)
 		if padding:
+			if int(padding) > _MAX_RENDER_PADDING:
+				return None
 			value = _apply_padding(value, int(padding))
 		result += fragment[last:match.start()] + value
 		last = match.end()
@@ -731,6 +964,10 @@ _UNMARKED_EPISODE = re.compile(r'\s[-–]\s*\d{1,4}$')
 
 
 def _render(template, fields, filename):
+	# A name that drops what tells it apart from its siblings would give them
+	# all the same suggestion
+	if fields.get("ambiguous"):
+		return None
 	# Without a year, nothing tells a movie apart from such an episode
 	if not fields["is_series"] and not fields["year"] and _UNMARKED_EPISODE.search(fields["title"]):
 		return None
@@ -738,7 +975,7 @@ def _render(template, fields, filename):
 		suggested = render_template(template, fields)
 	except Exception:
 		return None
-	if not suggested or suggested == filename:
+	if not suggested or suggested == filename or not _is_safe_name(suggested):
 		return None
 	return suggested
 
@@ -776,13 +1013,61 @@ def _inherit_from_parents(fields, parents, keys):
 				break
 
 
-def _parents_title(parents):
+# Words that name a collection, not the show: a torrent with the whole series
+# ('Friends.The.Complete.Series') would lend them to every episode inside.
+# These hardly ever end a real title. 'Collection' and 'Pack' on their own
+# often do ('Wolf Pack', 'The Collection'): see _collection_titles
+_COLLECTION_SUFFIX = re.compile(
+	r'(?:^|\s)(?:the\s+)?(?:complete\s+(?:series|collection)|box\s*set|(?:serie|colecci[oó]n)\s+completa'
+	r'|complete|completa|integral)$', re.IGNORECASE)
+_COLLECTION_TITLE_WORD = re.compile(r'(?:^|\s)(?:the\s+)?(?:collection|pack)$', re.IGNORECASE)
+
+# What is left is no title on its own
+_ARTICLES = {"", "the", "a", "an", "el", "la", "los", "las", "lo", "le", "les", "il", "der", "die", "das"}
+
+
+def _collection_titles(title):
+	"""The title followed by its shorter forms without the collection words at
+	its end, the shortest last ('Friends The Complete Series', 'Friends'), as
+	(form, guessed) pairs. guessed tells it took dropping a 'Collection' or
+	'Pack', which may just as well be part of the title ('Wolf Pack'): only
+	the outermost word, and never down to nothing but an article ('The
+	Collection' stays as it is)"""
+	forms = [(title, False)]
+	while True:
+		current, guessed = forms[-1]
+		match = _COLLECTION_SUFFIX.search(current)
+		word = not match and len(forms) == 1
+		if word:
+			match = _COLLECTION_TITLE_WORD.search(current)
+		if not match:
+			return forms
+		rest = current[:match.start()].rstrip(" -–_.,")
+		if _series_text(rest) in _ARTICLES:
+			return forms
+		forms.append((rest, guessed or word))
+
+
+def _parents_title(parents, own_title="", series=False):
 	"""Title for a name that has no year of its own: its own title is just the
 	leftovers of the name (numbers, tags...). The torrent, the last parent, is
-	the most reliable one"""
+	the most reliable one. For an episode or a season, the collection words
+	the parent carries are dropped. own_title, the title the name has before
+	inheriting anything, tells which form is the show's ('Wolf.Pack.S01E01'
+	inside 'Wolf.Pack.Collection'). Without one, a 'Collection' or 'Pack' stays
+	where it is, as it may well belong to the title: '01.mkv' inside
+	'Wolf.Pack.S01-S02' is an episode of Wolf Pack"""
+	own = _series_text(own_title)
 	for parent in reversed(parents):
 		if parent["title"]:
-			return parent["title"]
+			if not series:
+				return parent["title"]
+			forms = _collection_titles(parent["title"])
+			if own:
+				for form, _guessed in forms:
+					if _series_text(form) == own:
+						return form
+			return [form for form, guessed in forms if not guessed][-1]
 	return ""
 
 
@@ -796,18 +1081,31 @@ def suggest_file_name(filename, parent_name=None, single_video=False, template_m
 	folder of a complete series), and is looked at before the torrent name.
 	single_video tells whether the torrent holds just one video, which is what
 	allows a file with no metadata of its own to take the whole torrent name.
-	Returns None when the file cannot be identified"""
+	Returns None when the file cannot be identified, and for a sample clip
+	(see is_sample_file), which would take the name of the real video"""
+	if is_sample_file(f"{folder_name}/{filename}" if folder_name else filename):
+		return None
 	parents = [parse_metadata(name, season_prefix=season_prefix) for name in (folder_name, parent_name) if name]
 	parent_is_series = any(parent["is_series"] for parent in parents)
 	fields = parse_metadata(filename, season_prefix=season_prefix, allow_bare_episode=parent_is_series)
 	own_year = fields["year"]
+	own_title = fields["title"]
+	# Its own year, or its own season and episode, tell the file apart from
+	# the others with nothing taken from the parents
+	self_named = bool(own_year or (fields["season"].isdigit() and fields["episode_number"]))
 
 	if parents:
+		# A parent that drops what tells it apart ('S04.Vol.2', whose files
+		# may count from 01 again, or a dated show) cannot name its files
+		if not self_named and any(parent["ambiguous"] for parent in parents):
+			return None
 		_inherit_from_parents(fields, parents, _INHERITABLE_FIELDS)
-		if not own_year and _parents_title(parents):
-			fields["title"] = _parents_title(parents)
 		if parent_is_series:
 			fields["is_series"] = True
+		if not own_year:
+			title = _parents_title(parents, own_title, series=fields["is_series"])
+			if title:
+				fields["title"] = title
 		if not fields["chapter"] and fields["season"] and "-" not in fields["season"]:
 			if fields["episode_number"]:
 				fields["chapter"] = f"{fields['season']}x{int(fields['episode_number']):02d}"
@@ -817,9 +1115,10 @@ def suggest_file_name(filename, parent_name=None, single_video=False, template_m
 	_drop_series_title_from_episode_title(fields)
 
 	if fields["is_series"]:
-		# Every file needs its own episode, otherwise all of them would
-		# collapse into the same name
-		if not fields["episode_number"]:
+		# Every file needs its own episode and a single season, otherwise
+		# several of them would collapse into the same name: an episode of
+		# 'S01-S03' could belong to any of the three
+		if not fields["episode_number"] or not fields["season"].isdigit():
 			return None
 	elif not single_video and not own_year:
 		# One video among many with nothing identifying it: the torrent name
@@ -841,6 +1140,7 @@ def suggest_folder_name(folder_name, parent_name=None, template_movie=None, temp
 	left alone, so this returns None"""
 	fields = parse_metadata(folder_name, season_prefix=season_prefix)
 	own_year = fields["year"]
+	own_title = fields["title"]
 	# A folder name never carries an extension, whatever the dots suggest
 	fields["extension"] = ""
 	if fields["is_series"]:
@@ -854,7 +1154,7 @@ def suggest_folder_name(folder_name, parent_name=None, template_movie=None, temp
 		# The season is what tells two season folders apart: never inherited
 		_inherit_from_parents(fields, [parent], [k for k in _INHERITABLE_FIELDS if k != "season"])
 		if not own_year and parent["title"]:
-			fields["title"] = parent["title"]
+			fields["title"] = _parents_title([parent], own_title, series=fields["is_series"])
 	if not fields["title"]:
 		return None
 
@@ -863,10 +1163,67 @@ def suggest_folder_name(folder_name, parent_name=None, template_movie=None, temp
 	return _render(template, fields, folder_name)
 
 
+_SAMPLE_TOKEN = re.compile(r'(?:^|(?<=[\s._\-\[\]()]))samples?(?=$|[\s._\-\[\]()])', re.IGNORECASE)
+_TRAILING_GROUP = re.compile(r'\s*-[A-Za-z0-9]{2,20}\s*$')
+
+
+def _only_metadata(text):
+	"""True when the text holds nothing but metadata from its start: the end
+	of the name, the group ('-grp'), a metadata token or 'WEB' tags followed
+	by one of them"""
+	while True:
+		following = _TAG_SEPARATORS.match(text).end()
+		if following == len(text) or _TRAILING_GROUP.fullmatch(text):
+			return True
+		if any(pattern.match(text, following) for pattern in _META_PATTERNS):
+			return True
+		web = _BARE_WEB.match(text, following)
+		if not web:
+			return False
+		text = text[web.end():]
+
+
+def is_sample_file(path):
+	"""True for the sample clip a release ships next to the real video:
+	anything inside a Sample(s) folder, or a name with a 'sample' token that
+	ends it ('show.s01e01-grp-sample', 'sample'), is followed only by
+	metadata or the group ('movie.2019.sample.1080p', 'show.sample.WEB',
+	'show.sample-grp') or sits in brackets ('[Sample]'). In front of the name
+	it has to be glued to it ('sample-grp-show', 'sample_show.s01e01') or come
+	before an episode ('Sample.Show.S01E01'). A title that merely has the word
+	('Samples.of.Life.2020', 'Sample.People.2000') is no sample. path may hold
+	folders, with either separator"""
+	parts = [part for part in re.split(r'[/\\]', path or "") if part]
+	if not parts:
+		return False
+	if any(part.lower() in ("sample", "samples") for part in parts[:-1]):
+		return True
+	stem = parts[-1].rsplit(".", 1)[0] if "." in parts[-1] else parts[-1]
+	for match in _SAMPLE_TOKEN.finditer(stem):
+		rest = stem[match.end():]
+		if _TAG_SEPARATORS.match(rest).end() == len(rest):
+			return True
+		if match.start() == 0:
+			# A title made of words joined by '_' starts with one too
+			# ('Samples_of_Life'), so the rest must be written another way
+			if rest.lstrip().startswith("-") or (rest[:1] == "_" and "_" not in rest[1:]):
+				return True
+			if match.group().lower() == "sample" and _find_episode(rest):
+				return True
+			continue
+		if stem[match.start() - 1] in "[(" and rest[:1] in "])":
+			return True
+		if _only_metadata(rest):
+			return True
+	return False
+
+
 def companion_subtitle_name(subtitle_name, video_name, new_video_name):
 	"""Returns the name a subtitle must take so it keeps matching its video
 	after the video is renamed, preserving any language suffix and its own
-	extension. Returns None when the subtitle does not belong to the video"""
+	extension. Returns None when the subtitle does not belong to the video:
+	its name has to be the video's, alone or followed by a separator ('01.es'
+	goes with '01', '10' does not go with '1')"""
 	subtitle_stem, _, subtitle_ext = subtitle_name.rpartition(".")
 	if not subtitle_stem or subtitle_ext.lower() not in SUBTITLE_EXTENSIONS:
 		return None
@@ -874,6 +1231,8 @@ def companion_subtitle_name(subtitle_name, video_name, new_video_name):
 	if not subtitle_stem.startswith(video_stem):
 		return None
 	suffix = subtitle_stem[len(video_stem):]
+	if suffix and suffix[0] not in "._- ":
+		return None
 	new_stem = _split_extension(new_video_name)[0]
 	return f"{new_stem}{suffix}.{subtitle_ext}"
 
@@ -955,12 +1314,29 @@ def _split_last(path):
 	return path[:positions[-1]], path[positions[-1] + 1:]
 
 
+def _folder_season(segment):
+	"""(fields, season, start, end) for a folder of a single season and no
+	episode, be it a bare season folder ('Temporada 2', 'Season 02', 'S02') or
+	one named after the show too ('Chicago Fire - Temporada 13'). start and
+	end delimit the number of the season, so it can be swapped. None for any
+	other folder"""
+	fields = parse_metadata(segment)
+	if not fields["is_series"] or not fields["season"].isdigit() or fields["episode_number"]:
+		return None
+	season = int(fields["season"])
+	for pattern in SEASON_ONLY_PATTERNS:
+		for match in pattern.finditer(segment):
+			if int(match.group(1)) == season:
+				return fields, season, match.start(1), match.end(1)
+	return None
+
+
 def _season_folder(segment):
 	"""The season number of a folder that only says the season ('Temporada 2',
 	'Season 02', 'S02'), or None when the folder is anything else"""
-	fields = parse_metadata(segment)
-	if fields["is_series"] and fields["season"].isdigit() and not fields["episode_number"] and not _series_text(fields["title"]):
-		return int(fields["season"])
+	found = _folder_season(segment)
+	if found and not _series_text(found[0]["title"]):
+		return found[1]
 	return None
 
 
@@ -976,20 +1352,49 @@ def _names_series(path, identity):
 	return _same_series(identity, _series_text(fields["title"]), fields["year"])
 
 
-def _retarget_season(path, season):
-	"""Episodes of the previous season sit in 'Temporada 13', but this one
-	belongs in 'Temporada 14' next to it: the number is swapped keeping its
-	padding. A pack of several seasons belongs in the series folder itself"""
+def _retarget_season(path, season, identity=None):
+	"""Episodes of the previous season sit in 'Temporada 13' (or in 'Chicago
+	Fire - Temporada 13'), but this one belongs in 'Temporada 14' next to it:
+	the number is swapped keeping its padding ('Season 09' -> 'Season 10',
+	'S13' -> 'S02', but 'Temporada 13' -> 'Temporada 2'). A pack of several
+	seasons belongs in the folder holding the season folders. A folder named
+	after part of another season ('Show S04 Vol 1') is no place for it: ""
+	then. Any other folder (one named after another show included) is
+	returned as it is, never raising"""
 	path = path.rstrip("/\\")
 	parent, last = _split_last(path)
-	folder_season = _season_folder(last)
-	if folder_season is None or folder_season == season or not parent:
+	found = _folder_season(last)
+	if found is None or not parent:
+		return path
+	fields, folder_season, start, end = found
+	title = _series_text(fields["title"])
+	if title and not (identity and _same_series(identity, title, fields["year"])):
+		return path
+	if folder_season == season:
 		return path
 	if season is None:
 		return parent
-	number = next(match for match in re.finditer(r'\d+', last) if int(match.group()) == folder_season)
-	digits = str(season).zfill(len(number.group()))
-	return f"{path[:len(parent) + 1]}{last[:number.start()]}{digits}{last[number.end():]}"
+	if fields["ambiguous"]:
+		return ""
+	# The compact markers ('S01', 'T13') always have a fixed width, and a
+	# number with a leading zero shows the folders are padded. Any other is
+	# written as it is: 'Temporada 2' already exists next to 'Temporada 13'
+	old = last[start:end]
+	width = len(old) if old.startswith("0") or (start and last[start - 1] in "SsTt") else 1
+	rest = last[end:]
+	# An English ordinal goes with its number: '1st Season' -> '2nd Season'
+	suffix = re.match(r'(?:st|nd|rd|th)(?![A-Za-z])', rest, re.IGNORECASE)
+	if suffix:
+		new_suffix = _ordinal_suffix(season)
+		rest = (new_suffix.upper() if suffix.group().isupper() else new_suffix) + rest[suffix.end():]
+	return f"{path[:len(parent) + 1]}{last[:start]}{str(season).zfill(width)}{rest}"
+
+
+def _ordinal_suffix(number):
+	"""'st', 'nd', 'rd' or 'th', the English ordinal ending of the number"""
+	if number % 100 in (11, 12, 13):
+		return "th"
+	return {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
 
 
 def series_dir_candidates(name, torrents, known_dirs=(), current_dir=None, generic_dirs=()):
@@ -1009,7 +1414,7 @@ def series_dir_candidates(name, torrents, known_dirs=(), current_dir=None, gener
 	found = {}  # dir -> [named, episodes, latest]
 
 	def consider(directory, episodes, added):
-		directory = _retarget_season(directory, identity["season"])
+		directory = _retarget_season(directory, identity["season"], identity)
 		if not directory:
 			return
 		entry = found.setdefault(directory, [_names_series(directory, identity), 0, 0])

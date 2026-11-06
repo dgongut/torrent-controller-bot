@@ -6,6 +6,7 @@ import math
 import os
 import re
 import requests
+import socket
 import sys
 import telebot
 import threading
@@ -14,19 +15,20 @@ import uuid
 from collections import Counter
 from config import *
 from datetime import datetime
+from urllib.parse import urljoin
 from telebot.types import ForceReply
 from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue, describe_error
-from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
-from torrent_clients import PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, content_root, create_client
+from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, is_sample_file, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
+from torrent_clients import DuplicateTorrentError, RestartRequiredError, expected_torrent_ids, FILE_HIGH, FILE_LOW, FILE_NORMAL, FILE_SKIP, PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, content_root, create_client
 import bot_settings
 import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -57,10 +59,17 @@ def get_text(key, *args):
 			return f"key ['{key}'] is not in locale {LANGUAGE} or EN"
 
 	if args:
-		for i, arg in enumerate(args, start=1):
-			translated_text = translated_text.replace(f"${i}", str(arg))
+		# One pass: a value that itself contains "$2" (a torrent called
+		# "Price$2Off") must not get the second argument put inside it
+		def argument(match):
+			index = int(match.group(1))
+			return str(args[index - 1]) if 1 <= index <= len(args) else match.group(0)
+		translated_text = _PLACEHOLDER.sub(argument, translated_text)
 
 	return translated_text
+
+
+_PLACEHOLDER = re.compile(r"\$(\d+)")
 
 
 def parse_name(filename):
@@ -102,6 +111,13 @@ def parse_folder_name(folder_name, parent_name):
 		season_prefix="T" if LANGUAGE.lower() == "es" else "S",
 	)
 
+
+for problem in CONFIG_WARNINGS:
+	warning(problem)
+for removed in REMOVED_VARIABLES:
+	if os.environ.get(removed):
+		warning(f"{removed} is no longer used: screens repaint themselves every {DASHBOARD_REFRESH_SECONDS} s "
+				f"for {DASHBOARD_REFRESH_DURATION} s, then the update button takes over")
 
 # Initial variable validation
 if TELEGRAM_TOKEN is None or TELEGRAM_TOKEN == '':
@@ -284,6 +300,17 @@ def normalize_thread(thread_id):
 	return thread_id if thread_id > 1 else None
 
 
+def message_thread(message):
+	"""The forum topic a message is in, normalized, or None. Outside a forum a
+	reply also carries message_thread_id (the id of the message that started
+	the reply chain, which every answer to a ForceReply prompt is), and
+	sending to it fails with "message thread not found": only a topic message
+	(is_topic_message) is really in a topic"""
+	if message is None or not getattr(message, "is_topic_message", False):
+		return None
+	return normalize_thread(getattr(message, "message_thread_id", None))
+
+
 def send_message(chat_id, text, reply_markup=None, thread_id=None):
 	kwargs = {"parse_mode": "HTML", "reply_markup": reply_markup, "disable_web_page_preview": True}
 	thread_id = normalize_thread(thread_id)
@@ -302,22 +329,36 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
 
 
 def delete_message(chat_id, message_id):
+	"""Returns whether the message is gone. Telegram refuses to delete a
+	message older than 48 hours"""
 	try:
 		bot.delete_message(chat_id, message_id)
+		return True
 	except Exception:
-		pass
+		return False
+
+
+def remove_markup(chat_id, message_id):
+	"""Takes the buttons away from a message. A second tap on a button that
+	already did it gets "message is not modified" from Telegram, which must
+	not be painted over the message as an error"""
+	try:
+		bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+	except Exception as e:
+		if "message is not modified" not in str(e):
+			warning(f"Cannot remove the buttons of message {message_id}: {e}")
 
 
 def notify(text, chat_id=None, thread_id=None, reply_markup=None):
 	"""Sends a bot-initiated notification. A conversation that originated it
 	takes precedence, so the answer lands in the topic where it was asked;
 	otherwise it goes to the configured destination: the group (and its
-	TELEGRAM_THREAD) if set, or the first admin"""
+	TELEGRAM_THREAD) if set, or the first admin. Returns the message sent,
+	None when it could not be sent"""
 	if chat_id is not None:
-		send_message(chat_id, text, reply_markup=reply_markup, thread_id=thread_id)
-		return
+		return send_message(chat_id, text, reply_markup=reply_markup, thread_id=thread_id)
 	target = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
-	send_message(target, text, reply_markup=reply_markup, thread_id=TELEGRAM_THREAD)
+	return send_message(target, text, reply_markup=reply_markup, thread_id=TELEGRAM_THREAD)
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +378,8 @@ category_contexts = {}
 
 # Pending torrents waiting for a download dir: id -> {"magnet"/"data", "name", "ts"}
 pending_torrents = {}
+# Pending ids whose add is under way (the folder was chosen)
+_adding = set()
 
 # Navigation contexts: short id -> {"torrent_id", "filter_key", "page", "ts"}
 nav_contexts = {}
@@ -344,50 +387,135 @@ nav_contexts = {}
 # Pagination contexts: short id -> {"base": callback prefix, "ts": float}
 page_contexts = {}
 
-# Pending text inputs: (chat_id, user_id) -> {"action": str, ...}
+# Pending text inputs: (chat_id, user_id) -> {"action": str, "ts": float, "thread": int|None, ...}
 pending_inputs = {}
 
-# Short ids for directories (stable during runtime)
+# What a confirmation was shown about, so pressing it acts on exactly that
+# (the torrents a mass action counted, the ones a replace listed): short id
+# -> {"ts": float, ...}. The id starts with a letter of its own kind
+action_contexts = {}
+
+# Folders and categories behind the short ids of their buttons. The id is a
+# hash of the name, so it is the same in every run: buttons outlive restarts
 _dir_by_id = {}
-_dir_ids = {}
-
-# Short ids for categories (stable during runtime)
 _cat_by_id = {}
-_cat_ids = {}
 
-# Live screens (the dashboard, a list, a torrent) repainting themselves:
-# (chat_id, thread_id) -> {"message_id": int, "generation": int}. Only the last
-# one opened in a chat or topic is live, so Telegram never gets more edits than one
+# Live screens (the dashboard, a list, a torrent, files) repainting themselves.
+# live_views: (chat_id, thread_id) -> {"message_id": int, "generation": int},
+# the one live screen of each chat or topic, so Telegram never gets more edits
+# than one. live_messages: (chat_id, message_id) -> generation of the refresher
+# painting that message; a button pressed on it bumps it, which stops that
+# refresher wherever it was registered
 live_views = {}
+live_messages = {}
+_live_generation = [0]
 _live_views_lock = threading.Lock()
 
 
+def _stable_id(text):
+	"""Short id of a folder or a category for callback_data, the same in every
+	run. Handing them out in order of appearance made an old button point at
+	another folder after a restart, and move the data there"""
+	return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+
+
+DIR_IDS_FILE = os.path.join(_config_module.CONFIG_PATH, "dir_ids.json")
+_dir_ids_loaded = [False]
+
+
+def _load_dir_ids():
+	"""Folders that had a button before a restart. Some exist nowhere else
+	yet (the folder of a new season, offered before anything is in it)"""
+	if _dir_ids_loaded[0]:
+		return
+	_dir_ids_loaded[0] = True
+	try:
+		with open(DIR_IDS_FILE, "r", encoding="utf-8") as file:
+			stored = json.load(file)
+		for path in stored if isinstance(stored, list) else []:
+			if isinstance(path, str):
+				_dir_by_id.setdefault(_stable_id(path), path)
+	except FileNotFoundError:
+		pass
+	except Exception as e:
+		warning(f"Cannot read {DIR_IDS_FILE}: {e}")
+
+
+def _save_dir_ids():
+	try:
+		os.makedirs(_config_module.CONFIG_PATH, exist_ok=True)
+		tmp_file = DIR_IDS_FILE + ".tmp"
+		with open(tmp_file, "w", encoding="utf-8") as file:
+			json.dump(list(_dir_by_id.values())[-MAX_REMEMBERED_DIRS:], file)
+		os.replace(tmp_file, DIR_IDS_FILE)
+	except Exception as e:
+		warning(f"Cannot write {DIR_IDS_FILE}: {e}")
+
+
 def get_dir_id(path):
+	dir_id = _stable_id(path)
 	with _contexts_lock:
-		if path not in _dir_ids:
-			new_id = str(len(_dir_ids))
-			_dir_ids[path] = new_id
-			_dir_by_id[new_id] = path
-		return _dir_ids[path]
+		_load_dir_ids()
+		if _dir_by_id.get(dir_id) != path:
+			_dir_by_id[dir_id] = path
+			_save_dir_ids()
+	return dir_id
 
 
 def get_dir_by_id(dir_id):
+	"""The folder of a button, None when unknown. The folders that had a
+	button are remembered across restarts, and a miss also learns the
+	known folders again"""
 	with _contexts_lock:
-		return _dir_by_id.get(dir_id)
+		_load_dir_ids()
+		found = _dir_by_id.get(dir_id)
+	if found is None:
+		for directory in get_known_dirs():
+			get_dir_id(directory)
+		with _contexts_lock:
+			found = _dir_by_id.get(dir_id)
+	return found
 
 
 def get_cat_id(category):
+	cat_id = _stable_id(category)
 	with _contexts_lock:
-		if category not in _cat_ids:
-			new_id = str(len(_cat_ids))
-			_cat_ids[category] = new_id
-			_cat_by_id[new_id] = category
-		return _cat_ids[category]
+		_cat_by_id[cat_id] = category
+	return cat_id
 
 
 def get_cat_by_id(cat_id):
 	with _contexts_lock:
-		return _cat_by_id.get(cat_id)
+		found = _cat_by_id.get(cat_id)
+	if found is None:
+		for name in [""] + [name for name, _ in get_known_categories()]:
+			get_cat_id(name)
+		with _contexts_lock:
+			found = _cat_by_id.get(cat_id)
+	return found
+
+
+def new_action_context(kind, **data):
+	"""Short id (kind + 6 hex) for what a confirmation is about"""
+	with _contexts_lock:
+		now = time.time()
+		for key in [k for k, v in action_contexts.items() if now - v["ts"] > SEARCH_CONTEXT_TTL]:
+			del action_contexts[key]
+		ctx_id = f"{kind}{uuid.uuid4().hex[:6]}"
+		action_contexts[ctx_id] = dict(data, ts=now)
+		return ctx_id
+
+
+def get_action_context(ctx_id, kind):
+	"""The data of an action context of that kind, or None when it expired, the
+	bot restarted, or ctx_id is something else (a button from an older version)"""
+	if not ctx_id or not ctx_id.startswith(kind):
+		return None
+	with _contexts_lock:
+		ctx = action_contexts.get(ctx_id)
+		if ctx is None or time.time() - ctx["ts"] > SEARCH_CONTEXT_TTL:
+			return None
+		return dict(ctx)
 
 
 def new_search_context(query):
@@ -522,7 +650,12 @@ def pop_pending_torrent(pending_id):
 # ---------------------------------------------------------------------------
 
 class ExpiredContext(Exception):
-	pass
+	"""What a screen points at is gone. screen is (text, markup) to show in its
+	place, None for the generic expired search one"""
+
+	def __init__(self, screen=None):
+		super().__init__()
+		self.screen = screen
 
 
 def is_known_filter(filter_key):
@@ -595,6 +728,24 @@ def get_filtered_torrents(filter_key):
 # DASHBOARD
 # ---------------------------------------------------------------------------
 
+def transfer_stats_lines(title, downloaded, uploaded, seconds, starts):
+	"""Block of the dashboard with what the manager has transferred in a period,
+	nothing when it does not report it. Values below 0 are unknown"""
+	if downloaded < 0 and uploaded < 0:
+		return []
+	lines = ["", get_text(title), get_text("DASHBOARD_STATS_TRANSFER", sizeof_fmt(downloaded), sizeof_fmt(uploaded))]
+	extra = []
+	if downloaded > 0 and uploaded >= 0:
+		extra.append(get_text("DASHBOARD_STATS_RATIO", f"{uploaded / downloaded:.2f}"))
+	if seconds >= 0:
+		extra.append(get_text("DASHBOARD_STATS_TIME", format_eta(seconds)))
+	if starts > 0:
+		extra.append(get_text("DASHBOARD_STATS_SESSIONS", starts))
+	if extra:
+		lines.append(" · ".join(extra))
+	return lines
+
+
 def build_dashboard(refreshing):
 	summary = client.get_summary()
 	counts = summary.counts
@@ -614,6 +765,10 @@ def build_dashboard(refreshing):
 		lines.append(get_text("DASHBOARD_FREE_SPACE", sizeof_fmt(summary.free_space)))
 	if summary.alt_speed_enabled:
 		lines.append(get_text("DASHBOARD_TURTLE_ON"))
+	for title, downloaded, uploaded, seconds, starts in (
+			("DASHBOARD_STATS_SESSION", summary.session_downloaded, summary.session_uploaded, summary.session_seconds, -1),
+			("DASHBOARD_STATS_TOTAL", summary.total_downloaded, summary.total_uploaded, summary.total_seconds, summary.session_count)):
+		lines.extend(transfer_stats_lines(title, downloaded, uploaded, seconds, starts))
 	lines.append("")
 	lines.append(live_footer(refreshing))
 
@@ -652,7 +807,7 @@ def show_dashboard(chat_id, message_id=None, thread_id=None):
 	try:
 		text, markup = build_dashboard(refreshing=True)
 	except TorrentClientError as e:
-		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		text = client_error_text(e)
 		if message_id:
 			edit_message(chat_id, message_id, text)
 		else:
@@ -666,7 +821,7 @@ def show_dashboard(chat_id, message_id=None, thread_id=None):
 		if not sent:
 			return
 		message_id = sent.message_id
-	start_live_view(chat_id, message_id, thread_id, build_dashboard)
+	start_live_view(chat_id, message_id, thread_id, build_dashboard, build_call("refreshDashboard"))
 
 
 # ---------------------------------------------------------------------------
@@ -687,18 +842,44 @@ def live_buttons(refreshing, refresh_call, *buttons):
 	return [InlineKeyboardButton(get_text("BUTTON_UPDATE"), callback_data=refresh_call)] + list(buttons)
 
 
-def _live_status(key, message_id, generation):
-	"""live, stopped (a button of this same message is already repainting it)
-	or replaced (another message became the live screen of the chat)"""
+def _live_status(key, chat_id, message_id, generation):
+	"""live, stopped (a button of this message was pressed, or a newer
+	refresher took the message over) or replaced (another message became the
+	live screen of the chat or topic)"""
+	if live_messages.get((chat_id, message_id)) != generation:
+		return "stopped"
 	state = live_views.get(key)
-	if state and state["message_id"] == message_id and state["generation"] == generation:
-		return "live"
 	if state and state["message_id"] != message_id:
 		return "replaced"
-	return "stopped"
+	return "live"
 
 
-def _live_refresher(chat_id, thread_id, message_id, generation, build):
+def client_error_text(error):
+	"""What a failure of the torrent manager says: a refusal is not a
+	connection problem, and a manager that has to be restarted says so"""
+	if isinstance(error, RestartRequiredError):
+		return get_text("MANAGER_RESTART_REQUIRED", html.escape(str(error)))
+	if isinstance(error, PermanentTorrentError):
+		return get_text("ACTION_REFUSED", html.escape(str(error)))
+	return get_text("CONNECTION_ERROR", html.escape(str(error)))
+
+
+def live_error_screen(error, refresh_call=None):
+	"""What a live screen shows when the last repaint cannot be built: the
+	error and the button to try again, instead of being left saying it
+	updates itself"""
+	if isinstance(error, TorrentClientError):
+		text = client_error_text(error)
+	else:
+		text = get_text("ERROR_GENERIC", html.escape(str(error)))
+	markup = InlineKeyboardMarkup()
+	row = [InlineKeyboardButton(get_text("BUTTON_UPDATE"), callback_data=refresh_call)] if refresh_call else []
+	row.append(InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")))
+	markup.row(*row)
+	return text, markup
+
+
+def _live_refresher(chat_id, thread_id, message_id, generation, build, refresh_call=None):
 	key = (chat_id, thread_id)
 	last = None
 
@@ -707,15 +888,21 @@ def _live_refresher(chat_id, thread_id, message_id, generation, build):
 		so a button pressed meanwhile can never be painted over with this screen.
 		Returns False when the screen is no longer live"""
 		nonlocal last
+		gone = False
 		try:
 			text, markup = build(refreshing=refreshing)
-		except ExpiredContext:
-			return False
+		except ExpiredContext as e:
+			# What the screen showed is gone: it says so, instead of being
+			# left behind still saying it updates itself
+			text, markup = e.screen or (get_text("SEARCH_EXPIRED"), back_close_markup())
+			gone = True
 		except Exception as e:
 			warning(f"Live screen refresh failed: {e}")
-			return True
+			if refreshing:
+				return True
+			text, markup = live_error_screen(e, refresh_call)
 		with _live_views_lock:
-			status = _live_status(key, message_id, generation)
+			status = _live_status(key, chat_id, message_id, generation)
 			if status == "stopped" or (refreshing and status == "replaced"):
 				return False
 			# An identical screen is not sent: it is a wasted call to Telegram
@@ -723,40 +910,49 @@ def _live_refresher(chat_id, thread_id, message_id, generation, build):
 			if current != last:
 				edit_message(chat_id, message_id, text, markup)
 				last = current
-		return True
+		return not gone
 
-	iterations = max(1, DASHBOARD_REFRESH_DURATION // DASHBOARD_REFRESH_SECONDS)
-	for _ in range(iterations):
-		time.sleep(DASHBOARD_REFRESH_SECONDS)
+	try:
+		iterations = max(1, DASHBOARD_REFRESH_DURATION // DASHBOARD_REFRESH_SECONDS)
+		for _ in range(iterations):
+			time.sleep(DASHBOARD_REFRESH_SECONDS)
+			with _live_views_lock:
+				status = _live_status(key, chat_id, message_id, generation)
+			if status == "stopped":
+				return
+			# A screen left behind by a newer one stops right away, with its update button
+			if status == "replaced" or not paint(refreshing=True):
+				break
 		with _live_views_lock:
-			status = _live_status(key, message_id, generation)
-		if status == "stopped":
-			return
-		# A screen left behind by a newer one stops right away, with its update button
-		if status == "replaced" or not paint(refreshing=True):
-			break
-	with _live_views_lock:
-		if _live_status(key, message_id, generation) == "stopped":
-			return
-	paint(refreshing=False)
+			if _live_status(key, chat_id, message_id, generation) == "stopped":
+				return
+		paint(refreshing=False)
+	finally:
+		with _live_views_lock:
+			if live_messages.get((chat_id, message_id)) in (generation, None):
+				live_messages.pop((chat_id, message_id), None)
 
 
-def start_live_view(chat_id, message_id, thread_id, build):
+def start_live_view(chat_id, message_id, thread_id, build, refresh_call=None):
 	"""Starts repainting a screen already painted with build(refreshing=True).
-	It becomes the live screen of its chat or topic, replacing the previous one"""
+	It becomes the live screen of its chat or topic, replacing the previous
+	one. refresh_call repaints it by hand, offered if the last repaint fails"""
 	key = (chat_id, normalize_thread(thread_id))
 	with _live_views_lock:
-		state = live_views.get(key, {"generation": 0})
-		generation = state["generation"] + 1
+		_live_generation[0] += 1
+		generation = _live_generation[0]
 		live_views[key] = {"message_id": message_id, "generation": generation}
-	threading.Thread(target=_live_refresher, args=(chat_id, key[1], message_id, generation, build), daemon=True).start()
+		live_messages[(chat_id, message_id)] = generation
+	threading.Thread(target=_live_refresher, args=(chat_id, key[1], message_id, generation, build, refresh_call), daemon=True).start()
 
 
 def stop_live_view(chat_id, message_id, thread_id=None):
+	"""Stops the refresher of that message, whatever chat or topic it was
+	registered under and whether or not a newer screen replaced it: a button
+	pressed on a message means what it shows is about to change"""
 	with _live_views_lock:
-		state = live_views.get((chat_id, normalize_thread(thread_id)))
-		if state and state["message_id"] == message_id:
-			state["generation"] += 1
+		if (chat_id, message_id) in live_messages:
+			live_messages[(chat_id, message_id)] = None
 
 
 # ---------------------------------------------------------------------------
@@ -770,14 +966,93 @@ def list_tracker(filter_key):
 	return get_tracker_filter(filter_key[1:])
 
 
-def build_list(filter_key, page, refreshing=False):
-	torrents = get_filtered_torrents(filter_key)
+# Orders of the torrent lists: (callback code, value of a torrent, natural
+# order is the highest first). A value of None is unknown and always goes last
+LIST_SORTS = {
+	"added": ("a", lambda t: t.added_date, True),
+	"name": ("n", lambda t: (t.name or "").casefold(), False),
+	"size": ("s", lambda t: t.total_size or 0, True),
+	"progress": ("p", lambda t: t.progress, True),
+	"ratio": ("r", lambda t: t.ratio, True),
+	"speed": ("v", lambda t: (t.download_rate or 0) + (t.upload_rate or 0), True),
+	"activity": ("t", lambda t: t.last_activity, True),
+}
+LIST_SORT_BY_CODE = {code: key for key, (code, _, _) in LIST_SORTS.items()}
+
+
+def available_sorts():
+	"""The orders the torrent manager can give, the last activity is not in every listing"""
+	return [key for key in LIST_SORTS if key != "activity" or client.reports_last_activity]
+
+
+def current_sort():
+	key = bot_settings.get("list_sort")
+	if key not in available_sorts():
+		key = "added"
+	return key, bool(bot_settings.get("list_sort_reverse"))
+
+
+def sort_label(key, reverse, short=False):
+	"""The short one fits in half a row, next to the actions button of the list"""
+	return get_text(f"SORT_{key.upper()}{'_REVERSE' if reverse else ''}{'_SHORT' if short else ''}")
+
+
+def sort_torrents(torrents):
+	"""Torrents in the order chosen for the lists. Ties keep the order of the
+	manager's listing, the newest first"""
+	key, reverse = current_sort()
+	_, value, highest_first = LIST_SORTS[key]
+	known = [t for t in torrents if value(t) is not None]
+	unknown = [t for t in torrents if value(t) is None]
+	return sorted(known, key=value, reverse=highest_first != reverse) + unknown
+
+
+def build_sort_menu(filter_key):
+	key, reverse = current_sort()
+	text = get_text("SORT_TITLE", sort_label(key, reverse))
+	markup = InlineKeyboardMarkup(row_width=2)
+	markup.add(*[InlineKeyboardButton(f"{'✅ ' if option == key else ''}{sort_label(option, reverse if option == key else False, short=True)}",
+									callback_data=build_call("sortSet", filter_key, LIST_SORTS[option][0]))
+				for option in available_sorts()])
+	markup.row(InlineKeyboardButton(get_text("BUTTON_SORT_REVERSE"), callback_data=build_call("sortSet", filter_key, "x")))
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, 0)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return text, markup
+
+
+def set_sort(code):
+	"""Applies a button of the sort menu: an order, or turning the current one around"""
+	key, reverse = current_sort()
+	if code == "x":
+		bot_settings.set("list_sort_reverse", not reverse)
+		return
+	chosen = LIST_SORT_BY_CODE.get(code)
+	if chosen in available_sorts() and chosen != key:
+		bot_settings.set("list_sort", chosen)
+		bot_settings.set("list_sort_reverse", False)
+
+
+def build_list(filter_key, page, refreshing=False, order=None):
+	"""order is {torrent id: position} shared by the paints of one live list:
+	the first one fills it and the rest keep the torrents in those places (new
+	ones go last), so a list sorted by speed or activity does not reshuffle
+	every two seconds under the finger about to tap one"""
+	torrents = sort_torrents(get_filtered_torrents(filter_key))
+	if order is not None:
+		if order:
+			torrents.sort(key=lambda t: order.get(t.id, len(order)))
+		else:
+			order.update({t.id: position for position, t in enumerate(torrents)})
 	total = len(torrents)
 	pages = max(1, math.ceil(total / TORRENTS_PER_PAGE))
 	page = max(0, min(int(page), pages - 1))
 	label = get_filter_label(filter_key)
 
 	text = get_text("LIST_TITLE", label, total, page + 1, pages)
+	if total > 0:
+		text += "\n" + get_text("LIST_SIZE", sizeof_fmt(sum(t.total_size or 0 for t in torrents)))
 	if total == 0:
 		text += f"\n\n{get_text('LIST_EMPTY')}"
 	text += f"\n\n{live_footer(refreshing)}"
@@ -794,25 +1069,15 @@ def build_list(filter_key, page, refreshing=False):
 	if pages > 1:
 		markup.row(*pagination_row(page, pages, "list", filter_key))
 
-	if total > 0:
-		markup.row(
-			InlineKeyboardButton(get_text("BUTTON_MASS_RESUME"), callback_data=build_call("mass", "resume", filter_key)),
-			InlineKeyboardButton(get_text("BUTTON_MASS_PAUSE"), callback_data=build_call("mass", "pause", filter_key)),
-		)
-		markup.row(
-			InlineKeyboardButton(get_text("BUTTON_MASS_DELETE"), callback_data=build_call("mass", "delete", filter_key)),
-			InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key)),
-		)
-	# On a tracker filter the limits of the tracker take the place of the ratio
-	# of all: they cover the torrents there are now and the ones that arrive
-	tracker = list_tracker(filter_key) if tracker_limits_supported() else None
-	if total > 0 and (client.supports_ratio_limit or client.supports_torrent_speed_limit) and not tracker:
-		# "ratio" is the name the limits of all had when they were only the ratio:
-		# kept, so the buttons already in the chats still work
-		markup.row(InlineKeyboardButton(get_text("BUTTON_MASS_LIMITS"), callback_data=build_call("mass", "ratio", filter_key)))
-	if tracker:
-		markup.row(InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_OF", "📌" if tracker_limits.get_rule(tracker) else "➕"),
-										callback_data=build_call("tlRule", tracker_limits.tracker_key(tracker), filter_key)))
+	# What acts on every torrent of the list waits in a menu of its own: it is
+	# seldom used and would otherwise take three rows of every list
+	tools = []
+	if total > 1:
+		tools.append(InlineKeyboardButton(get_text("BUTTON_SORT", sort_label(*current_sort(), short=True)), callback_data=build_call("sort", filter_key)))
+	if mass_menu_rows(filter_key, total):
+		tools.append(InlineKeyboardButton(get_text("BUTTON_MASS_MENU"), callback_data=build_call("massMenu", filter_key, page)))
+	if tools:
+		markup.row(*tools)
 
 	markup.row(*live_buttons(refreshing, build_call("list", filter_key, page),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("dashboard")),
@@ -821,16 +1086,54 @@ def build_list(filter_key, page, refreshing=False):
 	return text, markup
 
 
+def mass_menu_rows(filter_key, total):
+	"""Buttons of the actions on every torrent of a list, empty when there is none"""
+	rows = []
+	if total > 0:
+		rows.append([
+			InlineKeyboardButton(get_text("BUTTON_MASS_RESUME"), callback_data=build_call("mass", "resume", filter_key)),
+			InlineKeyboardButton(get_text("BUTTON_MASS_PAUSE"), callback_data=build_call("mass", "pause", filter_key)),
+		])
+		rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key))])
+	# On a tracker filter the limits of the tracker take the place of the ratio
+	# of all: they cover the torrents there are now and the ones that arrive
+	tracker = list_tracker(filter_key) if tracker_limits_supported() else None
+	if total > 0 and (client.supports_ratio_limit or client.supports_torrent_speed_limit) and not tracker:
+		# "ratio" is the name the limits of all had when they were only the ratio:
+		# kept, so the buttons already in the chats still work
+		rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_LIMITS"), callback_data=build_call("mass", "ratio", filter_key))])
+	if tracker:
+		rows.append([InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_OF", "📌" if tracker_limits.get_rule(tracker) else "➕"),
+										callback_data=build_call("tlRule", tracker_limits.tracker_key(tracker), filter_key))])
+	if total > 0:
+		rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_DELETE"), callback_data=build_call("mass", "delete", filter_key))])
+	return rows
+
+
+def build_mass_menu(filter_key, page):
+	total = len(get_filtered_torrents(filter_key))
+	text = get_text("MASS_MENU_TITLE", get_filter_label(filter_key), total)
+	markup = InlineKeyboardMarkup()
+	for row in mass_menu_rows(filter_key, total):
+		markup.row(*row)
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, page)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return text, markup
+
+
 def render_list(chat_id, message_id, filter_key, page, thread_id=None):
 	live = True
+	order = {}
 	try:
-		text, markup = build_list(filter_key, page, refreshing=True)
+		text, markup = build_list(filter_key, page, refreshing=True, order=order)
 	except ExpiredContext:
 		text = get_text("SEARCH_EXPIRED")
 		markup = back_close_markup()
 		live = False
 	except TorrentClientError as e:
-		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		text = client_error_text(e)
 		markup = back_close_markup()
 		live = False
 	if message_id:
@@ -839,7 +1142,8 @@ def render_list(chat_id, message_id, filter_key, page, thread_id=None):
 		sent = send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 		message_id = sent.message_id if sent else None
 	if live and message_id:
-		start_live_view(chat_id, message_id, thread_id, lambda refreshing: build_list(filter_key, page, refreshing))
+		start_live_view(chat_id, message_id, thread_id, lambda refreshing: build_list(filter_key, page, refreshing, order),
+						build_call("list", filter_key, page))
 
 
 def back_close_markup(back_call=None):
@@ -938,7 +1242,8 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 		lines.append("")
 		lines.append(f"<b>{get_text('INFO_FILES')} ({len(torrent.files)}):</b>")
 		for path, size, _ in torrent.files[:10]:
-			lines.append(f"• <code>{html.escape(path)}</code> ({sizeof_fmt(size)})")
+			skipped = " ⏭️" if torrent.file_priorities.get(path) == FILE_SKIP else ""
+			lines.append(f"• <code>{html.escape(path)}</code> ({sizeof_fmt(size)}){skipped}")
 		if len(torrent.files) > 10:
 			lines.append(get_text("INFO_AND_MORE_FILES", len(torrent.files) - 10))
 	lines.append("")
@@ -975,11 +1280,13 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 		limits_row.append(InlineKeyboardButton(get_text("BUTTON_RATIO_LIMIT"), callback_data=build_call("ratioMenu", ratio_ctx)))
 	if limits_row:
 		markup.row(*limits_row)
-	# The file screen only exists to rename folders and files one by one
-	if show_files and client.supports_rename:
+	# The file screen is where folders and files are renamed one by one and
+	# where the files to download are chosen
+	if show_files and (client.supports_rename or client.file_priority_levels):
 		files_ctx = new_nav_context(torrent.id, filter_key, page)
-		root_index = torrent_folders(torrent).index(torrent_root(torrent))
-		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES"), callback_data=build_call("files", files_ctx, root_index, 0)))
+		folders = torrent_folders(torrent)
+		root_ref = folder_ref(folders, folders.index(torrent_root(torrent)))
+		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES"), callback_data=build_call("files", files_ctx, root_ref, 0)))
 	markup.row(InlineKeyboardButton(get_text("BUTTON_DELETE"), callback_data=build_call("delete", torrent.id, filter_key, page)))
 	markup.row(*live_buttons(refreshing, build_call("info", torrent.id, filter_key, page),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, page)),
@@ -992,12 +1299,13 @@ def render_detail(chat_id, message_id, torrent_id, filter_key, page, thread_id=N
 	try:
 		text, markup = build_detail(torrent_id, filter_key, page, refreshing=True)
 	except TorrentClientError as e:
-		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		text = client_error_text(e)
 		markup = back_close_markup(build_call("list", filter_key, page))
 		edit_message(chat_id, message_id, text, markup)
 		return
 	edit_message(chat_id, message_id, text, markup)
-	start_live_view(chat_id, message_id, thread_id, lambda refreshing: build_detail(torrent_id, filter_key, page, refreshing))
+	start_live_view(chat_id, message_id, thread_id, lambda refreshing: build_detail(torrent_id, filter_key, page, refreshing),
+					build_call("info", torrent_id, filter_key, page))
 
 
 # ---------------------------------------------------------------------------
@@ -1067,13 +1375,36 @@ def is_inside(path, folder):
 	return not folder or path.startswith(folder + "/")
 
 
-def get_torrent_folder(torrent, folder_index):
-	"""Folder at that index, or the torrent folder when the index is out of
-	range or points above it (the top level only holds the torrent folder)"""
+def folder_key(folder):
+	"""Short hash of a folder path, carried with its index by the buttons"""
+	return hashlib.sha1(folder.encode("utf-8")).hexdigest()[:4]
+
+
+def folder_ref(folders, index):
+	"""How a button points at folders[index]: "index.key". A rename elsewhere
+	in the torrent can move a folder in the sorted list, and the index alone
+	would then name another one"""
+	return f"{index}.{folder_key(folders[index])}"
+
+
+def get_torrent_folder(torrent, folder_index, strict=False):
+	"""Folder a button points at, or the torrent folder when the index is out
+	of range or points above it (the top level only holds the torrent folder).
+	A button that carries the folder's key follows it if it moved, and when it
+	is gone, strict (a button that acts on the folder) gives None instead"""
 	root = torrent_root(torrent)
+	folders = torrent_folders(torrent)
+	index_text, _, key = str(folder_index).partition(".")
 	try:
-		folder = torrent_folders(torrent)[int(folder_index)]
+		folder = folders[int(index_text)]
 	except (IndexError, ValueError):
+		folder = None
+	if key:
+		if folder is None or folder_key(folder) != key:
+			folder = next((f for f in folders if folder_key(f) == key), None)
+		if folder is None:
+			return None if strict else root
+	elif folder is None:
 		return root
 	return folder if is_inside(folder, root) or folder == root else root
 
@@ -1085,16 +1416,26 @@ def folder_entries(torrent, folder):
 	return subfolders, files
 
 
-def suggest_for_file(torrent, path):
+def single_video(torrent):
+	"""Whether the torrent holds one video, its sample clips aside"""
+	return sum(1 for path, _, _ in torrent.files if is_video_file(path) and not is_sample_file(path)) == 1
+
+
+def suggest_for_file(torrent, path, one_video=None, root=None):
 	"""Suggestion for one file of the torrent, using the torrent name and the
 	folder holding it (a season folder) as context. Returns None when nothing
-	can be suggested"""
-	if not is_video_file(path):
+	can be suggested, and always for a sample clip, which would otherwise take
+	the name of the real video. one_video and root, when given, spare the scan
+	of every file that a plan over thousands of files repeated for each one"""
+	if not is_video_file(path) or is_sample_file(path):
 		return None
-	single_video = len([f for f in torrent.files if is_video_file(f[0])]) == 1
+	if one_video is None:
+		one_video = single_video(torrent)
+	if root is None:
+		root = torrent_root(torrent)
 	folder = file_folder(path)
-	folder_name = file_basename(folder) if folder and folder != torrent_root(torrent) else None
-	suggested = parse_file_name(file_basename(path), torrent.name, single_video, folder_name)
+	folder_name = file_basename(folder) if folder and folder != root else None
+	suggested = parse_file_name(file_basename(path), torrent.name, one_video, folder_name)
 	if not suggested or suggested == file_basename(path):
 		return None
 	return suggested
@@ -1115,13 +1456,24 @@ def suggest_for_folder(torrent, folder):
 	return suggested
 
 
-def subtitle_renames(torrent, video_path, new_name):
-	"""Renames needed so the subtitles of video_path keep matching it"""
+def subtitles_by_folder(torrent):
+	"""{folder: subtitle paths in it}"""
+	subtitles = {}
+	for path, _, _ in torrent.files:
+		if is_subtitle_file(path):
+			subtitles.setdefault(file_folder(path), []).append(path)
+	return subtitles
+
+
+def subtitle_renames(torrent, video_path, new_name, subtitles=None):
+	"""Renames needed so the subtitles of video_path keep matching it.
+	subtitles is subtitles_by_folder(torrent), when already worked out"""
 	renames = []
 	folder = file_folder(video_path)
 	video_file = file_basename(video_path)
-	for path, _, _ in torrent.files:
-		if path == video_path or file_folder(path) != folder or not is_subtitle_file(path):
+	candidates = (subtitles if subtitles is not None else subtitles_by_folder(torrent)).get(folder, [])
+	for path in candidates:
+		if path == video_path:
 			continue
 		companion = companion_subtitle_name(file_basename(path), video_file, new_name)
 		if companion and companion != file_basename(path):
@@ -1136,12 +1488,15 @@ def build_rename_plan(torrent, only_path=None, within=""):
 	plan = []
 	taken = {file_basename(p) for p, _, _ in torrent.files}
 	collisions = []
+	one_video = single_video(torrent)
+	root = torrent_root(torrent)
+	subtitles = subtitles_by_folder(torrent)
 	for path, _, _ in torrent.files:
 		if only_path and path != only_path:
 			continue
 		if not is_inside(path, within):
 			continue
-		suggested = suggest_for_file(torrent, path)
+		suggested = suggest_for_file(torrent, path, one_video, root)
 		if not suggested:
 			continue
 		taken.discard(file_basename(path))
@@ -1151,7 +1506,7 @@ def build_rename_plan(torrent, only_path=None, within=""):
 			continue
 		taken.add(suggested)
 		plan.append((path, suggested))
-		plan.extend(subtitle_renames(torrent, path, suggested))
+		plan.extend(subtitle_renames(torrent, path, suggested, subtitles))
 	return plan, collisions
 
 
@@ -1240,14 +1595,148 @@ def rename_result_text(files_done, folders_done, errors):
 	return get_text("FILES_RENAME_OK", rename_count_text(files_done, folders_done))
 
 
-def build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page):
+# Whether a file is downloaded and how eagerly are two separate things on
+# screen, though the manager keeps both in its priority: leaving a file out is
+# a switch, and the priority is only offered for the files downloaded.
+# Codes of the buttons in callback_data: "d" downloads what was left out
+# (with the normal priority) and "s" leaves it out
+FILE_PRIORITY_CODES = {FILE_SKIP: "s", FILE_LOW: "l", FILE_NORMAL: "n", FILE_HIGH: "h"}
+FILE_PRIORITY_BY_CODE = {code: priority for priority, code in FILE_PRIORITY_CODES.items()}
+FILE_WANT_CODE = "d"
+# Mark of a file in the file list, none for the normal ones
+FILE_PRIORITY_MARKS = {FILE_SKIP: "⏭️ ", FILE_LOW: "🔻 ", FILE_HIGH: "🔺 "}
+
+
+def file_priority(torrent, path):
+	return torrent.file_priorities.get(path, FILE_NORMAL)
+
+
+def priority_label(priority):
+	return get_text(f"PRIORITY_{priority.upper()}")
+
+
+def download_priorities():
+	"""Priorities a downloaded file can have, the ones offered as such"""
+	return [level for level in client.file_priority_levels if level != FILE_SKIP]
+
+
+def can_skip_files():
+	return FILE_SKIP in client.file_priority_levels
+
+
+def files_inside(torrent, folder):
+	"""Paths of every file under folder, at any depth"""
+	return [path for path, _, _ in torrent.files if is_inside(path, folder)]
+
+
+def priority_row(current, set_call):
+	"""One button per priority of a downloaded file, the current one marked.
+	set_call receives the code of the priority as its last argument. Empty
+	when the manager has a single one: there would be nothing to choose"""
+	levels = download_priorities()
+	if len(levels) < 2:
+		return []
+	return [InlineKeyboardButton(f"{'✅ ' if level == current else ''}{priority_label(level)}",
+								callback_data=f"{set_call}|{FILE_PRIORITY_CODES[level]}") for level in levels]
+
+
+def wanted_files_line(torrent, folder=""):
+	"""How much of the content is downloaded, only when some file is left out"""
+	paths = files_inside(torrent, folder)
+	inside = set(paths)
+	wanted = [(path, size) for path, size, _ in torrent.files if path in inside and file_priority(torrent, path) != FILE_SKIP]
+	if len(wanted) == len(paths):
+		return None
+	return get_text("FILES_WANTED", len(wanted), len(paths), sizeof_fmt(sum(size for _, size in wanted)))
+
+
+def file_download_lines(priority):
+	"""Whether a file is downloaded and, when it is, with which priority"""
+	if priority == FILE_SKIP:
+		return [get_text("FILE_SKIPPED")]
+	lines = [get_text("FILE_DOWNLOADED")]
+	if len(download_priorities()) > 1:
+		lines.append(get_text("FILE_PRIORITY", priority_label(priority)))
+	return lines
+
+
+def file_download_rows(priority, set_call):
+	"""The switch to download the file or leave it out, and the priority
+	while it is downloaded"""
+	rows = []
+	if priority == FILE_SKIP:
+		rows.append([InlineKeyboardButton(get_text("BUTTON_FILE_WANT"), callback_data=f"{set_call}|{FILE_WANT_CODE}")])
+		return rows
+	row = priority_row(priority, set_call)
+	if row:
+		rows.append(row)
+	if can_skip_files():
+		rows.append([InlineKeyboardButton(get_text("BUTTON_FILE_SKIP"), callback_data=f"{set_call}|{FILE_PRIORITY_CODES[FILE_SKIP]}")])
+	return rows
+
+
+def folder_download_change(torrent, folder, code):
+	"""(paths, priority) a button of the folder screen changes. Leaving out and
+	downloading only touch the files that need it, and a priority is only
+	given to the files downloaded: the ones left out stay so"""
+	paths = files_inside(torrent, folder)
+	skipped = [path for path in paths if file_priority(torrent, path) == FILE_SKIP]
+	wanted = [path for path in paths if file_priority(torrent, path) != FILE_SKIP]
+	if code == FILE_WANT_CODE:
+		return skipped, FILE_NORMAL
+	priority = FILE_PRIORITY_BY_CODE.get(code)
+	if priority == FILE_SKIP and can_skip_files():
+		return wanted, FILE_SKIP
+	if priority in download_priorities():
+		return [path for path in wanted if file_priority(torrent, path) != priority], priority
+	return [], None
+
+
+def build_folder_priority(torrent, folder, ctx_id, folder_index, file_page):
+	"""Which files under the folder are downloaded, and how eagerly"""
+	paths = files_inside(torrent, folder)
+	wanted = [path for path in paths if file_priority(torrent, path) != FILE_SKIP]
+	name = file_basename(folder) if folder else torrent.name
+	lines = [get_text("FOLDER_PRIORITY_TITLE", html.escape(name), len(paths)), ""]
+	lines.append(get_text("FOLDER_WANTED_COUNT", len(wanted), len(paths) - len(wanted)))
+	levels = {file_priority(torrent, path) for path in wanted}
+	if wanted and len(download_priorities()) > 1:
+		counts = [(level, sum(1 for path in wanted if file_priority(torrent, path) == level)) for level in download_priorities()]
+		lines.append(get_text("FOLDER_PRIORITY_NOW", " · ".join(
+			priority_label(level) if len(levels) == 1 else f"{priority_label(level)}: {count}" for level, count in counts if count)))
+		lines.append("")
+		lines.append(get_text("FOLDER_PRIORITY_HINT"))
+	if len(wanted) < len(paths) and client.skipped_files_in_size:
+		lines.append("")
+		lines.append(get_text("FOLDER_SKIPPED_IN_SIZE"))
+	set_call = build_call("folderPrio", ctx_id, folder_index, file_page)
+	markup = InlineKeyboardMarkup()
+	switches = []
+	if len(wanted) < len(paths):
+		switches.append(InlineKeyboardButton(get_text("BUTTON_FOLDER_WANT_ALL"), callback_data=f"{set_call}|{FILE_WANT_CODE}"))
+	if wanted and can_skip_files():
+		switches.append(InlineKeyboardButton(get_text("BUTTON_FOLDER_SKIP_ALL"), callback_data=f"{set_call}|{FILE_PRIORITY_CODES[FILE_SKIP]}"))
+	if switches:
+		markup.row(*switches)
+	if wanted:
+		row = priority_row(levels.pop() if len(levels) == 1 else None, set_call)
+		if row:
+			markup.row(*row)
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("files", ctx_id, folder_index, file_page)),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	return "\n".join(lines), markup
+
+
+def build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page, refreshing=False):
 	torrent = client.get_torrent(torrent_id)
 	if torrent is None:
 		return get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page))
 
 	folders = torrent_folders(torrent)
 	folder = get_torrent_folder(torrent, folder_index)
-	folder_index = folders.index(folder)
+	folder_index = folder_ref(folders, folders.index(folder))
 	subfolders, files = folder_entries(torrent, folder)
 	entries = [("folder", folders.index(f)) for f in subfolders] + [("file", i) for i in files]
 	total = len(entries)
@@ -1257,6 +1746,9 @@ def build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page):
 	location = "/" + folder[len(root):].lstrip("/") if root else "/" + folder
 	text = get_text("FILES_TITLE", html.escape(torrent.name), html.escape(location),
 					len(subfolders), len(files), file_page + 1, pages)
+	wanted_line = wanted_files_line(torrent, folder) if client.file_priority_levels else None
+	if wanted_line:
+		text += f"\n{wanted_line}"
 
 	markup = InlineKeyboardMarkup(row_width=1)
 	start = file_page * FILES_PER_PAGE
@@ -1264,13 +1756,20 @@ def build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page):
 		if kind == "folder":
 			markup.add(InlineKeyboardButton(
 				f"📁 {truncate(file_basename(folders[index]))}",
-				callback_data=build_call("files", ctx_id, index, 0)))
+				callback_data=build_call("files", ctx_id, folder_ref(folders, index), 0)))
 		else:
 			path = torrent.files[index][0]
 			icon = "🎬" if is_video_file(path) else ("💬" if is_subtitle_file(path) else "📄")
+			mark = FILE_PRIORITY_MARKS.get(file_priority(torrent, path), "") if client.file_priority_levels else ""
+			# Like the torrent list: the share only shows while there is some
+			# left, and not on a file left out, which is not going anywhere
+			_, size, completed = torrent.files[index]
+			share = file_progress(size, completed)
+			skipped = client.file_priority_levels and file_priority(torrent, path) == FILE_SKIP
+			progress = f" {share:.0f}%" if share < 100 and not skipped else ""
 			markup.add(InlineKeyboardButton(
-				f"{icon} {truncate(file_basename(path))}",
-				callback_data=build_call("file", ctx_id, folder_index, file_page, index)))
+				f"{mark}{icon}{progress} {truncate(file_basename(path))}",
+				callback_data=file_call("file", ctx_id, folder_index, file_page, index, path)))
 
 	if pages > 1:
 		markup.row(*pagination_row(file_page, pages, "files", ctx_id, folder_index))
@@ -1278,62 +1777,168 @@ def build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page):
 	if folder != root:
 		parent = file_folder(folder)
 		markup.row(InlineKeyboardButton(get_text("BUTTON_FOLDER_UP", truncate(file_basename(parent) or "/")),
-										callback_data=build_call("files", ctx_id, folders.index(parent), 0)))
-	if folder:
-		markup.row(InlineKeyboardButton(get_text("BUTTON_FOLDER_RENAME"), callback_data=build_call("folder", ctx_id, folder_index, file_page)))
-	files_plan, folders_plan, _ = build_full_plan(torrent, within=folder)
+										callback_data=build_call("files", ctx_id, folder_ref(folders, folders.index(parent)), 0)))
+	# What acts on the folder being browsed shares a row
+	folder_row = []
+	if client.file_priority_levels:
+		folder_row.append(InlineKeyboardButton(get_text("BUTTON_FOLDER_PRIORITY"), callback_data=build_call("folderPrio", ctx_id, folder_index, file_page)))
+	if folder and client.supports_rename:
+		folder_row.append(InlineKeyboardButton(get_text("BUTTON_FOLDER_RENAME"), callback_data=build_call("folder", ctx_id, folder_index, file_page)))
+	if folder_row:
+		markup.row(*folder_row)
+	files_plan, folders_plan, _ = build_full_plan(torrent, within=folder) if client.supports_rename else ([], [], [])
 	if files_plan or folders_plan:
 		markup.row(InlineKeyboardButton(get_text("BUTTON_FILES_RENAME_ALL"), callback_data=build_call("filesAll", ctx_id, folder_index, file_page)))
-	markup.row(
+	text += f"\n\n{live_footer(refreshing)}"
+	markup.row(*live_buttons(refreshing, build_call("files", ctx_id, folder_index, file_page),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("info", torrent_id, filter_key, page)),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
-	)
+	))
 	return text, markup
 
 
-def render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page):
+def render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page, thread_id=None):
+	"""The file list repaints itself for a while, like the torrent screen: it
+	shows how far each file has got"""
 	try:
-		text, markup = build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page)
+		text, markup = build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page, refreshing=True)
 	except TorrentClientError as e:
-		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
-		markup = back_close_markup(build_call("info", torrent_id, filter_key, page))
+		edit_message(chat_id, message_id, client_error_text(e),
+					back_close_markup(build_call("info", torrent_id, filter_key, page)))
+		return
 	edit_message(chat_id, message_id, text, markup)
+	start_live_view(chat_id, message_id, thread_id,
+		lambda refreshing: build_files(ctx_id, torrent_id, filter_key, page, folder_index, file_page, refreshing),
+		build_call("files", ctx_id, folder_index, file_page))
+
+
+def file_key(path):
+	"""Short hash of a file path. The buttons of a file carry it next to the
+	file's position, which a rename can hand over to another file"""
+	return hashlib.sha1(path.encode("utf-8")).hexdigest()[:6]
+
+
+def file_call(command, ctx_id, folder_index, file_page, file_index, path, *extra):
+	return build_call(command, ctx_id, folder_index, file_page, file_index, file_key(path), *extra)
 
 
 def get_torrent_file(torrent, file_index):
 	"""Returns (path, size) for the file index or None when out of range"""
 	try:
 		path, size, _ = torrent.files[int(file_index)]
-	except (IndexError, ValueError):
+	except (IndexError, TypeError, ValueError):
 		return None
 	return path, size
 
 
-def build_file_detail(torrent, path, size, ctx_id, folder_index, file_page, file_index):
+def resolve_file(torrent, file_index, key=None):
+	"""(index, path, size) of the file a button points at, or None when it is
+	no longer in the torrent. The position alone is not trusted: renaming a
+	file reorders the list, and the same position then names another file,
+	which the skip button would have left out. key is None on buttons from
+	before the hash, which only carried the position"""
+	if torrent is None:
+		return None
+	entry = get_torrent_file(torrent, file_index)
+	if key is None:
+		return (int(file_index),) + entry if entry else None
+	if entry and file_key(entry[0]) == key:
+		return (int(file_index),) + entry
+	for index, (path, size, _) in enumerate(torrent.files):
+		if file_key(path) == key:
+			return index, path, size
+	return None
+
+
+def renamed_file_call(ctx_id, folder_index, file_page, torrent_id, old_path, new_name):
+	"""Where the back button of a file rename goes: the file under its new
+	name, or the file list when it cannot be found"""
+	folder = file_folder(old_path)
+	new_path = f"{folder}/{new_name}" if folder else new_name
+	try:
+		torrent = client.get_torrent(torrent_id)
+	except TorrentClientError:
+		torrent = None
+	for index, (path, _, _) in enumerate(torrent.files if torrent else []):
+		if path in (new_path, old_path):
+			return file_call("file", ctx_id, folder_index, file_page, index, path)
+	return build_call("files", ctx_id, folder_index, file_page)
+
+
+def file_progress(size, completed):
+	"""Share of a file already on disk, 0-100"""
+	if size <= 0:
+		return 100.0
+	return min(100.0, max(0.0, completed / size * 100))
+
+
+def file_completed(torrent, path):
+	return next((completed for p, _, completed in torrent.files if p == path), 0) or 0
+
+
+def build_file_detail(torrent, path, size, ctx_id, folder_index, file_page, file_index, refreshing=False):
 	lines = [f"<b>{html.escape(file_basename(path))}</b>", ""]
 	folder = file_folder(path)
 	if folder:
 		lines.append(f"{get_text('INFO_DIR')}: <code>{html.escape(folder)}</code>")
 	lines.append(f"{get_text('INFO_SIZE')}: {sizeof_fmt(size)}")
+	completed = file_completed(torrent, path)
+	lines.append(get_text("FILE_PROGRESS", f"{file_progress(size, completed):.1f}", sizeof_fmt(completed), sizeof_fmt(size)))
 
 	markup = InlineKeyboardMarkup(row_width=1)
-	suggested = suggest_for_file(torrent, path)
+	if client.file_priority_levels:
+		priority = file_priority(torrent, path)
+		lines.extend(file_download_lines(priority))
+		for row in file_download_rows(priority, file_call("filePrio", ctx_id, folder_index, file_page, file_index, path)):
+			markup.row(*row)
+	suggested = suggest_for_file(torrent, path) if client.supports_rename else None
 	if suggested:
 		lines.append("")
 		lines.append(get_text("FILE_SUGGEST", html.escape(suggested)))
 		subtitles = subtitle_renames(torrent, path, suggested)
 		if subtitles:
 			lines.append(get_text("FILE_SUBTITLES", len(subtitles)))
-		markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_AUTO"), callback_data=build_call("fileAuto", ctx_id, folder_index, file_page, file_index)))
-	elif is_video_file(path):
+		markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_AUTO"), callback_data=file_call("fileAuto", ctx_id, folder_index, file_page, file_index, path)))
+	elif is_video_file(path) and client.supports_rename:
+		# One line: the screen is also where the download of the file is chosen
 		lines.append("")
-		lines.append(get_text("FILE_NO_SUGGESTION"))
-	markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_MANUAL"), callback_data=build_call("fileManual", ctx_id, folder_index, file_page, file_index)))
-	markup.row(
+		lines.append(get_text("FILE_NO_SUGGESTION_SHORT"))
+	if client.supports_rename:
+		markup.add(InlineKeyboardButton(get_text("BUTTON_RENAME_MANUAL"), callback_data=file_call("fileManual", ctx_id, folder_index, file_page, file_index, path)))
+	lines.append("")
+	lines.append(live_footer(refreshing))
+	markup.row(*live_buttons(refreshing, file_call("file", ctx_id, folder_index, file_page, file_index, path),
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("files", ctx_id, folder_index, file_page)),
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
-	)
+	))
 	return "\n".join(lines), markup
+
+
+def build_file_screen(torrent_id, ctx_id, folder_index, file_page, file_index, refreshing=False, key=None):
+	"""The file screen read again from the manager. It follows the file if
+	another rename moved it in the list, and a file that is gone (the torrent
+	removed, or the file renamed meanwhile) ends the repainting"""
+	torrent = client.get_torrent(torrent_id)
+	back = back_close_markup(build_call("files", ctx_id, folder_index, file_page))
+	if torrent is None:
+		raise ExpiredContext((get_text("TORRENT_NOT_FOUND"), back_close_markup()))
+	resolved = resolve_file(torrent, file_index, key)
+	if resolved is None:
+		raise ExpiredContext((get_text("FILE_NOT_FOUND"), back))
+	index, path, size = resolved
+	return build_file_detail(torrent, path, size, ctx_id, folder_index, file_page, index, refreshing)
+
+
+def render_file_detail(chat_id, message_id, thread_id, torrent, resolved, ctx_id, folder_index, file_page):
+	"""Paints the file screen of resolved (index, path, size) and keeps it
+	repainting itself for a while"""
+	index, path, size = resolved
+	text, markup = build_file_detail(torrent, path, size, ctx_id, folder_index, file_page, index, refreshing=True)
+	edit_message(chat_id, message_id, text, markup)
+	key = file_key(path)
+	start_live_view(chat_id, message_id, thread_id,
+		lambda refreshing: build_file_screen(torrent.id, ctx_id, folder_index, file_page, index, refreshing, key=key),
+		file_call("file", ctx_id, folder_index, file_page, index, path))
 
 
 def build_folder_detail(torrent, folder, ctx_id, folder_index, file_page):
@@ -1363,7 +1968,7 @@ def folder_rename_back_call(torrent, ctx_id, folder):
 	and its index does not move either: every other folder is inside it"""
 	folders = torrent_folders(torrent)
 	target = folder if folder == torrent_root(torrent) else file_folder(folder)
-	return build_call("files", ctx_id, folders.index(target), 0)
+	return build_call("files", ctx_id, folder_ref(folders, folders.index(target)), 0)
 
 
 def rename_folder_to(torrent, folder, new_name):
@@ -1745,9 +2350,19 @@ def set_tracker_rule(tracker, field, value):
 	"""Changes one value of the rule and applies it to the torrents the tracker
 	already has. Returns how many got it"""
 	rule = tracker_limits.set_field(tracker, field, value)
-	torrents = client.get_torrents()
-	ids = tracker_rule_torrent_ids(tracker, torrents)
-	apply_rule_fields(ids, rule, [field])
+	try:
+		torrents = client.get_torrents()
+		ids = tracker_rule_torrent_ids(tracker, torrents)
+		apply_rule_fields(ids, rule, [field])
+	except TorrentClientError:
+		# The rule is saved but its torrents may not have the new value, and
+		# they are marked as having the rule already, so the monitor would
+		# never give it to them. The change itself is left for the monitor to
+		# finish, that field only: the rest of the rule, and the limits set by
+		# hand on some of them, stay as they are
+		with _rule_retries_lock:
+			_rule_retries.setdefault(tracker, set()).add(field)
+		raise
 	tracker_limits.mark_applied(ids, tracker)
 	# A fresh and whole list of the manager: the moment to forget torrents that are gone
 	tracker_limits.prune(t.id for t in torrents)
@@ -1769,10 +2384,57 @@ def delete_tracker_rule(tracker, restore):
 	return restored
 
 
+# Rule changes the manager failed to apply: tracker -> fields. The monitor
+# applies them on its next poll, as the change would have
+_rule_retries = {}
+_rule_retries_lock = threading.Lock()
+
+
+def keep_hand_limit(torrent_id, fields):
+	"""A limit set by hand on one torrent is its own. A torrent the rule of its
+	tracker had not reached yet (it arrived after the last poll) gets the rest
+	of the rule now and is marked as having it: the monitor would otherwise put
+	the rule over the hand-set fields, and marking it without the rest would
+	leave it without the rule's other limits for good"""
+	if not tracker_limits_supported():
+		return
+	try:
+		torrent = client.get_torrent(torrent_id)
+		current = tracker_limits.rules()
+		tracker = tracker_limits.rule_tracker(torrent.trackers, current) if torrent else None
+		if not tracker or tracker_limits.applied_tracker(torrent_id) == tracker:
+			return
+		others = [f for f in tracker_limits.non_default_fields(current[tracker]) if f not in fields]
+		apply_rule_fields([str(torrent_id)], current[tracker], others)
+	except TorrentClientError as e:
+		warning(f"Cannot give {torrent_id} the rest of the limits of its tracker: {e}")
+		return
+	tracker_limits.mark_applied([torrent_id], tracker)
+
+
+def retry_failed_rule_changes(torrents):
+	"""The rule changes that failed, applied as they would have been: the
+	field changed, to every torrent that follows the rule"""
+	with _rule_retries_lock:
+		retries = dict(_rule_retries)
+	for tracker, fields in retries.items():
+		rule = tracker_limits.get_rule(tracker)
+		try:
+			if rule:
+				apply_rule_fields(tracker_rule_torrent_ids(tracker, torrents), rule, sorted(fields))
+		except TorrentClientError as e:
+			warning(f"Cannot apply the changed limits of the tracker {tracker} yet: {e}")
+			continue
+		with _rule_retries_lock:
+			if _rule_retries.get(tracker) == fields:
+				del _rule_retries[tracker]
+
+
 def apply_pending_tracker_limits(torrents):
 	"""Gives the rule of their tracker to the torrents that did not get it yet:
 	new ones, the ones added while the bot was down, and the ones whose tracker
 	the manager did not know yet (a magnet before its first announce)"""
+	retry_failed_rule_changes(torrents)
 	for tracker, ids in tracker_limits.pending(torrents):
 		rule = tracker_limits.get_rule(tracker)
 		fields = tracker_limits.non_default_fields(rule)
@@ -1865,15 +2527,23 @@ def build_tracker_rule_pick():
 	return text, settings_nav(markup, back=settings_call("tlimits"))
 
 
-def build_settings_tracker_limits():
+def build_settings_tracker_limits(page=0):
+	"""The rules, a page at a time: Telegram refuses a keyboard of more than
+	100 buttons, and every rule is one"""
 	current = tracker_limits.rules()
+	trackers = sorted(current)
+	pages = max(1, math.ceil(len(trackers) / TRACKER_RULES_PER_PAGE))
+	page = max(0, min(int(page), pages - 1))
 	lines = [get_text("SETTINGS_TRACKER_LIMITS_TITLE"), "", get_text("SETTINGS_TRACKER_LIMITS_HELP")]
 	if not current:
 		lines += ["", get_text("TRACKER_LIMITS_EMPTY")]
 	markup = InlineKeyboardMarkup(row_width=1)
-	for tracker in sorted(current):
+	start = page * TRACKER_RULES_PER_PAGE
+	for tracker in trackers[start:start + TRACKER_RULES_PER_PAGE]:
 		markup.add(InlineKeyboardButton(f"🌐 {truncate(tracker, 28)} · {tracker_rule_summary(current[tracker])}",
 										callback_data=build_call("tlRule", tracker_limits.tracker_key(tracker))))
+	if pages > 1:
+		markup.row(*pagination_row(page, pages, "tlPage"))
 	markup.add(InlineKeyboardButton(get_text("BUTTON_TRACKER_LIMITS_ADD"), callback_data=build_call("tlAdd")))
 	return "\n".join(lines), settings_nav(markup, back=settings_call("limits"))
 
@@ -1957,18 +2627,31 @@ def series_candidates(name, exclude_id=None, current_dir=None):
 	for torrent in torrents:
 		if str(torrent.id) == str(exclude_id) or not torrent.download_dir:
 			continue
-		try:
-			added = torrent.added_date.timestamp() if torrent.added_date else 0
-		except (AttributeError, OverflowError, OSError, ValueError):
-			added = 0
-		others.append((torrent.name, torrent.download_dir, added))
+		others.append((torrent.name, torrent.download_dir, added_timestamp(torrent.added_date)))
 	generic = [bot_settings.get("auto_download_dir")]
 	try:
 		generic.append(client.get_default_download_dir())
 	except TorrentClientError:
 		pass
-	return series_dir_candidates(name, others, known_dirs=bot_settings.get("favorite_dirs") or [],
-								current_dir=current_dir, generic_dirs=generic)
+	try:
+		return series_dir_candidates(name, others, known_dirs=bot_settings.get("favorite_dirs") or [],
+									current_dir=current_dir, generic_dirs=generic)
+	except Exception as e:
+		# A folder name the parser chokes on must not take the add, move or
+		# series screens down with it: nothing is suggested instead
+		warning(f"Cannot work out the series folder of {name}: {e}")
+		return []
+
+
+def added_timestamp(added_date):
+	"""When a torrent was added as a unix number, 0 when unknown. Every
+	manager reports a unix number; a datetime is taken too"""
+	if not added_date:
+		return 0
+	try:
+		return added_date.timestamp() if hasattr(added_date, "timestamp") else float(added_date)
+	except (OverflowError, OSError, TypeError, ValueError):
+		return 0
 
 
 def series_dirs(name, exclude_id=None, current_dir=None):
@@ -2324,7 +3007,7 @@ def render_settings(chat_id, message_id, screen="main"):
 	try:
 		text, markup = build_settings(screen)
 	except TorrentClientError as e:
-		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		text = client_error_text(e)
 		markup = back_close_markup()
 	edit_message(chat_id, message_id, text, markup)
 
@@ -2334,7 +3017,7 @@ def send_settings_menu(chat_id, thread_id=None, prefix=None, screen="main"):
 	try:
 		text, markup = build_settings(screen)
 	except TorrentClientError as e:
-		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		text = client_error_text(e)
 		markup = back_close_markup()
 	if prefix:
 		text = f"{prefix}\n\n{text}"
@@ -2635,6 +3318,10 @@ def name_already_exists(name, exclude_id=None):
 	return False
 
 
+# Held from checking that a name is free until the torrent has it
+_rename_lock = threading.Lock()
+
+
 def auto_rename_enabled():
 	"""Auto-rename needs both the setting and a client able to rename"""
 	return client.supports_rename and bool(bot_settings.get("auto_rename"))
@@ -2648,10 +3335,13 @@ def auto_rename_torrent(torrent):
 	suggested = parse_name(torrent.name)
 	if not suggested or suggested == torrent.name:
 		return None, None
-	if name_already_exists(suggested, exclude_id=torrent.id):
-		warning(f"Auto-rename skipped for {torrent.name}: a torrent named '{suggested}' already exists")
-		return None, suggested
-	client.rename_torrent(torrent.id, suggested)
+	# The check and the rename go together: two renames at once (two magnets
+	# getting their metadata in the same poll) would both find the name free
+	with _rename_lock:
+		if name_already_exists(suggested, exclude_id=torrent.id):
+			warning(f"Auto-rename skipped for {torrent.name}: a torrent named '{suggested}' already exists")
+			return None, suggested
+		client.rename_torrent(torrent.id, suggested)
 	count_usage("auto_rename")
 	return suggested, None
 
@@ -2784,28 +3474,51 @@ def replace_targets(torrent):
 		return None, []
 	if torrent is None or not torrent.files:
 		return None, []
+	# A torrent that leaves files out is not a whole copy of anything: done
+	# with a few episodes of a pack, it would delete the complete one before it
+	if any(priority == FILE_SKIP for priority in torrent.file_priorities.values()):
+		return None, []
 	own = torrent_paths(torrent)
-	previous = [t for t in holders if t is not None and t.files and not torrent_paths(t) & own]
+	videos = video_count(torrent)
+	# Nor does it replace one with more videos than it brings, whatever the
+	# names say: that is another release that only looks the same to the parser
+	previous = [t for t in holders if t is not None and t.files and not torrent_paths(t) & own and video_count(t) <= videos]
 	return (suggested, previous) if previous else (None, [])
 
 
+def video_count(torrent):
+	"""Videos the torrent downloads, its sample clips and the files left out
+	not counted"""
+	return sum(1 for path, _, _ in torrent.files
+			if is_video_file(path) and not is_sample_file(path) and torrent.file_priorities.get(path) != FILE_SKIP)
+
+
 def wait_until_removed(torrent_ids):
+	"""Waits a while for the manager to drop the torrents. Only a wait: the
+	data is already being deleted, so a manager that does not answer here
+	must not stop what comes after (the notice, the rename)"""
 	for _ in range(REPLACE_WAIT_ATTEMPTS):
-		if all(client.get_torrent(torrent_id) is None for torrent_id in torrent_ids):
-			return
+		try:
+			if all(client.get_torrent(torrent_id) is None for torrent_id in torrent_ids):
+				return
+		except TorrentClientError as e:
+			debug(f"Still waiting for the removal of {', '.join(torrent_ids)}: {e}")
 		time.sleep(REPLACE_WAIT_DELAY)
 
 
-def replace_previous(torrent_id):
+def replace_previous(torrent_id, only=None):
 	"""Deletes, with their data, the torrents that have the name torrent_id
 	should take, and renames it to that name (its subfolders and files too
 	when the automatic rename includes them). The manager deletes in the
 	background and the old files can still be on disk when the rename runs,
-	so the rename is retried for a while.
+	so the rename is retried for a while. only, when given, are the ids a
+	confirmation listed: nothing else is deleted, whatever has turned up since.
 	Returns the text telling what was done"""
 	try:
 		torrent = client.get_torrent(torrent_id)
 		suggested, previous = replace_targets(torrent) if torrent else (None, [])
+		if only is not None:
+			previous = [t for t in previous if str(t.id) in only]
 		if not previous:
 			return get_text("REPLACE_NOTHING")
 		# The name is the one the new torrent takes, so where and how big tell them apart
@@ -2839,6 +3552,30 @@ def replace_previous(torrent_id):
 				return "\n".join(lines)
 			time.sleep(REPLACE_WAIT_DELAY)
 	return "\n".join(lines)
+
+
+def show_replace(chat_id, message_id, torrent_id, confirm):
+	"""The replace confirmation listing what would be deleted (confirm), or the
+	completion notice with its offer again. The confirm button carries exactly
+	the torrents listed: what turns up afterwards is never deleted with them"""
+	torrent = client.get_torrent(torrent_id)
+	if torrent is None:
+		edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), close_markup())
+		return
+	suggested, previous = replace_targets(torrent)
+	completed = get_text("NOTIFY_COMPLETED", html.escape(torrent.name))
+	if not previous:
+		edit_message(chat_id, message_id, f"{completed}\n\n{get_text('REPLACE_NOTHING')}")
+	elif not confirm:
+		edit_message(chat_id, message_id, *replace_offer(torrent, suggested))
+	else:
+		items = "\n".join(get_text("REPLACE_ITEM", html.escape(t.name), html.escape(t.download_dir or ""), sizeof_fmt(t.total_size))
+						for t in previous)
+		replace_ctx = new_action_context("r", torrent_id=str(torrent.id), previous=[str(t.id) for t in previous])
+		markup = InlineKeyboardMarkup(row_width=1)
+		markup.add(InlineKeyboardButton(get_text("BUTTON_REPLACE_CONFIRM"), callback_data=build_call("replaceOk", replace_ctx)))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("replaceNo", torrent.id)))
+		edit_message(chat_id, message_id, get_text("REPLACE_CONFIRM", items, html.escape(torrent.name), html.escape(suggested)), markup)
 
 
 def replace_offer(torrent, suggested):
@@ -2912,10 +3649,13 @@ def add_torrent_from_bot(late_add=None, **kwargs):
 					del registry[key]
 		try:
 			torrent = client.add_torrent(**kwargs)
+		except PermanentTorrentError:
+			raise  # Refused for good (or there already): nothing can land late
 		except TorrentClientError:
-			info_hash = expected_info_hash(kwargs.get("magnet"), kwargs.get("torrent_data"))
-			if late_add is not None and info_hash:
-				_late_adds[info_hash] = dict(late_add, ts=now)
+			if late_add is not None:
+				# Every id it can get: a v2 torrent is known by two
+				for info_hash in expected_torrent_ids(kwargs.get("magnet"), kwargs.get("torrent_data")):
+					_late_adds[info_hash] = dict(late_add, ts=now)
 			raise
 		_bot_added_ids[str(torrent.id)] = now
 	return torrent
@@ -3012,16 +3752,40 @@ def handle_late_add(torrent_id, late_add):
 	notify(f"{get_text('ADD_LATE')}\n\n{text}", context["chat_id"], context["thread_id"], reply_markup=markup)
 
 
+def add_error_text(error):
+	"""What a failed add says. A torrent that was already in the manager is
+	named, so it can be found, instead of looking like a broken file"""
+	if isinstance(error, DuplicateTorrentError):
+		existing = None
+		if error.torrent_id:
+			try:
+				existing = client.get_torrent(error.torrent_id)
+			except TorrentClientError:
+				pass
+		return get_text("ADD_DUPLICATE", html.escape(existing.name if existing else str(error.torrent_id or "?")))
+	if isinstance(error, RestartRequiredError):
+		return client_error_text(error)
+	return get_text("ADD_ERROR", html.escape(str(error)))
+
+
 def do_add_torrent(chat_id, message_id, pending_id, download_dir, thread_id=None, category=None):
 	pending = pop_pending_torrent(pending_id)
 	if pending is None:
 		edit_message(chat_id, message_id, get_text("ADD_EXPIRED"))
 		return
+	with _contexts_lock:
+		_adding.add(pending_id)
 	try:
-		text, _markup = perform_add_torrent(pending, download_dir, chat_id, thread_id, category)
-	except TorrentClientError as e:
-		text = get_text("ADD_ERROR", html.escape(str(e)))
-	edit_message(chat_id, message_id, text)
+		# The folder buttons (and cancel) go away while the manager takes it
+		edit_message(chat_id, message_id, "⏳")
+		try:
+			text, _markup = perform_add_torrent(pending, download_dir, chat_id, thread_id, category)
+		except TorrentClientError as e:
+			text = add_error_text(e)
+		edit_message(chat_id, message_id, text)
+	finally:
+		with _contexts_lock:
+			_adding.discard(pending_id)
 
 
 def start_add_flow(chat_id, name, magnet=None, data=None, thread_id=None):
@@ -3036,7 +3800,7 @@ def start_add_flow(chat_id, name, magnet=None, data=None, thread_id=None):
 			text, markup = perform_add_torrent({"name": name, "magnet": magnet, "data": data},
 									download_dir, chat_id, thread_id, category, automatic=True)
 		except TorrentClientError as e:
-			text, markup = get_text("ADD_ERROR", html.escape(str(e))), None
+			text, markup = add_error_text(e), None
 		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 		return
 	pending_id = new_pending_torrent(name, magnet=magnet, data=data)
@@ -3057,18 +3821,86 @@ def extract_magnet_name(magnet):
 	return "magnet"
 
 
+class MagnetRedirect(Exception):
+	"""A torrent link that leads to a magnet (indexers that only have the
+	magnet answer their download link with a redirect to it)"""
+
+	def __init__(self, magnet):
+		super().__init__(magnet)
+		self.magnet = magnet
+
+
 def download_torrent_from_url(url):
 	"""Downloads a .torrent from a URL with size/time limits and validates
-	the content is bencoded torrent metadata. Returns (data, name) or
-	raises ValueError if the content is not a torrent"""
+	the content is bencoded torrent metadata. Returns (data, name), raises
+	MagnetRedirect when the link leads to a magnet, or ValueError if the
+	content is not a torrent. It never takes longer than URL_DOWNLOAD_DEADLINE:
+	the read timeout alone lets a server that sends a byte now and then keep a
+	handler (there are only two) busy for hours"""
+	outcome = {}
+	cancelled = threading.Event()
+
+	def worker():
+		try:
+			outcome["value"] = _download_torrent(url, cancelled, outcome)
+		except BaseException as e:
+			outcome["error"] = e
+
+	thread = threading.Thread(target=worker, daemon=True)
+	thread.start()
+	thread.join(URL_DOWNLOAD_DEADLINE)
+	if thread.is_alive():
+		cancelled.set()  # The worker stops at its next chunk...
+		_abort_response(outcome.get("response"))  # ...or now, if it is waiting on the server
+		raise ValueError(f"the download took more than {URL_DOWNLOAD_DEADLINE} s")
+	if "error" in outcome:
+		raise outcome["error"]
+	return outcome["value"]
+
+
+def _abort_response(response):
+	"""Cuts the connection of a download from another thread: closing alone
+	does not wake a read blocked on the socket, shutting it down does"""
+	if response is None:
+		return
+	try:
+		sock = getattr(getattr(response.raw, "_connection", None), "sock", None)
+		if sock is not None:
+			sock.shutdown(socket.SHUT_RDWR)
+	except Exception:
+		pass
+	try:
+		response.close()
+	except Exception:
+		pass
+
+
+def _download_torrent(url, cancelled, holder=None):
+	headers = {"User-Agent": f"torrent-controller-bot/{VERSION}"}
+	# Redirects are followed by hand: requests would follow one to a magnet
+	# and fail with InvalidSchema, a ValueError, told as "not a torrent"
+	for _ in range(URL_MAX_REDIRECTS + 1):
+		response = requests.get(url, stream=True, timeout=URL_DOWNLOAD_TIMEOUT, headers=headers, allow_redirects=False)
+		if holder is not None:
+			holder["response"] = response
+		if not response.is_redirect:
+			break
+		location = (response.headers.get("Location") or "").strip()
+		response.close()
+		if location.lower().startswith("magnet:"):
+			raise MagnetRedirect(location)
+		url = urljoin(url, location)
+	else:
+		raise ValueError("too many redirects")
 	data = b""
-	response = requests.get(url, stream=True, timeout=URL_DOWNLOAD_TIMEOUT, headers={"User-Agent": f"torrent-controller-bot/{VERSION}"})
 	try:
 		response.raise_for_status()
 		length = response.headers.get("Content-Length")
 		if length and int(length) > URL_DOWNLOAD_MAX_BYTES:
 			raise ValueError("too big")
-		for chunk in response.iter_content(chunk_size=64 * 1024):
+		for chunk in response.iter_content(chunk_size=16 * 1024):
+			if cancelled.is_set():
+				raise ValueError("cancelled")
 			data += chunk
 			if len(data) > URL_DOWNLOAD_MAX_BYTES:
 				raise ValueError("too big")
@@ -3101,10 +3933,18 @@ def _bencode_end(data, start):
 	if kind in (b"l", b"d"):
 		position = start + 1
 		while data[position:position + 1] != b"e":
-			position = _bencode_end(data, position)
+			following = _bencode_end(data, position)
+			if following <= position:
+				raise ValueError(f"no progress at {position}")
+			position = following
 		return position + 1
 	colon = data.index(b":", start)
-	return colon + 1 + int(data[start:colon])
+	length = int(data[start:colon])
+	# A negative length would point backwards and the caller would loop on
+	# the same value forever (while holding the add lock)
+	if length < 0:
+		raise ValueError(f"negative string length at {start}")
+	return colon + 1 + length
 
 
 def torrent_data_hash(data):
@@ -3119,6 +3959,8 @@ def torrent_data_hash(data):
 			value_end = _bencode_end(data, key_end)
 			if key == b"info":
 				return hashlib.sha1(data[key_end:value_end]).hexdigest()
+			if value_end <= position:
+				return None  # Malformed: it would never move on
 			position = value_end
 	except (ValueError, IndexError, RecursionError):
 		return None
@@ -3157,7 +3999,7 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 		edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
 		return
 	except TorrentClientError as e:
-		edit_message(chat_id, message_id, get_text("CONNECTION_ERROR", html.escape(str(e))), back_close_markup())
+		edit_message(chat_id, message_id, client_error_text(e), back_close_markup())
 		return
 
 	count = len(torrents)
@@ -3166,26 +4008,30 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 		edit_message(chat_id, message_id, get_text("LIST_EMPTY"), back_close_markup(back_call))
 		return
 
+	# The buttons carry what was counted here, not the filter: a filter is
+	# read again when pressed, and by then it can hold other torrents (the
+	# ones downloading now, a search a new torrent matches...)
+	mass_ctx = new_action_context("m", filter_key=filter_key, ids=[str(t.id) for t in torrents])
 	markup = InlineKeyboardMarkup(row_width=1)
 	if action == "resume":
 		text = get_text("MASS_CONFIRM_RESUME", count)
-		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "resume", filter_key, "-")))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "resume", mass_ctx, "-")))
 	elif action == "pause":
 		text = get_text("MASS_CONFIRM_PAUSE", count)
-		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "pause", filter_key, "-")))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "pause", mass_ctx, "-")))
 	elif action == "delete":
 		text = get_text("MASS_CONFIRM_DELETE", count)
-		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "0")))
-		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmMass", "delete", filter_key, "1")))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmMass", "delete", mass_ctx, "0")))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_WITH_DATA"), callback_data=build_call("confirmMass", "delete", mass_ctx, "1")))
 	elif action == "ratio":
-		text, markup = build_mass_limits(filter_key, count)
+		text, markup = build_mass_limits(mass_ctx, filter_key, count)
 		edit_message(chat_id, message_id, text, markup)
 		return
 	elif action == "move":
 		text = get_text("MASS_MOVE_ASK_DIR", count)
 		markup = build_dir_markup(
-			dir_call=lambda dir_id: build_call("massMoveDir", filter_key, dir_id),
-			write_call=build_call("massMoveNew", filter_key),
+			dir_call=lambda dir_id: build_call("massMoveDir", mass_ctx, dir_id),
+			write_call=build_call("massMoveNew", mass_ctx),
 			cancel_call=back_call,
 			page_parts=("mass", "move", filter_key),
 			page=dir_page,
@@ -3197,21 +4043,43 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 	edit_message(chat_id, message_id, text, markup)
 
 
-def build_mass_limits(filter_key, count, done=None):
-	"""The limits of every torrent of a filter or search: nothing is marked,
+def mass_targets(mass_ctx):
+	"""(filter key, ids) a mass confirmation counted, keeping only the torrents
+	still in the manager, or None when the confirmation is not known (expired,
+	the bot restarted, or a button from before the confirmations kept them)"""
+	ctx = get_action_context(mass_ctx, "m")
+	if ctx is None:
+		return None
+	present = {str(t.id) for t in client.get_torrents()}
+	return ctx["filter_key"], [torrent_id for torrent_id in ctx["ids"] if torrent_id in present]
+
+
+def resume_old_mass_button(chat_id, message_id, action, key):
+	"""A mass button that does not carry a known confirmation: an expired one
+	says so, and one from an older version (it carries the filter itself) shows
+	the confirmation again, counted now, instead of acting on whatever the
+	filter holds at this moment"""
+	if key.startswith("m"):
+		edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
+	else:
+		render_mass_confirm(chat_id, message_id, action, key)
+
+
+def build_mass_limits(mass_ctx, filter_key, count, done=None):
+	"""The limits of every torrent a confirmation counted: nothing is marked,
 	since each one may have its own, and every choice stays on the screen"""
 	lines = [done, ""] if done else []
 	lines.append(get_text("MASS_LIMITS_TITLE", count))
 	markup = InlineKeyboardMarkup()
 	if client.supports_ratio_limit:
 		lines += ["", get_text("MASS_RATIO_HINT")]
-		for row in ratio_option_rows(-1, "", lambda value: build_call("confirmMass", "ratio", filter_key, value),
-									build_call("massRatioAsk", filter_key), with_global=True):
+		for row in ratio_option_rows(-1, "", lambda value: build_call("confirmMass", "ratio", mass_ctx, value),
+									build_call("massRatioAsk", mass_ctx), with_global=True):
 			markup.row(*row)
 	if client.supports_torrent_speed_limit:
 		markup.row(
-			InlineKeyboardButton(get_text("BUTTON_TORRENT_DOWN_LIMIT"), callback_data=build_call("massSpeedAsk", filter_key, "down")),
-			InlineKeyboardButton(get_text("BUTTON_TORRENT_UP_LIMIT"), callback_data=build_call("massSpeedAsk", filter_key, "up")),
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_DOWN_LIMIT"), callback_data=build_call("massSpeedAsk", mass_ctx, "down")),
+			InlineKeyboardButton(get_text("BUTTON_TORRENT_UP_LIMIT"), callback_data=build_call("massSpeedAsk", mass_ctx, "up")),
 		)
 	markup.row(
 		InlineKeyboardButton(get_text("BUTTON_BACK"), callback_data=build_call("list", filter_key, 0)),
@@ -3226,19 +4094,24 @@ def mass_ratio_label(limit):
 	return f"{limit:g}" if limit >= 0 else get_text("NO_LIMIT")
 
 
-def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
+def do_mass_action(chat_id, message_id, action, mass_ctx, extra=None):
+	"""Runs a confirmed mass action on the torrents its confirmation counted
+	that are still there, never on what the filter holds now"""
 	try:
-		torrents = get_filtered_torrents(filter_key)
-	except ExpiredContext:
-		edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
-		return
+		targets = mass_targets(mass_ctx)
 	except TorrentClientError as e:
-		edit_message(chat_id, message_id, get_text("CONNECTION_ERROR", html.escape(str(e))), back_close_markup())
+		edit_message(chat_id, message_id, client_error_text(e), back_close_markup())
 		return
-
-	ids = [t.id for t in torrents]
+	if targets is None:
+		resume_old_mass_button(chat_id, message_id, "ratio" if action == "speed" else action, mass_ctx)
+		return
+	filter_key, ids = targets
 	count = len(ids)
 	back_call = build_call("list", filter_key, 0)
+	if not ids:
+		# Never an empty id list to the manager: some read it as every torrent
+		edit_message(chat_id, message_id, get_text("MASS_GONE"), back_close_markup(back_call))
+		return
 	try:
 		if action == "resume":
 			client.resume_torrents(ids)
@@ -3251,7 +4124,7 @@ def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
 			if limit is None and extra != "g":
 				return
 			client.set_ratio_limit(ids, limit)
-			text, markup = build_mass_limits(filter_key, count, done=get_text("MASS_DONE_RATIO", count, mass_ratio_label(limit)))
+			text, markup = build_mass_limits(mass_ctx, filter_key, count, done=get_text("MASS_DONE_RATIO", count, mass_ratio_label(limit)))
 			edit_message(chat_id, message_id, text, markup)
 			return
 		elif action == "speed":
@@ -3260,7 +4133,7 @@ def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
 				return
 			client.set_torrent_speed_limit(ids, direction, int(kbps))
 			done = get_text("MASS_DONE_DOWN" if direction == "down" else "MASS_DONE_UP", count, speed_limit_text(int(kbps)))
-			text, markup = build_mass_limits(filter_key, count, done=done)
+			text, markup = build_mass_limits(mass_ctx, filter_key, count, done=done)
 			edit_message(chat_id, message_id, text, markup)
 			return
 		elif action == "delete":
@@ -3275,7 +4148,7 @@ def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
 		else:
 			return
 	except TorrentClientError as e:
-		text = get_text("ERROR_GENERIC", html.escape(str(e)))
+		text = client_error_text(e)
 	edit_message(chat_id, message_id, text, back_close_markup(back_call))
 
 
@@ -3283,14 +4156,36 @@ def do_mass_action(chat_id, message_id, action, filter_key, extra=None):
 # PENDING TEXT INPUTS
 # ---------------------------------------------------------------------------
 
-def set_pending_input(chat_id, user_id, action, **extra):
+def set_pending_input(chat_id, user_id, action, thread_id=None, **extra):
 	with _contexts_lock:
-		pending_inputs[(chat_id, user_id)] = {"action": action, **extra}
+		pending_inputs[(chat_id, user_id)] = {"action": action, "ts": time.time(), "thread": normalize_thread(thread_id), **extra}
 
 
-def pop_pending_input(chat_id, user_id):
+def pop_pending_input(chat_id, user_id, thread_id=None, any_thread=False):
+	"""The question the bot asked this user in this chat and is waiting an
+	answer for, taken out. None when there is none, when it is older than
+	INPUT_TTL (an answer that never came is not waited for forever: the next
+	text could be anything), or when it was asked in another topic (the
+	question stays for that one). any_thread takes it wherever it was asked"""
 	with _contexts_lock:
-		return pending_inputs.pop((chat_id, user_id), None)
+		pending = pending_inputs.get((chat_id, user_id))
+		if pending is None:
+			return None
+		if time.time() - pending.get("ts", 0) > INPUT_TTL:
+			del pending_inputs[(chat_id, user_id)]
+			return None
+		if not any_thread and pending.get("thread") != normalize_thread(thread_id):
+			return None
+		return pending_inputs.pop((chat_id, user_id))
+
+
+def drop_pending_input(chat_id, user_id):
+	"""The user did something else (a button, a command, a file): the question
+	is abandoned, and its prompt goes with it"""
+	pending = pop_pending_input(chat_id, user_id, any_thread=True)
+	if pending and pending.get("prompt_message_id"):
+		delete_message(chat_id, pending["prompt_message_id"])
+	return pending
 
 
 def send_limits_screen(chat_id, thread_id, pending, done, back_markup):
@@ -3306,7 +4201,7 @@ def send_limits_screen(chat_id, thread_id, pending, done, back_markup):
 
 def handle_pending_input(message, pending):
 	chat_id = message.chat.id
-	thread_id = normalize_thread(message.message_thread_id)
+	thread_id = message_thread(message)
 	text = message.text.strip()
 	action = pending["action"]
 
@@ -3334,14 +4229,20 @@ def handle_pending_input(message, pending):
 		if number < 1 or number > pages:
 			send_message(chat_id, get_text("GOTO_PAGE_INVALID", pages), reply_markup=back_markup, thread_id=thread_id)
 			return
-		dispatch_callback(chat_id, pending["target_message_id"], message.from_user.id, f"{pending['base']}|{number - 1}")
+		# In the topic of the message: the screen it repaints is live there
+		dispatch_callback(chat_id, pending["target_message_id"], message.from_user.id, f"{pending['base']}|{number - 1}",
+						thread_id=thread_id)
 	elif action == "rename":
-		if name_already_exists(text, exclude_id=pending["torrent_id"]):
-			send_message(chat_id, get_text("RENAME_DUPLICATE", html.escape(text)), reply_markup=back_markup, thread_id=thread_id)
-			return
 		try:
-			torrent = client.get_torrent(pending["torrent_id"])
-			client.rename_torrent(pending["torrent_id"], text)
+			# The check and the rename go together, see auto_rename_torrent
+			with _rename_lock:
+				duplicate = name_already_exists(text, exclude_id=pending["torrent_id"])
+				if not duplicate:
+					torrent = client.get_torrent(pending["torrent_id"])
+					client.rename_torrent(pending["torrent_id"], text)
+			if duplicate:
+				send_message(chat_id, get_text("RENAME_DUPLICATE", html.escape(text)), reply_markup=back_markup, thread_id=thread_id)
+				return
 			key = rename_key(torrent, "RENAME_OK") if torrent else "RENAME_OK"
 			send_message(chat_id, get_text(key, html.escape(text)), reply_markup=back_markup, thread_id=thread_id)
 		except TorrentClientError as e:
@@ -3358,6 +4259,9 @@ def handle_pending_input(message, pending):
 			if torrent and is_video_file(file_path):
 				plan.extend(subtitle_renames(torrent, file_path, text))
 			done, errors = apply_rename_plan(torrent_id, plan)
+			if pending.get("file_nav"):
+				# Back to the file under its new name, wherever the rename put it in the list
+				back_markup = back_close_markup(renamed_file_call(*pending["file_nav"], torrent_id, file_path, text))
 			if errors:
 				send_message(chat_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), reply_markup=back_markup, thread_id=thread_id)
 			else:
@@ -3392,7 +4296,7 @@ def handle_pending_input(message, pending):
 		try:
 			result, _markup = perform_add_torrent(pending_torrent, text, chat_id, thread_id)
 		except TorrentClientError as e:
-			result = get_text("ADD_ERROR", html.escape(str(e)))
+			result = add_error_text(e)
 		send_message(chat_id, result, reply_markup=back_markup, thread_id=thread_id)
 	elif action == "autoDir":
 		bot_settings.set("auto_download_dir", text.rstrip("/") or "/")
@@ -3414,6 +4318,10 @@ def handle_pending_input(message, pending):
 				error_text = get_text("TPL_ERROR_UNKNOWN_FIELD", html.escape(e.detail))
 			elif e.code == "padding_not_allowed":
 				error_text = get_text("TPL_ERROR_PADDING_NOT_ALLOWED", html.escape(e.detail))
+			elif e.code == "invalid_char":
+				error_text = get_text("TPL_ERROR_INVALID_CHAR", html.escape(e.detail))
+			elif e.code == "padding_too_wide":
+				error_text = get_text("TPL_ERROR_PADDING_TOO_WIDE", html.escape(e.detail))
 			else:
 				error_text = get_text("TPL_ERROR_INVALID")
 			send_message(chat_id, f"{error_text}\n\n{get_text('TPL_FIELDS_HELP')}", reply_markup=back_markup, thread_id=thread_id)
@@ -3429,7 +4337,7 @@ def handle_pending_input(message, pending):
 			return
 		sent = send_message(chat_id, "⏳", thread_id=thread_id)
 		if sent:
-			do_mass_action(chat_id, sent.message_id, "ratio", pending["filter_key"], f"{limit:g}")
+			do_mass_action(chat_id, sent.message_id, "ratio", pending["mass_ctx"], f"{limit:g}")
 	elif action == "massSpeed":
 		try:
 			kbps = int(text)
@@ -3440,9 +4348,9 @@ def handle_pending_input(message, pending):
 			return
 		sent = send_message(chat_id, "⏳", thread_id=thread_id)
 		if sent:
-			do_mass_action(chat_id, sent.message_id, "speed", pending["filter_key"], f"{pending['direction']}:{kbps}")
+			do_mass_action(chat_id, sent.message_id, "speed", pending["mass_ctx"], f"{pending['direction']}:{kbps}")
 	elif action == "massMove":
-		do_mass_move_to(chat_id, pending["filter_key"], text, thread_id=thread_id)
+		do_mass_move_to(chat_id, pending["mass_ctx"], text, thread_id=thread_id)
 	elif action == "ratioLimit":
 		limit = parse_ratio(text)
 		if limit is None:
@@ -3450,6 +4358,7 @@ def handle_pending_input(message, pending):
 			return
 		try:
 			client.set_ratio_limit([pending["torrent_id"]], limit)
+			keep_hand_limit(pending["torrent_id"], ["ratio"])
 			send_limits_screen(chat_id, thread_id, pending, get_text("RATIO_SET_OK", html.escape(pending.get("name", "")), f"{limit:g}"), back_markup)
 		except TorrentClientError as e:
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
@@ -3463,6 +4372,7 @@ def handle_pending_input(message, pending):
 			return
 		try:
 			client.set_torrent_speed_limit([pending["torrent_id"]], pending["direction"], kbps)
+			keep_hand_limit(pending["torrent_id"], [pending["direction"]])
 			send_limits_screen(chat_id, thread_id, pending, get_text("LIMIT_SET_OK"), back_markup)
 		except TorrentClientError as e:
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
@@ -3518,7 +4428,27 @@ def handle_pending_input(message, pending):
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
 
 
-def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None, apply=None, target=None, wrap=None):
+# The last move order given for each torrent: id -> order number. A retry of
+# an older order gives up once a newer one exists
+_move_orders = {}
+_move_orders_lock = threading.Lock()
+_move_order_counter = [0]
+
+
+def register_move_order(ids):
+	with _move_orders_lock:
+		_move_order_counter[0] += 1
+		for torrent_id in ids:
+			_move_orders[str(torrent_id)] = _move_order_counter[0]
+		return _move_order_counter[0]
+
+
+def move_order_superseded(ids, order):
+	with _move_orders_lock:
+		return any(_move_orders.get(str(torrent_id), order) != order for torrent_id in ids)
+
+
+def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None, apply=None, target=None, wrap=None, failure_markup="same"):
 	"""Show a progress message and deliver the move order in a background thread
 	(the RPC blocks until the physical move is finished). The message is updated
 	with the final result. If the daemon does not answer (e.g. busy relocating
@@ -3528,20 +4458,23 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 	torrent); it must be safe to call again on a retry.
 	wrap turns the texts that tell about a retry or a failure into the whole
 	message, for a message that has more to say than the move itself."""
+	# What a failure is left with: by default the same buttons as a success
+	failure_markup = reply_markup if failure_markup == "same" else failure_markup
 	deliver = apply or (lambda: client.move_torrents(ids, new_dir))
 	wrap = wrap or (lambda text: text)
 	target = target or new_dir  # What the logs call the destination
+	order = register_move_order(ids)
 	if message_id is not None:
 		edit_message(chat_id, message_id, progress_text)
 	else:
 		msg = send_message(chat_id, progress_text, thread_id=thread_id)
 		message_id = msg.message_id if msg else None
 
-	def finish(text):
+	def finish(text, markup=reply_markup):
 		if message_id is not None:
-			edit_message(chat_id, message_id, text, reply_markup)
+			edit_message(chat_id, message_id, text, markup)
 		else:
-			send_message(chat_id, text, reply_markup=reply_markup, thread_id=thread_id)
+			send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 
 	def worker():
 		try:
@@ -3551,44 +4484,65 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 		except PermanentTorrentError as e:
 			# The manager will not do it: retrying only delays the bad news
 			warning(f"Move order refused: {e}")
-			finish(wrap(get_text("MOVE_REFUSED", html.escape(str(e)))))
+			finish(wrap(get_text("MOVE_REFUSED", html.escape(str(e)))), failure_markup)
 			return
 		except TorrentClientError as e:
 			err = str(e)
 		except Exception as e:
 			error(f"Unexpected error delivering move order: {e}")
-			finish(wrap(get_text("MOVE_GIVE_UP", html.escape(str(e)))))
+			finish(wrap(get_text("MOVE_GIVE_UP", html.escape(str(e)))), failure_markup)
 			return
 		warning(f"Move order not delivered, will retry in background: {err}")
 		if message_id is not None:
 			edit_message(chat_id, message_id, wrap(get_text("MOVE_RETRYING")))
 		for _ in range(MOVE_RETRY_ATTEMPTS):
 			time.sleep(MOVE_RETRY_DELAY)
+			if move_order_superseded(ids, order):
+				# A newer order for these torrents went out meanwhile: retrying
+				# this one would send them back where they are no longer wanted
+				debug(f"Move order to {target} superseded, not retried")
+				finish(wrap(get_text("MOVE_SUPERSEDED")), failure_markup)
+				return
 			try:
 				deliver()
 				debug(f"Move order delivered after retrying: {len(ids)} torrents -> {target}")
 				finish(success_text)
 				return
+			except PermanentTorrentError as e:
+				# A retry can learn what the first try could not (Download Station
+				# telling that File Station failed half way): told, not retried
+				warning(f"Move order refused on a retry: {e}")
+				finish(wrap(get_text("MOVE_REFUSED", html.escape(str(e)))), failure_markup)
+				return
 			except TorrentClientError as e:
 				err = str(e)
 		error(f"Move order gave up after {MOVE_RETRY_ATTEMPTS} attempts: {err}")
-		finish(wrap(get_text("MOVE_GIVE_UP", html.escape(err))))
+		finish(wrap(get_text("MOVE_GIVE_UP", html.escape(err))), failure_markup)
 
 	threading.Thread(target=worker, daemon=True).start()
 
 
-def do_mass_move_to(chat_id, filter_key, new_dir, thread_id=None, message_id=None):
-	back_markup = back_close_markup(build_call("list", filter_key, 0))
-	try:
-		torrents = get_filtered_torrents(filter_key)
-	except (ExpiredContext, TorrentClientError) as e:
-		text = get_text("MASS_EXPIRED") if isinstance(e, ExpiredContext) else get_text("CONNECTION_ERROR", html.escape(str(e)))
+def do_mass_move_to(chat_id, mass_ctx, new_dir, thread_id=None, message_id=None):
+	"""Moves the torrents the "move all" screen counted that are still there"""
+	def answer(text, markup):
 		if message_id:
-			edit_message(chat_id, message_id, text, back_markup)
+			edit_message(chat_id, message_id, text, markup)
 		else:
-			send_message(chat_id, text, reply_markup=back_markup, thread_id=thread_id)
+			send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+
+	try:
+		targets = mass_targets(mass_ctx)
+	except TorrentClientError as e:
+		answer(client_error_text(e), back_close_markup())
 		return
-	ids = [t.id for t in torrents]
+	if targets is None:
+		answer(get_text("MASS_EXPIRED"), back_close_markup())
+		return
+	filter_key, ids = targets
+	back_markup = back_close_markup(build_call("list", filter_key, 0))
+	if not ids:
+		answer(get_text("MASS_GONE"), back_markup)
+		return
 	progress_text = get_text("MASS_MOVING", len(ids), html.escape(new_dir))
 	success_text = get_text("MASS_DONE_MOVE", len(ids), html.escape(new_dir))
 	deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=message_id, thread_id=thread_id, reply_markup=back_markup)
@@ -3631,10 +4585,13 @@ def for_me(message):
 
 
 def check_auth(message):
+	"""For commands and files: the user is allowed, or is told not to be. An
+	allowed one moved on from any question the bot was still waiting for"""
 	if not is_authorized(message.from_user.id, message.chat.id):
 		warning(f"Unauthorized access attempt: user {message.from_user.id} in chat {message.chat.id}")
-		send_message(message.chat.id, get_text("USER_NOT_ALLOWED", message.from_user.id), thread_id=message.message_thread_id)
+		send_message(message.chat.id, get_text("USER_NOT_ALLOWED", message.from_user.id), thread_id=message_thread(message))
 		return False
+	drop_pending_input(message.chat.id, message.from_user.id)
 	return True
 
 
@@ -3644,7 +4601,7 @@ def command_start(message):
 		return
 	count_usage("cmd_start")
 	delete_message(message.chat.id, message.message_id)
-	show_dashboard(message.chat.id, thread_id=message.message_thread_id)
+	show_dashboard(message.chat.id, thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["help"])
@@ -3653,7 +4610,7 @@ def command_help(message):
 		return
 	count_usage("cmd_help")
 	delete_message(message.chat.id, message.message_id)
-	send_message(message.chat.id, get_text("START_MESSAGE"), thread_id=message.message_thread_id)
+	send_message(message.chat.id, get_text("START_MESSAGE"), thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["list"])
@@ -3662,7 +4619,7 @@ def command_list(message):
 		return
 	count_usage("cmd_list")
 	delete_message(message.chat.id, message.message_id)
-	render_list(message.chat.id, None, FILTER_ALL, 0, thread_id=message.message_thread_id)
+	render_list(message.chat.id, None, FILTER_ALL, 0, thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["find"])
@@ -3674,9 +4631,9 @@ def command_find(message):
 	parts = message.text.split(maxsplit=1)
 	if len(parts) > 1 and parts[1].strip():
 		ctx_id = new_search_context(parts[1].strip())
-		render_list(message.chat.id, None, f"q{ctx_id}", 0, thread_id=message.message_thread_id)
+		render_list(message.chat.id, None, f"q{ctx_id}", 0, thread_id=message_thread(message))
 	else:
-		ask_for_input(message.chat.id, message.from_user.id, "search", get_text("SEARCH_ASK"), thread_id=message.message_thread_id)
+		ask_for_input(message.chat.id, message.from_user.id, "search", get_text("SEARCH_ASK"), thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["add"])
@@ -3685,7 +4642,7 @@ def command_add(message):
 		return
 	count_usage("cmd_add")
 	delete_message(message.chat.id, message.message_id)
-	send_message(message.chat.id, get_text("ADD_USAGE"), thread_id=message.message_thread_id)
+	send_message(message.chat.id, get_text("ADD_USAGE"), thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["settings"])
@@ -3697,9 +4654,9 @@ def command_settings(message):
 	try:
 		text, markup = build_settings()
 	except TorrentClientError as e:
-		text = get_text("CONNECTION_ERROR", html.escape(str(e)))
+		text = client_error_text(e)
 		markup = back_close_markup()
-	send_message(message.chat.id, text, reply_markup=markup, thread_id=message.message_thread_id)
+	send_message(message.chat.id, text, reply_markup=markup, thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["version"])
@@ -3709,10 +4666,11 @@ def command_version(message):
 	count_usage("cmd_version")
 	delete_message(message.chat.id, message.message_id)
 	try:
-		connected_to = client.test_connection()
+		connected_to = html.escape(client.test_connection())
 	except TorrentClientError as e:
-		connected_to = f"❌ {e}"
-	send_message(message.chat.id, get_text("VERSION_TEXT", VERSION, connected_to), thread_id=message.message_thread_id)
+		# The error can carry the HTML page of a proxy, which Telegram would refuse
+		connected_to = f"❌ {html.escape(str(e))}"
+	send_message(message.chat.id, get_text("VERSION_TEXT", VERSION, connected_to), thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["donate"])
@@ -3721,7 +4679,7 @@ def command_donate(message):
 		return
 	count_usage("cmd_donate")
 	delete_message(message.chat.id, message.message_id)
-	send_message(message.chat.id, get_text("DONATE"), thread_id=message.message_thread_id)
+	send_message(message.chat.id, get_text("DONATE"), thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["donors"])
@@ -3735,7 +4693,7 @@ def command_donors(message):
 		text = get_text("DONORS_LIST", "\n".join(f"· {html.escape(d)}" for d in donors))
 	else:
 		text = get_text("ERROR_GETTING_DONORS")
-	send_message(message.chat.id, text, thread_id=message.message_thread_id)
+	send_message(message.chat.id, text, thread_id=message_thread(message))
 
 
 def get_donors_online():
@@ -3777,7 +4735,7 @@ def ask_for_input(chat_id, user_id, action, prompt, thread_id=None, message_id=N
 	text = f"{prompt}\n\n{get_text('INPUT_CANCEL_HINT')}"
 	sent = send_message(chat_id, text, reply_markup=ForceReply(), thread_id=thread_id)
 	prompt_message_id = sent.message_id if sent else None
-	set_pending_input(chat_id, user_id, action, prompt_message_id=prompt_message_id, **extra)
+	set_pending_input(chat_id, user_id, action, thread_id=thread_id, prompt_message_id=prompt_message_id, **extra)
 
 
 def download_telegram_file(file_id):
@@ -3804,23 +4762,29 @@ def download_telegram_file(file_id):
 
 @bot.message_handler(content_types=["document"])
 def handle_document(message):
+	document = message.document
+	is_torrent = bool(document.file_name) and document.file_name.lower().endswith(".torrent")
+	# In a group the bot sees every file anyone posts: only an admin's .torrent
+	# is for it, and the rest gets no answer, as with the links posted there
+	if getattr(message.chat, "type", None) != "private" and (
+			not is_torrent or not is_authorized(message.from_user.id, message.chat.id)):
+		return
 	if not check_auth(message):
 		return
-	document = message.document
-	if not document.file_name or not document.file_name.lower().endswith(".torrent"):
-		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message.message_thread_id)
+	if not is_torrent:
+		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message_thread(message))
 		return
 	if document.file_size and document.file_size > 20 * 1024 * 1024:
-		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message.message_thread_id)
+		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message_thread(message))
 		return
 	try:
 		data = download_telegram_file(document.file_id)
 	except Exception as e:
-		send_message(message.chat.id, get_text("ADD_ERROR", html.escape(describe_error(e))), thread_id=message.message_thread_id)
+		send_message(message.chat.id, get_text("ADD_ERROR", html.escape(describe_error(e))), thread_id=message_thread(message))
 		return
 	name = document.file_name[:-len(".torrent")]
 	count_usage("add_file")
-	start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
+	start_add_flow(message.chat.id, name, data=data, thread_id=message_thread(message))
 
 
 @bot.message_handler(func=lambda message: True)
@@ -3833,12 +4797,18 @@ def handle_text(message):
 	if not is_authorized(message.from_user.id, message.chat.id):
 		return
 
-	pending = pop_pending_input(message.chat.id, message.from_user.id)
-	if pending:
-		handle_pending_input(message, pending)
-		return
-
 	text = message.text.strip()
+	if is_link(text):
+		# A link pasted while a question waits is a torrent to add: taken as
+		# the answer it was a move to a folder called "magnet:?xt=..." or a
+		# torrent renamed to it, and the torrent was never added
+		drop_pending_input(message.chat.id, message.from_user.id)
+	else:
+		pending = pop_pending_input(message.chat.id, message.from_user.id, thread_id=message_thread(message))
+		if pending:
+			handle_pending_input(message, pending)
+			return
+
 	if text.lower().startswith("magnet:"):
 		add_magnet_from_message(message, text)
 	elif text.lower().startswith(("http://", "https://")) and " " not in text:
@@ -3850,6 +4820,12 @@ def handle_text(message):
 				add_magnet_from_message(message, url)
 			elif url.lower().startswith(("http://", "https://")):
 				add_url_from_message(message, url)
+
+
+def is_link(text):
+	"""A whole message that is a magnet or a single web link"""
+	lowered = (text or "").strip().lower()
+	return lowered.startswith("magnet:") or (lowered.startswith(("http://", "https://")) and " " not in lowered)
 
 
 def message_links(message):
@@ -3873,7 +4849,7 @@ def message_links(message):
 def add_magnet_from_message(message, magnet):
 	name = extract_magnet_name(magnet)
 	count_usage("add_magnet")
-	start_add_flow(message.chat.id, name, magnet=magnet, thread_id=message.message_thread_id)
+	start_add_flow(message.chat.id, name, magnet=magnet, thread_id=message_thread(message))
 
 
 def add_url_from_message(message, url):
@@ -3882,18 +4858,21 @@ def add_url_from_message(message, url):
 	is_private = message.chat.type == "private"
 	try:
 		data, name = download_torrent_from_url(url)
+	except MagnetRedirect as redirect:
+		add_magnet_from_message(message, redirect.magnet)
+		return
 	except ValueError:
 		debug(f"URL is not a torrent, ignored: {url}")
 		if is_private:
-			send_message(message.chat.id, get_text("ADD_URL_NOT_TORRENT"), thread_id=message.message_thread_id)
+			send_message(message.chat.id, get_text("ADD_URL_NOT_TORRENT"), thread_id=message_thread(message))
 		return
 	except Exception as e:
 		debug(f"Cannot download URL {url}: {e}")
 		if is_private:
-			send_message(message.chat.id, get_text("ADD_URL_ERROR", html.escape(str(e))), thread_id=message.message_thread_id)
+			send_message(message.chat.id, get_text("ADD_URL_ERROR", html.escape(str(e))), thread_id=message_thread(message))
 		return
 	count_usage("add_url")
-	start_add_flow(message.chat.id, name, data=data, thread_id=message.message_thread_id)
+	start_add_flow(message.chat.id, name, data=data, thread_id=message_thread(message))
 
 
 # ---------------------------------------------------------------------------
@@ -3924,8 +4903,15 @@ def handle_callback(call):
 
 	if command != "noop":
 		count_usage(f"btn_{command}")
-	thread_id = normalize_thread(call.message.message_thread_id)
-	stop_live_view(chat_id, message_id, thread_id)
+	thread_id = message_thread(call.message)
+	# A button means the user moved on from any question still waiting
+	if command != "cancelInput":
+		drop_pending_input(chat_id, call.from_user.id)
+	# Only a button that repaints this message stops it repainting itself: the
+	# dead arrows of a list and the page prompt leave it as it was, and a
+	# stopped screen would be left saying it updates itself, with no button
+	if command not in ("noop", "goto"):
+		stop_live_view(chat_id, message_id, thread_id)
 	dispatch_callback(chat_id, message_id, call.from_user.id, call.data, thread_id=thread_id, message_html=getattr(call.message, "html_text", None))
 
 
@@ -3944,7 +4930,10 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			pass
 
 		elif command == "cerrar":
-			delete_message(chat_id, message_id)
+			# Telegram does not let a message older than 48 hours be deleted:
+			# it is left without buttons instead of the tap doing nothing
+			if not delete_message(chat_id, message_id):
+				remove_markup(chat_id, message_id)
 
 		elif command == "dashboard" or command == "refreshDashboard":
 			show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)
@@ -3952,6 +4941,22 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 		elif command == "list":
 			filter_key, page = args[0], args[1]
 			render_list(chat_id, message_id, filter_key, page, thread_id=thread_id)
+
+		elif command == "massMenu":
+			text, markup = build_mass_menu(args[0], args[1] if len(args) > 1 else 0)
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "sort":
+			text, markup = build_sort_menu(args[0])
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "sortSet":
+			# The menu stays, with the mark moved, so the order can be turned
+			# around right away. Its back button opens the list on the first
+			# page: the one being looked at shows other torrents now
+			set_sort(args[1])
+			text, markup = build_sort_menu(args[0])
+			edit_message(chat_id, message_id, text, markup)
 
 		elif command == "info":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -4005,23 +5010,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 
 		elif command in ("replace", "replaceNo"):
 			# The button under a completion notice, and the way back to it
-			torrent = client.get_torrent(args[0])
-			if torrent is None:
-				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), close_markup())
-				return
-			suggested, previous = replace_targets(torrent)
-			completed = get_text("NOTIFY_COMPLETED", html.escape(torrent.name))
-			if not previous:
-				edit_message(chat_id, message_id, f"{completed}\n\n{get_text('REPLACE_NOTHING')}")
-			elif command == "replaceNo":
-				edit_message(chat_id, message_id, *replace_offer(torrent, suggested))
-			else:
-				items = "\n".join(get_text("REPLACE_ITEM", html.escape(t.name), html.escape(t.download_dir or ""), sizeof_fmt(t.total_size))
-								for t in previous)
-				markup = InlineKeyboardMarkup(row_width=1)
-				markup.add(InlineKeyboardButton(get_text("BUTTON_REPLACE_CONFIRM"), callback_data=build_call("replaceOk", torrent.id)))
-				markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=build_call("replaceNo", torrent.id)))
-				edit_message(chat_id, message_id, get_text("REPLACE_CONFIRM", items, html.escape(torrent.name), html.escape(suggested)), markup)
+			show_replace(chat_id, message_id, args[0], confirm=command == "replace")
 
 		elif command == "replaceSkip":
 			# Both stay: the notice is left as a plain completion, with no buttons.
@@ -4033,13 +5022,22 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				edit_message(chat_id, message_id, "\n".join(message_html.split("\n")[:2]))
 
 		elif command == "replaceOk":
-			torrent = client.get_torrent(args[0])
+			ctx = get_action_context(args[0], "r")
+			if ctx is None:
+				# Expired, or a button from before the confirmation kept what it
+				# listed (it carries the torrent id): asked again, listed now
+				if args[0].startswith("r") and len(args[0]) == 7:
+					edit_message(chat_id, message_id, get_text("REPLACE_EXPIRED"), close_markup())
+				else:
+					show_replace(chat_id, message_id, args[0], confirm=True)
+				return
+			torrent = client.get_torrent(ctx["torrent_id"])
 			if torrent is None:
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), close_markup())
 				return
 			completed = get_text("NOTIFY_COMPLETED", html.escape(torrent.name))
 			edit_message(chat_id, message_id, f"{completed}\n\n{get_text('REPLACING')}")
-			edit_message(chat_id, message_id, f"{completed}\n\n{replace_previous(torrent.id)}")
+			edit_message(chat_id, message_id, f"{completed}\n\n{replace_previous(torrent.id, only=set(ctx['previous']))}")
 
 		elif command == "rename":
 			torrent_id, filter_key, page = args[0], args[1], args[2]
@@ -4094,7 +5092,8 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				ask_for_input(chat_id, user_id, "rename", get_text(rename_key(torrent, "RENAME_ASK"), html.escape(torrent.name)),
 							thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, back_call=build_call("info", torrent_id, filter_key, page))
 
-		elif command in ("files", "file", "fileAuto", "fileManual", "filesAll", "filesAllOk", "folder", "folderAuto", "folderManual"):
+		elif command in ("files", "file", "fileAuto", "fileManual", "filesAll", "filesAllOk", "folder", "folderAuto", "folderManual",
+				"filePrio", "folderPrio"):
 			ctx = get_nav_context(args[0])
 			if ctx is None or len(args) < 3:
 				edit_message(chat_id, message_id, get_text("FILES_CONTEXT_EXPIRED"), back_close_markup(build_call("dashboard")))
@@ -4106,22 +5105,59 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			back_call = build_call("files", ctx_id, folder_index, file_page)
 
 			if command == "files":
-				render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page)
+				render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page, thread_id=thread_id)
+
+			elif command == "filePrio":
+				# filePrio|ctx|folder|page|index|key|code (older: without the key)
+				file_index = args[3] if len(args) > 3 else None
+				key, code = (args[4], args[5]) if len(args) > 5 else (None, args[4] if len(args) > 4 else None)
+				torrent = client.get_torrent(torrent_id)
+				resolved = resolve_file(torrent, file_index, key)
+				priority = FILE_NORMAL if code == FILE_WANT_CODE else FILE_PRIORITY_BY_CODE.get(code)
+				if resolved is None or priority not in client.file_priority_levels:
+					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page, thread_id=thread_id)
+					return
+				client.set_file_priority(torrent_id, [resolved[1]], priority)
+				# Read back from the manager, so the mark shows what really applies
+				torrent = client.get_torrent(torrent_id) or torrent
+				resolved = resolve_file(torrent, resolved[0], file_key(resolved[1])) or resolved
+				render_file_detail(chat_id, message_id, thread_id, torrent, resolved, ctx_id, folder_index, file_page)
+
+			elif command == "folderPrio":
+				torrent = client.get_torrent(torrent_id)
+				if torrent is None:
+					edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
+					return
+				folder = get_torrent_folder(torrent, folder_index, strict=len(args) > 3)
+				if folder is None:
+					# The folder is gone (renamed meanwhile): nothing is left out
+					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page, thread_id=thread_id)
+					return
+				if len(args) > 3:
+					paths, priority = folder_download_change(torrent, folder, args[3])
+					if paths:
+						client.set_file_priority(torrent_id, paths, priority)
+						# Read back from the manager: the screen stays, showing what really applies
+						torrent = client.get_torrent(torrent_id) or torrent
+				text, markup = build_folder_priority(torrent, folder, ctx_id, folder_index, file_page)
+				edit_message(chat_id, message_id, text, markup)
 
 			elif command in ("file", "fileAuto", "fileManual"):
 				file_index = args[3] if len(args) > 3 else None
 				torrent = client.get_torrent(torrent_id)
-				entry = get_torrent_file(torrent, file_index) if torrent else None
-				if entry is None:
-					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page)
+				resolved = resolve_file(torrent, file_index, args[4] if len(args) > 4 else None)
+				if resolved is None:
+					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page, thread_id=thread_id)
 					return
-				file_back_call = build_call("file", ctx_id, folder_index, file_page, file_index)
+				index, path, _size = resolved
+				entry = (path, _size)
+				file_back_call = file_call("file", ctx_id, folder_index, file_page, index, path)
 				if command == "file":
-					text, markup = build_file_detail(torrent, entry[0], entry[1], ctx_id, folder_index, file_page, file_index)
-					edit_message(chat_id, message_id, text, markup)
+					render_file_detail(chat_id, message_id, thread_id, torrent, resolved, ctx_id, folder_index, file_page)
 				elif command == "fileManual":
-					ask_for_input(chat_id, user_id, "renameFile", get_text("FILE_RENAME_ASK", html.escape(file_basename(entry[0]))),
-								thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, file_path=entry[0], back_call=file_back_call)
+					ask_for_input(chat_id, user_id, "renameFile", get_text("FILE_RENAME_ASK", html.escape(file_basename(path))),
+								thread_id=thread_id, message_id=message_id, torrent_id=torrent_id, file_path=path, back_call=file_back_call,
+								file_nav=[ctx_id, folder_index, file_page])
 				else:
 					plan, collisions = build_rename_plan(torrent, only_path=entry[0])
 					if collisions:
@@ -4130,6 +5166,8 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 						edit_message(chat_id, message_id, get_text("FILE_NO_SUGGESTION"), back_close_markup(file_back_call))
 					else:
 						done, errors = apply_rename_plan(torrent_id, plan)
+						# Back to the file under its new name, wherever the rename put it in the list
+						file_back_call = renamed_file_call(ctx_id, folder_index, file_page, torrent_id, path, plan[0][1])
 						if errors:
 							edit_message(chat_id, message_id, get_text("FILES_RENAME_PARTIAL", done, len(errors), html.escape(errors[0])), back_close_markup(file_back_call))
 						else:
@@ -4140,9 +5178,9 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				if torrent is None:
 					edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 					return
-				folder = get_torrent_folder(torrent, folder_index)
+				folder = get_torrent_folder(torrent, folder_index, strict=True)
 				if not folder:
-					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page)
+					render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page, thread_id=thread_id)
 					return
 				if command == "folder":
 					text, markup = build_folder_detail(torrent, folder, ctx_id, folder_index, file_page)
@@ -4168,7 +5206,10 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				if torrent is None:
 					edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 				else:
-					folder = get_torrent_folder(torrent, folder_index)
+					folder = get_torrent_folder(torrent, folder_index, strict=True)
+					if folder is None:
+						render_files(chat_id, message_id, ctx_id, torrent_id, filter_key, page, folder_index, file_page, thread_id=thread_id)
+						return
 					files_plan, folders_plan, skipped = build_full_plan(torrent, within=folder)
 					if not files_plan and not folders_plan:
 						edit_message(chat_id, message_id, get_text("FILES_NO_SUGGESTIONS"), back_close_markup(back_call))
@@ -4241,10 +5282,10 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			if message_html:
 				edit_message(chat_id, message_id, without_series_block(message_html))
 			else:
-				bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+				remove_markup(chat_id, message_id)
 
 		elif command == "serKeep":
-			bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+			remove_markup(chat_id, message_id)
 
 		elif command == "search":
 			ask_for_input(chat_id, user_id, "search", get_text("SEARCH_ASK"), thread_id=thread_id, message_id=message_id)
@@ -4298,6 +5339,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				limit = None if value == "g" else (-1 if value == "n" else parse_ratio(value))
 				if limit is not None or value == "g":
 					client.set_ratio_limit([torrent_id], limit)
+					keep_hand_limit(torrent_id, ["ratio"])
 				# Stays on the screen with the mark on what was just chosen, read
 				# back from the manager so it shows what really applies
 				torrent = client.get_torrent(torrent_id) or torrent
@@ -4393,8 +5435,16 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 							back_call=build_call("dashboard"))
 
 		elif command == "cancelAdd":
-			pop_pending_torrent(args[0])
-			show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)
+			# Gone already means the folder was chosen and the add is under way:
+			# its result is about to land on this message, and a dashboard
+			# opened here would paint itself over it
+			with _contexts_lock:
+				under_way = args[0] in _adding
+			if not under_way:
+				# Cancelled, or expired (a restart forgets them): either way the
+				# prompt is done with, and the dashboard takes its place
+				pop_pending_torrent(args[0])
+				show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)
 
 		elif command == "addDirPage":
 			pending_id, dir_page = args[0], int(args[1])
@@ -4410,20 +5460,22 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=dir_page)
 
 		elif command == "confirmMass":
-			action, filter_key, extra = args[0], args[1], args[2]
-			do_mass_action(chat_id, message_id, action, filter_key, extra)
+			action, mass_ctx, extra = args[0], args[1], args[2]
+			do_mass_action(chat_id, message_id, action, mass_ctx, extra)
 
-		elif command == "massSpeedAsk":
-			filter_key = args[0]
-			direction = "up" if args[1:2] == ["up"] else "down"
-			ask_for_input(chat_id, user_id, "massSpeed", get_text("MASS_LIMITS_ASK_UP" if direction == "up" else "MASS_LIMITS_ASK_DOWN"),
-						thread_id=thread_id, message_id=message_id, filter_key=filter_key, direction=direction,
-						back_call=build_call("mass", "ratio", filter_key))
-
-		elif command == "massRatioAsk":
-			filter_key = args[0]
-			ask_for_input(chat_id, user_id, "massRatio", get_text("MASS_RATIO_ASK_VALUE"), thread_id=thread_id, message_id=message_id,
-						filter_key=filter_key, back_call=build_call("mass", "ratio", filter_key))
+		elif command in ("massSpeedAsk", "massRatioAsk"):
+			ctx = get_action_context(args[0], "m")
+			if ctx is None:
+				resume_old_mass_button(chat_id, message_id, "ratio", args[0])
+				return
+			back_call = build_call("mass", "ratio", ctx["filter_key"])
+			if command == "massSpeedAsk":
+				direction = "up" if args[1:2] == ["up"] else "down"
+				ask_for_input(chat_id, user_id, "massSpeed", get_text("MASS_LIMITS_ASK_UP" if direction == "up" else "MASS_LIMITS_ASK_DOWN"),
+							thread_id=thread_id, message_id=message_id, mass_ctx=args[0], direction=direction, back_call=back_call)
+			else:
+				ask_for_input(chat_id, user_id, "massRatio", get_text("MASS_RATIO_ASK_VALUE"), thread_id=thread_id, message_id=message_id,
+							mass_ctx=args[0], back_call=back_call)
 
 		elif command == "keepSeeding":
 			torrent_id = args[0]
@@ -4432,33 +5484,45 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), close_markup())
 				return
 			client.set_ratio_limit([torrent_id], -1)
+			keep_hand_limit(torrent_id, ["ratio"])
 			client.resume_torrents([torrent_id])
 			base = message_html or get_text("NOTIFY_RATIO_REACHED", html.escape(torrent.name), "")
 			edit_message(chat_id, message_id, f"{base}\n\n{get_text('KEEP_SEEDING_DONE')}", close_markup())
 
 		elif command == "massMoveDir":
-			filter_key, dir_id = args[0], args[1]
+			mass_ctx, dir_id = args[0], args[1]
+			if get_action_context(mass_ctx, "m") is None:
+				resume_old_mass_button(chat_id, message_id, "move", mass_ctx)
+				return
 			new_dir = get_dir_by_id(dir_id)
 			if new_dir is None:
 				edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
 			else:
-				do_mass_move_to(chat_id, filter_key, new_dir, thread_id=thread_id, message_id=message_id)
+				do_mass_move_to(chat_id, mass_ctx, new_dir, thread_id=thread_id, message_id=message_id)
 
 		elif command == "massMoveNew":
-			filter_key = args[0]
+			mass_ctx = args[0]
+			ctx = get_action_context(mass_ctx, "m")
+			if ctx is None:
+				resume_old_mass_button(chat_id, message_id, "move", mass_ctx)
+				return
 			prompt = get_text("MOVE_NEW_DIR_ASK")
 			try:
-				dirs = [t.download_dir for t in get_filtered_torrents(filter_key)]
-				dirs_text = current_dirs_text(dirs)
+				counted = set(ctx["ids"])
+				dirs_text = current_dirs_text([t.download_dir for t in client.get_torrents() if str(t.id) in counted])
 				if dirs_text:
 					prompt = f"{dirs_text}\n{prompt}"
-			except (ExpiredContext, TorrentClientError):
+			except TorrentClientError:
 				pass
-			ask_for_input(chat_id, user_id, "massMove", prompt, thread_id=thread_id, message_id=message_id, filter_key=filter_key,
-						back_call=build_call("list", filter_key, 0))
+			ask_for_input(chat_id, user_id, "massMove", prompt, thread_id=thread_id, message_id=message_id, mass_ctx=mass_ctx,
+						back_call=build_call("list", ctx["filter_key"], 0))
 
 		elif command == "settings":
 			render_settings(chat_id, message_id, args[0] if args else "main")
+
+		elif command == "tlPage":
+			text, markup = build_settings_tracker_limits(args[0] if args else 0)
+			edit_message(chat_id, message_id, text, markup)
 
 		elif command == "tlAdd":
 			text, markup = build_tracker_rule_pick()
@@ -4655,7 +5719,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 							back_call=f"{base}|{page}", target_message_id=message_id, base=base, pages=pages)
 
 		elif command == "cancelInput":
-			pending_input = pop_pending_input(chat_id, user_id)
+			pending_input = pop_pending_input(chat_id, user_id, any_thread=True)
 			back_call = (pending_input or {}).get("back_call")
 			if back_call:
 				edit_message(chat_id, message_id, get_text("INPUT_CANCELLED"), back_close_markup(back_call))
@@ -4666,7 +5730,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			debug(f"Unknown callback: {data}")
 
 	except TorrentClientError as e:
-		edit_message(chat_id, message_id, get_text("CONNECTION_ERROR", html.escape(str(e))), back_close_markup())
+		edit_message(chat_id, message_id, client_error_text(e), back_close_markup())
 	except ExpiredContext:
 		edit_message(chat_id, message_id, get_text("SEARCH_EXPIRED"), back_close_markup())
 	except Exception as e:
@@ -4681,7 +5745,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 def send_startup_message():
 	try:
 		torrent_count = len(client.get_torrents())
-		text = get_text("STARTUP_MESSAGE", VERSION, client_version, torrent_count)
+		text = get_text("STARTUP_MESSAGE", VERSION, html.escape(client_version), torrent_count)
 	except TorrentClientError as e:
 		text = get_text("STARTUP_MESSAGE_ERROR", VERSION, html.escape(str(e)))
 	notify(text)
@@ -4700,9 +5764,11 @@ def handle_external_torrent(torrent_id):
 	lines = [get_text("NOTIFY_EXTERNAL_ADDED", html.escape(torrent.name), html.escape(torrent.download_dir or ""))]
 	if torrent.total_size and torrent.total_size > 0:
 		lines.append(get_text("ADD_OK_SIZE", sizeof_fmt(torrent.total_size)))
-	block, markup, moved = None, None, False
+	block, markup, target = None, None, None
 	if (bot_settings.get("notify_external_added") or auto_move_series_enabled(external=True)) and not torrent.auto_managed:
-		block, markup, moved = place_external_series(torrent, lines)
+		target = external_series_target(torrent)
+		if target is None and bot_settings.get("notify_external_added"):
+			block, markup = series_suggestion(torrent, torrent.download_dir or "")
 	renamed = []
 	if auto_rename_enabled() and bot_settings.get("auto_rename_external"):
 		if torrent.files:
@@ -4713,36 +5779,62 @@ def handle_external_torrent(torrent_id):
 			threading.Thread(target=deferred_auto_rename, args=(torrent.id, torrent.name), daemon=True).start()
 	# With the add notification off, a rename or a move is still worth telling:
 	# the torrent changed without anyone in the chat asking for it
-	if bot_settings.get("notify_external_added") or renamed or moved:
+	if bot_settings.get("notify_external_added") or renamed or target:
 		count_usage("auto_notify_external")
 		text = "\n".join(lines + renamed)
+		if target:
+			move_external_to_series(torrent, text, target)
+			return
 		if block:
 			text = f"{text}\n\n{block}"
 		notify(text, reply_markup=markup)
 
 
-def place_external_series(torrent, lines):
-	"""The folder of the series for a torrent the bot did not add. It is
-	already in the manager, so the automatic move really is a move here; the
-	📂 line in lines is updated to tell where it ended up.
-	Returns (block, markup, moved)"""
+def external_series_target(torrent):
+	"""The folder of its series a torrent the bot did not add goes to with
+	the automatic move on, or None"""
 	current_dir = torrent.download_dir or ""
-	if auto_move_series_enabled(external=True) and current_dir:
-		target = series_auto_dir(series_candidates(torrent.name, exclude_id=torrent.id, current_dir=current_dir))
-		if target:
-			try:
-				client.move_torrents([torrent.id], target)
-			except TorrentClientError as e:
-				warning(f"Cannot move {torrent.name} to the folder of its series: {e}")
-			else:
-				count_usage("auto_move_series")
-				lines[0] = with_dir_line(lines[0], target)
-				block, markup = series_placed(torrent.id, series_identity(torrent.name)["title"], current_dir)
-				return block, markup, True
-	if not bot_settings.get("notify_external_added"):
-		return None, None, False
-	block, markup = series_suggestion(torrent, current_dir)
-	return block, markup, False
+	if not (auto_move_series_enabled(external=True) and current_dir):
+		return None
+	return series_auto_dir(series_candidates(torrent.name, exclude_id=torrent.id, current_dir=current_dir))
+
+
+def move_external_to_series(torrent, text, target):
+	"""Moves a torrent the bot did not add to the folder of its series. It is
+	already in the manager, so this really moves its data, which can take
+	long: the notice goes out at once saying where it is going, and the move
+	is delivered (and retried) in the background like any other, which then
+	updates the notice with where it ended up. Done inline, the monitor
+	waited for the move, and a timeout was told as the torrent staying where
+	it was while the manager went on moving it"""
+	count_usage("auto_move_series")
+	chat_id = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
+	progress_text = f"{text}\n\n{get_text('SERIES_MOVING', html.escape(target))}"
+	sent = notify(progress_text)
+	placed_block, placed_markup = series_placed(torrent.id, series_identity(torrent.name)["title"], torrent.download_dir or "")
+	deliver_move_order(chat_id, [torrent.id], target, progress_text, f"{with_dir_line(text, target)}\n\n{placed_block}",
+					message_id=sent.message_id if sent else None, thread_id=TELEGRAM_THREAD, reply_markup=placed_markup,
+					wrap=lambda failure: f"{text}\n\n{failure}", failure_markup=None)
+
+
+def torrent_finished(torrent, prev):
+	"""Whether the monitor counts the torrent as finished. While a torrent is
+	checked (or queued to be), qBittorrent and Deluge give the progress of the
+	check, so a finished one goes 100 -> 0 -> 100 and looked freshly completed
+	after every recheck: it keeps what it was. None is unknown (first seen
+	while checking: data that was already there, or a restart), and becoming
+	finished from unknown is not a completion. A torrent with nothing left to
+	download (every file left out) is not finished either: there was no
+	download to announce"""
+	if torrent.status in (TorrentStatus.CHECKING, TorrentStatus.QUEUED) and not torrent.is_finished:
+		if prev:
+			return prev["finished"]
+		return None if torrent.status == TorrentStatus.CHECKING else False
+	return bool(torrent.is_finished) and (torrent.total_size or 0) > 0
+
+
+def torrent_error_text(torrent):
+	return torrent.error_message or ""
 
 
 def poll_torrents(states):
@@ -4772,8 +5864,8 @@ def poll_torrents(states):
 					external.add(torrent_id)
 	for torrent in torrents:
 		torrent_id = str(torrent.id)
-		state = {"finished": torrent.is_finished, "error": torrent.error_message or "", "status": torrent.status}
 		prev = states.get(torrent_id)
+		state = {"finished": torrent_finished(torrent, prev), "error": torrent_error_text(torrent), "status": torrent.status}
 		if not baseline:
 			if torrent_id in late:
 				try:
@@ -4791,7 +5883,7 @@ def poll_torrents(states):
 			# A torrent already finished the first time it is seen is a
 			# download that completed between two polls, not a leftover:
 			# the baseline built on the first poll is what covers restarts
-			if state["finished"] and (prev is None or not prev["finished"]):
+			if state["finished"] is True and (prev is None or prev["finished"] is False):
 				try:
 					handle_completed(torrent)
 				except Exception as e:

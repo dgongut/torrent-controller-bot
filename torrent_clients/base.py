@@ -5,10 +5,14 @@ The bot only talks to this interface, so any torrent client
 implementing TorrentClient.
 """
 
+import base64
+import binascii
+import hashlib
 import re
 import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from urllib.parse import parse_qsl
 
 
 class TorrentStatus:
@@ -28,6 +32,13 @@ RATIO_MODE_TORRENT = "torrent"  # a limit of its own
 RATIO_MODE_NONE = "none"  # seeds forever
 
 
+# Whether and how eagerly a file of a torrent is downloaded (TorrentInfo.file_priorities)
+FILE_SKIP = "skip"  # Not downloaded
+FILE_LOW = "low"
+FILE_NORMAL = "normal"
+FILE_HIGH = "high"
+
+
 class TorrentClientError(Exception):
 	"""Normalized error raised by any torrent client implementation"""
 	pass
@@ -37,6 +48,23 @@ class PermanentTorrentError(TorrentClientError):
 	"""Failure that retrying cannot fix, because the torrent manager will not
 	do what was asked no matter how many times it is told. Callers that retry
 	on TorrentClientError have to give up on this one right away"""
+	pass
+
+
+class DuplicateTorrentError(PermanentTorrentError):
+	"""The torrent being added is already in the manager. torrent_id is the id
+	of the torrent that was already there, None when the manager does not say"""
+
+	def __init__(self, message, torrent_id=None):
+		super().__init__(message)
+		self.torrent_id = torrent_id
+
+
+class RestartRequiredError(PermanentTorrentError):
+	"""The manager was left broken in a way only restarting it fixes, and until
+	then it may neither list its torrents nor keep the ones added meanwhile
+	(Deluge 2.2 removing a torrent only halfway). Retrying is no use: the
+	manager has to be restarted"""
 	pass
 
 
@@ -124,6 +152,117 @@ def content_root(paths, fallback=""):
 	return ""
 
 
+def clean_ratio(value):
+	"""Share ratio as the bot shows and sorts it, rounded. Managers answer
+	'no ratio yet' with negative sentinels (Transmission's -1 and -2, Deluge's
+	-1 while nothing is downloaded): those are 0 here, so a torrent without
+	data never sorts below one that really has a ratio"""
+	try:
+		value = float(value or 0)
+	except (TypeError, ValueError):
+		return 0.0
+	return round(value, 2) if value > 0 else 0.0
+
+
+def capped_progress(percent, left):
+	"""Progress (0-100) as the bot shows it, rounded. Rounding must never make
+	it 100 while the manager says some wanted bytes are still missing (left
+	above 0): 100 is finished, and the bot acts on that. Managers only report
+	a share (a big torrent lacking a few MB is at 99.999 %), so the bytes left
+	are what tells. left is None when the manager does not say"""
+	try:
+		percent = min(max(round(float(percent or 0), 2), 0.0), 100.0)
+	except (TypeError, ValueError):
+		return 0.0
+	if isinstance(left, (int, float)) and not isinstance(left, bool) and left > 0:
+		return min(percent, 99.99)
+	return percent
+
+
+def _bencode_end(data, start):
+	"""Where the bencoded value that starts at start ends. Broken data raises
+	ValueError: a negative or oversized length must never step backwards (an
+	endless loop) nor read past the end"""
+	kind = data[start:start + 1]
+	if kind == b"i":
+		return data.index(b"e", start) + 1
+	if kind in (b"l", b"d"):
+		position = start + 1
+		while data[position:position + 1] != b"e":
+			if position >= len(data):
+				raise ValueError("Unterminated bencoded list")
+			position = _bencode_end(data, position)
+		return position + 1
+	colon = data.index(b":", start)
+	length = data[start:colon]
+	if not length.isdigit():
+		raise ValueError("Bad bencoded string length")
+	end = colon + 1 + int(length)
+	if end > len(data):
+		raise ValueError("Truncated bencoded string")
+	return end
+
+
+def _bencode_entries(data):
+	"""(key, value start, value end) of each entry of a bencoded dictionary"""
+	if data[:1] != b"d":
+		raise ValueError("Not a bencoded dictionary")
+	position = 1
+	while data[position:position + 1] != b"e":
+		if position >= len(data):
+			raise ValueError("Unterminated bencoded dictionary")
+		key_end = _bencode_end(data, position)
+		value_end = _bencode_end(data, key_end)
+		yield data[data.index(b":", position) + 1:key_end], key_end, value_end
+		position = value_end
+
+
+# Exact topic of a magnet link (xt, xt.1...) and the info hash it gives: v1
+# (btih, in hex or base32) or v2 (btmh, a SHA-256 multihash)
+_MAGNET_TOPIC = re.compile(r"xt(?:\.\d+)?", re.IGNORECASE)
+_MAGNET_V1 = re.compile(r"urn:btih:([0-9a-z]{32}|[0-9a-z]{40})", re.IGNORECASE)
+_MAGNET_V2 = re.compile(r"urn:btmh:1220([0-9a-f]{64})", re.IGNORECASE)
+
+
+def expected_torrent_ids(magnet=None, torrent_data=None):
+	"""Ids (lowercase hex info hashes) the torrent of a magnet link or of the
+	content of a .torrent file can have once added, an empty list when they
+	cannot be known. A torrent of BitTorrent v2 can have two: managers built
+	on libtorrent 2 name hybrid and v2 torrents after the SHA-256 info hash
+	cut to 40 digits, and the rest after the SHA-1 one"""
+	ids = []
+	if isinstance(magnet, str) and magnet:
+		v2_ids = []
+		# Parameter by parameter and decoded, since managers built on libtorrent
+		# also read a percent-encoded topic (xt=urn%3Abtih%3A...)
+		for key, value in parse_qsl(magnet.split("?", 1)[-1]):
+			if not _MAGNET_TOPIC.fullmatch(key.strip()):
+				continue
+			v1, v2 = _MAGNET_V1.fullmatch(value.strip()), _MAGNET_V2.fullmatch(value.strip())
+			if v1 and len(v1.group(1)) == 40 and re.fullmatch(r"[0-9a-fA-F]+", v1.group(1)):
+				ids.append(v1.group(1).lower())
+			elif v1 and len(v1.group(1)) == 32:
+				try:
+					ids.append(base64.b32decode(v1.group(1).upper()).hex())
+				except (binascii.Error, ValueError):
+					pass
+			elif v2:
+				v2_ids.append(v2.group(1)[:40].lower())
+		ids.extend(v2_ids)  # After the v1 one, which is the id Transmission gives
+	elif isinstance(torrent_data, (bytes, bytearray)):
+		try:
+			for key, start, end in _bencode_entries(torrent_data):
+				if key == b"info":
+					info = bytes(torrent_data[start:end])
+					ids.append(hashlib.sha1(info).hexdigest())
+					if any(k == b"meta version" and info[s:e] == b"i2e" for k, s, e in _bencode_entries(info)):
+						ids.append(hashlib.sha256(info).hexdigest()[:40])
+					break
+		except (ValueError, IndexError, RecursionError):
+			return []
+	return list(dict.fromkeys(ids))
+
+
 @dataclass
 class TorrentInfo:
 	id: str  # Must survive client restarts: it travels in buttons and the monitor tracks torrents by it
@@ -159,6 +298,7 @@ class TorrentInfo:
 	completed_date: object = None  # unix timestamp, None while not finished or unknown
 	last_activity: object = None  # unix timestamp of the last transfer, None never or unknown
 	files: list = field(default_factory=list)  # list of (path, size, completed)
+	file_priorities: dict = field(default_factory=dict)  # {path: FILE_*} of the files, empty when unknown
 	trackers: list = field(default_factory=list)  # list of tracker hostnames
 
 	@property
@@ -177,6 +317,16 @@ class SessionSummary:
 	upload_rate: int = 0  # bytes/s
 	free_space: int = -1  # bytes, -1 unknown
 	alt_speed_enabled: bool = False
+	# Bytes transferred, the time running and the number of times started,
+	# since the manager was last started (session_*) and in all its history
+	# (total_*). -1 when the manager does not report it
+	session_downloaded: int = -1
+	session_uploaded: int = -1
+	session_seconds: int = -1
+	total_downloaded: int = -1
+	total_uploaded: int = -1
+	total_seconds: int = -1
+	session_count: int = -1
 
 
 class TorrentClient(ABC):
@@ -192,6 +342,11 @@ class TorrentClient(ABC):
 	ratio_limit_copied_on_add = False  # The global ratio limit is copied into each torrent when added (Deluge)
 	supports_torrent_speed_limit = True  # Clients that cannot limit the speed of a single torrent
 	supports_reannounce = True  # Clients that cannot ask the trackers for peers on demand
+	reports_last_activity = True  # Clients whose listing has no time of the last transfer
+	# Priorities a file can be given, FILE_SKIP included. Empty when the client
+	# cannot choose which files are downloaded
+	file_priority_levels = (FILE_SKIP, FILE_LOW, FILE_NORMAL, FILE_HIGH)
+	skipped_files_in_size = False  # The size of a torrent still counts the files left out
 
 	@abstractmethod
 	def test_connection(self):
@@ -253,6 +408,12 @@ class TorrentClient(ABC):
 		"""Limits the speed of the torrents alone. direction: 'down'|'up';
 		kbps: KB/s, 0 or less removes the limit"""
 		raise TorrentClientError("This torrent manager does not support speed limits per torrent")
+
+	def set_file_priority(self, torrent_id, paths, priority):
+		"""Sets whether and how eagerly the files of a torrent are downloaded.
+		paths are paths as reported in TorrentInfo.files and priority one of
+		file_priority_levels, FILE_SKIP to leave them out of the download"""
+		raise TorrentClientError("This torrent manager cannot choose the files to download")
 
 	def reannounce_torrents(self, torrent_ids):
 		"""Asks the trackers for peers right now instead of waiting for the next announce"""

@@ -1,7 +1,8 @@
 """Test battery for name_parser.py. Run with: python3 test_name_parser.py"""
 
-from name_parser import (companion_subtitle_name, parse_metadata, render_template, suggest_file_name, suggest_folder_name,
-						series_identity, suggest_name, validate_template, TemplateError, _PLATFORM_TAGS, CANONICAL_FIELDS)
+from name_parser import (companion_subtitle_name, is_sample_file, parse_metadata, render_template, suggest_file_name,
+						suggest_folder_name, series_identity, suggest_name, validate_template, TemplateError, _PLATFORM_TAGS,
+						CANONICAL_FIELDS, DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE)
 
 FAILED = []
 
@@ -581,7 +582,7 @@ check("a multi-season pack", suggest_name("Breaking Bad Temporada Completa 1-5 [
 check("a multi-season pack with padding", suggest_name("Breaking Bad Temporadas 1 a 5 [BluRay 1080p]",
 	template_season="{titulo} - T{temporada.2}"), "Breaking Bad - T01-05")
 # A spaced dash after a single season is an episode, and digits must stand alone
-check_fields("Show Season 2 - 05 [1080p].mkv", season="2", episode_number="")
+check_fields("Show Season 2 - 05 [1080p].mkv", season="2", episode_number="5", chapter="2x05")
 check_fields("Show Temporada 2 a 1080p.mkv", season="2", resolution="1080p")
 check_fields("Show Temporada 2 a 4K.mkv", season="2", resolution="4K")
 
@@ -679,6 +680,444 @@ check("subtitle ass extension kept",
 check("subtitle of another video", companion_subtitle_name("02.srt", "01.mkv", "2x01 - Show Name.mkv"), None)
 check("not a subtitle", companion_subtitle_name("01.nfo", "01.mkv", "2x01 - Show Name.mkv"), None)
 check("subtitle without extension", companion_subtitle_name("srt", "01.mkv", "2x01 - Show Name.mkv"), None)
+# The video name has to end where a separator starts: '10' is not '1' with a suffix
+check("a longer number is another video", companion_subtitle_name("10.srt", "1.mkv", "New.mkv"), None)
+check("nor a word glued to it", companion_subtitle_name("1x.srt", "1.mkv", "New.mkv"), None)
+for subtitle, expected in [("1.srt", "New.srt"), ("1.es.srt", "New.es.srt"), ("1_es.srt", "New_es.srt"),
+							("1-forced.srt", "New-forced.srt"), ("1 English.srt", "New English.srt")]:
+	check(f"subtitle {subtitle} goes with 1.mkv", companion_subtitle_name(subtitle, "1.mkv", "New.mkv"), expected)
+
+
+# ---------------------------------------------------------------------------
+# DIFFERENT RELEASES NEVER SHARE A NAME
+# ---------------------------------------------------------------------------
+# With the automatic rename and replace on, two releases that get the same
+# suggestion are taken for two versions of the same thing, and the older one
+# is deleted with its data. So when a name cannot be told apart from its
+# siblings, there is no suggestion at all
+
+def differ(description, first, second, **kwargs):
+	"""Two names of different releases: never the same suggestion (None for
+	both is fine, it only means they are left alone)"""
+	a, b = suggest_name(first, **kwargs), suggest_name(second, **kwargs)
+	check(f"{description}: different names or none", a is None or a != b, True)
+
+
+# --- A season with something more than the season ----------------------------
+# Anime: the episode follows the season after a spaced dash
+check("an anime episode behind the season",
+	suggest_name("[SubsPlease] Jujutsu Kaisen S2 - 05 (1080p) [ABCD1234].mkv"), "2x05 - Jujutsu Kaisen - 1080p.mkv")
+check("the next one", suggest_name("[SubsPlease] Jujutsu Kaisen S2 - 06 (1080p) [ABCD1234].mkv"), "2x06 - Jujutsu Kaisen - 1080p.mkv")
+check_fields("[SubsPlease] Jujutsu Kaisen S2 - 05 (1080p) [ABCD1234].mkv",
+	title="Jujutsu Kaisen", season="2", episode_number="5", chapter="2x05", resolution="1080p", is_series=True)
+check("a version of an episode is the same episode",
+	suggest_name("[SubsPlease] Frieren S2 - 03v2 (1080p) [ABCD1234].mkv"), "2x03 - Frieren - 1080p.mkv")
+check("an ordinal season", suggest_name("[Group] Show Name 2nd Season - 05 [1080p].mkv"), "2x05 - Show Name - 1080p.mkv")
+check_fields("[Group] Show Name 3rd Season - 12 [1080p].mkv", title="Show Name", season="3", episode_number="12")
+check("an ordinal season pack", suggest_name("[Group] Show Name 2nd Season [1080p]"), "T2 - Show Name - 1080p")
+check("a batch of episodes", suggest_name("[SubsPlease] Vinland Saga S2 (01-24) (1080p) [Batch]"), "2x01-24 - Vinland Saga - 1080p")
+check_fields("[Erai-raws] Kimetsu no Yaiba Season 2 - 11 [1080p][Multiple Subtitle].mkv",
+	title="Kimetsu no Yaiba", season="2", episode_number="11")
+# A single digit could be the end of a range of seasons as well: no guessing
+check("a single digit after the dash is no episode", suggest_name("Show Name Season 2 - 5.mkv"), None)
+check("nor a range of seasons", suggest_name("Breaking Bad Temporada 1 - 5 [BluRay 1080p]"), None)
+check("a recap episode (12.5) is not episode 12", suggest_name("[ASW] Mushoku Tensei S2 - 12.5 [1080p HEVC].mkv"), None)
+# The episode written in words after S02
+check("S02.Episode.5", suggest_name("Show.Name.S02.Episode.5.1080p.WEB.mkv"), "2x05 - Show Name - 1080p.mkv")
+check("S02.Ep05", suggest_name("Show.Name.S02.Ep05.1080p.WEB.mkv"), "2x05 - Show Name - 1080p.mkv")
+check_fields("Show.S01EP05.1080p.WEB.mkv", title="Show", chapter="1x05")
+check_fields("Show.S01.EP01-EP08.1080p.WEB", title="Show", season="1", episode_number="1-8", chapter="1x01-08")
+check_fields("Los.Simpson.S35.Cap.01.mkv", title="Los Simpson", chapter="35x01")
+# Parts and volumes of a season: nothing can hold them, so no suggestion
+for first, second in [("Stranger.Things.S04.Vol.1.1080p.NF.WEB-DL", "Stranger.Things.S04.Vol.2.1080p.NF.WEB-DL"),
+						("La.Casa.de.Papel.S05.Part.1.1080p.NF.WEB-DL", "La.Casa.de.Papel.S05.Part.2.1080p.NF.WEB-DL"),
+						("Show.Name.S02.Disc.1.1080p.BluRay", "Show.Name.S02.Disc.2.1080p.BluRay"),
+						("Show.Name.S02.Extras.1080p.BluRay", "Show.Name.S02.1080p.BluRay"),
+						("Show.Name.Season.2.Recap.1080p.WEB.mkv", "Show.Name.Season.2.1080p.WEB.mkv"),
+						("Show.S2.OVA.1080p.mkv", "Show.S2.1080p.mkv"),
+						("[SubsPlease] Jujutsu Kaisen S2 - 05 (1080p) [ABCD1234].mkv", "[SubsPlease] Jujutsu Kaisen S2 - 06 (1080p) [ABCD1234].mkv"),
+						("Show.Name.S02.Episode.5.1080p.WEB.mkv", "Show.Name.S02.Episode.6.1080p.WEB.mkv"),
+						("[Group] Show Name 2nd Season - 05 [1080p].mkv", "[Group] Show Name 2nd Season - 06 [1080p].mkv")]:
+	differ(f"{first} / {second}", first, second)
+	differ(f"{first} / {second} (S prefix)", first, second, season_prefix="S")
+check("a volume of a season is left alone", suggest_name("Stranger.Things.S04.Vol.1.1080p.NF.WEB-DL"), None)
+check("a part of a season is left alone", suggest_name("La.Casa.de.Papel.S05.Part.2.1080p.NF.WEB-DL"), None)
+check("so is its folder", suggest_folder_name("Stranger.Things.S04.Vol.1", "Stranger Things (2016)"), None)
+check("but it is still that season of that show", series_identity("Stranger.Things.S04.Vol.1.1080p.NF.WEB-DL")["season"], 4)
+# Its files: an episode marker of their own is enough, a bare number is not
+# (a second volume may count from 01 again)
+check("an episode inside a volume",
+	suggest_file_name("Stranger.Things.S04E08.Chapter.Eight.1080p.NF.WEB-DL.mkv", parent_name="Stranger.Things.S04.Vol.2.1080p.NF.WEB-DL"),
+	"4x08 - Stranger Things - 1080p.mkv")
+check("a bare number inside a volume", suggest_file_name("01.mkv", parent_name="Stranger.Things.S04.Vol.2.1080p.NF.WEB-DL"), None)
+check("a bare number inside an anime batch",
+	suggest_file_name("05.mkv", parent_name="[SubsPlease] Vinland Saga S2 (01-24) (1080p) [Batch]"), "2x05 - Vinland Saga - 1080p.mkv")
+# What every season pack carries is no reason to leave it alone
+for name, expected in [("Show.Name.S02.Complete.1080p.mkv", "T2 - Show Name - 1080p.mkv"),
+						("Show.Name.S02.REPACK.1080p.WEB", "T2 - Show Name - 1080p"),
+						("Show.Name.S02.ESP.AC3.5.1.1080p.WEB", "T2 - Show Name - 1080p"),
+						("Show.Name.S02.2019.1080p.WEB", "T2 - Show Name - 1080p"),
+						("Metalocalipsis (2006) S03 1080p MAX WEB-DL DD+2.0 HEVC-HDZ", "T3 - Metalocalipsis - 1080p"),
+						("Serie Temporada 2 [HDTV 720p][AC3 5.1 Castellano]", "T2 - Serie - 720p"),
+						("Serie.Temporada.2.Completa.720p.mkv", "T2 - Serie - 720p.mkv"),
+						("House.M.D.S01-S08.1080p.BluRay.MULTi.AAC.2.0.x265-GRP", "T1-T8 - House M.D - 1080p")]:
+	check(f"a season pack: {name}", suggest_name(name), expected)
+
+# --- Air dates and rounds are no movie year -----------------------------------
+for first, second in [("The.Daily.Show.2024.11.05.Guest.Name.1080p.WEB.h264-GRP.mkv", "The.Daily.Show.2024.11.06.Guest.Name.1080p.WEB.h264-GRP.mkv"),
+						("Formula1.2024.Round20.Mexico.Race.1080p.WEB.mkv", "Formula1.2024.Round21.Mexico.Race.1080p.WEB.mkv"),
+						("NFL.2024.Week.10.Chiefs.vs.Bills.1080p.WEB.mkv", "NFL.2024.Week.11.Chiefs.vs.Bills.1080p.WEB.mkv"),
+						("Formula1.2024.Mexico.Grand.Prix.Race.1080p.WEB.mkv", "Formula1.2024.Brazil.Grand.Prix.Race.1080p.WEB.mkv"),
+						("Movie.2019.Part.1.1080p.BluRay.mkv", "Movie.2019.Part.2.1080p.BluRay.mkv")]:
+	differ(f"{first} / {second}", first, second)
+check("a dated episode is left alone", suggest_name("The.Daily.Show.2024.11.05.Guest.Name.1080p.WEB.h264-GRP.mkv"), None)
+check("a round is left alone", suggest_name("Formula1.2024.Round20.Mexico.Race.1080p.WEB.mkv"), None)
+check("a trailer is not the movie", suggest_name("Movie (2019) [Trailer] 1080p.mkv"), None)
+check("nor a dated show inside a single video torrent",
+	suggest_file_name("video.mkv", parent_name="The.Daily.Show.2024.11.05.Guest.Name.1080p.WEB", single_video=True), None)
+# What movies carry after the year is still fine
+for name, expected in [("Movie.2019.MULTi.VFF.AC3.5.1.1080p.BluRay.mkv", "Movie (2019) - 1080p.mkv"),
+						("Movie.2019.EXTENDED.1080p.BluRay.x264-GRP.mkv", "Movie (2019) - 1080p.mkv"),
+						("Movie.2019.Special.Edition.1080p.BluRay.mkv", "Movie (2019) - 1080p.mkv"),
+						("Movie.2019.25th.Anniversary.Edition.1080p.mkv", "Movie (2019) - 1080p.mkv"),
+						("Movie.2019.FRENCH.5.1.1080p.mkv", "Movie (2019) - 1080p.mkv"),
+						("Pelicula.2023.BDRemux.EAC3.5.1.Latino.mkv", "Pelicula (2023) - BDRemux.mkv"),
+						("Harry.Potter.and.the.Deathly.Hallows.Part.1.2010.1080p.BluRay.mkv",
+							"Harry Potter and the Deathly Hallows Part 1 (2010) - 1080p.mkv"),
+						("Kill.Bill.Vol.1.2003.1080p.BluRay.mkv", "Kill Bill Vol 1 (2003) - 1080p.mkv"),
+						("UFC.300.Pereira.vs.Hill.2024.1080p.WEB.mkv", "UFC 300 Pereira vs Hill (2024) - 1080p.mkv"),
+						("El.Codigo.Da.Vinci.TRILOGIA.2006.-.2016.Version.Extendida.mHD.10Bits.1080p.BluRay.DD5.1.AV1-TMd",
+							"El Codigo Da Vinci TRILOGIA (2006-2016) - 1080p")]:
+	check(f"a movie: {name}", suggest_name(name), expected)
+
+# --- 'Cap' starts a word ------------------------------------------------------
+check("Kneecap is a movie", suggest_name("Kneecap.2024.1080p.WEB.h264-GRP.mkv"), "Kneecap (2024) - 1080p.mkv")
+check_fields("Kneecap.2024.1080p.WEB.h264-GRP.mkv", title="Kneecap", year="2024", chapter="", is_series=False)
+check_fields("Nightcap.1080p.WEB.mkv", title="Nightcap", chapter="", is_series=False)
+check_fields("Show.Name.Season.2.Recap.1080p.WEB.mkv", season="2", episode_number="", chapter="T2")
+check("Recap is no episode 10x80", suggest_name("Show.Name.Season.2.Recap.1080p.WEB.mkv"), None)
+check("Recap as a title", suggest_name("Recap.2019.1080p.mkv"), "Recap (2019) - 1080p.mkv")
+check("Cap.103 still is an episode", suggest_name("Serie Cap.103 HDTV.avi"), "1x03 - Serie.avi")
+check("Capitulo 103 too", suggest_name("Serie Capitulo 103 HDTV.avi"), "1x03 - Serie.avi")
+check_fields("Serie.Cap.103.HDTV.avi", title="Serie", chapter="1x03")
+check_fields("Chicago Fire - Temporada 14 [HDTV 720p][Cap.1404].mkv", title="Chicago Fire", chapter="14x04")
+check_fields("Serie [HDTV][Cap.101-110].mkv", episode_number="1-10")
+
+# --- 'WEB' as a word of the title ---------------------------------------------
+check("Charlottes Web", suggest_name("Charlottes.Web.2006.1080p.BluRay.x264-GRP.mkv"), "Charlottes Web (2006) - 1080p.mkv")
+check_fields("Charlottes.Web.2006.1080p.BluRay.x264-GRP.mkv", title="Charlottes Web", source="BluRay")
+check("Unfriended Dark Web", suggest_name("Unfriended.Dark.Web.2018.1080p.BluRay.x264-GRP.mkv"),
+	"Unfriended Dark Web (2018) - 1080p.mkv")
+check("Web of Lies", suggest_name("Web.of.Lies.S01E01.1080p.mkv"), "1x01 - Web of Lies - 1080p.mkv")
+check_fields("Web.of.Lies.S01E01.1080p.mkv", title="Web of Lies", source="")
+check_fields("charlottes.web.2006.1080p.bluray.x264-grp.mkv", title="charlottes web", source="BluRay")
+check_fields("Spider-Web.2019.1080p.BluRay.mkv", title="Spider-Web")
+check_fields("The.Web.2019.1080p.mkv", title="The Web", source="")
+# The release tag still is the source, and still ends the title
+check_fields("Chicago.Fire.S14E04.1080p.WEB.h264-ETHEL", title="Chicago Fire", source="WEB-DL")
+check_fields("the.office.us.s05e14.720p.web.x264-grp.mkv", title="the office us", source="WEB-DL")
+check_fields("Barbie.2023.WEB.1080p.h264-ETHEL.mkv", title="Barbie", year="2023", source="WEB-DL")
+check_fields("Movie.Name.WEB.1080p.mkv", title="Movie Name", source="WEB-DL")
+check_fields("Show.S01E01.WEB.H264-GRP.mkv", title="Show", chapter="1x01", source="WEB-DL")
+check_fields("Show.S01E02.The.Buys.WEB.1080p.mkv", episode_title="The Buys", source="WEB-DL")
+check_fields("Dark.Web.Cicada.3301.2021.1080p.WEB.h264-GRP.mkv", title="Dark Web Cicada 3301", year="2021", source="WEB-DL")
+check_fields("Movie.2019.WEBRip.1080p.mkv", title="Movie", source="WEBRip")
+
+# --- A T and a number in front of a movie title ---------------------------------
+check("T2 Trainspotting", suggest_name("T2.Trainspotting.2017.1080p.BluRay.x264-GRP.mkv"), "T2 Trainspotting (2017) - 1080p.mkv")
+check_fields("T2.Trainspotting.2017.1080p.BluRay.x264-GRP.mkv", title="T2 Trainspotting", year="2017", season="", is_series=False)
+check("is no series", series_identity("T2.Trainspotting.2017.1080p.BluRay.x264-GRP.mkv"), None)
+check("with spaces", suggest_name("T2 Trainspotting (2017) 1080p.mkv"), "T2 Trainspotting (2017) - 1080p.mkv")
+check("T2 Judgment Day", suggest_name("T2.Judgment.Day.1991.1080p.BluRay.x264-GRP.mkv"), "T2 Judgment Day (1991) - 1080p.mkv")
+# The Spanish season behind the title, or a renamed pack, still is a season
+check_fields("Serie.Name.T2.1080p.WEB-DL", title="Serie Name", season="2", chapter="T2", is_series=True)
+check("a Spanish T2 season pack", suggest_name("Serie.Name.T2.1080p.WEB-DL"), "T2 - Serie Name - 1080p")
+check_fields("Muertos.S.L.T4.1080p", title="Muertos S.L", season="4")
+check("a renamed T2 pack", series_identity("T2 - Mad Men - 1080p")["season"], 2)
+check("a renamed T2 pack with a year in it", series_identity("T2 - Mad Men (2007) - 1080p")["season"], 2)
+check_fields("T01.Serie.2019.1080p", season="1", is_series=True)
+
+# --- Acronyms -------------------------------------------------------------------
+check("Episode IV A New Hope", suggest_name("Star.Wars.Episode.IV.A.New.Hope.1977.1080p.BluRay.x264-GRP.mkv"),
+	"Star Wars Episode IV A New Hope (1977) - 1080p.mkv")
+check_fields("Star.Wars.Episode.V.The.Empire.Strikes.Back.1980.1080p.mkv", title="Star Wars Episode V The Empire Strikes Back")
+check_fields("Agents.of.S.H.I.E.L.D.S01E01.1080p.mkv", title="Agents of S.H.I.E.L.D", chapter="1x01")
+check_fields("Marvels.Agents.of.S.H.I.E.L.D.S07.1080p.WEB", title="Marvels Agents of S.H.I.E.L.D", season="7")
+check_fields("E.T.the.Extra-Terrestrial.1982.1080p.mkv", title="E.T the Extra-Terrestrial", year="1982")
+check_fields("L.A.Confidential.1997.1080p.mkv", title="L.A Confidential", year="1997")
+
+# --- Sample clips ----------------------------------------------------------------
+SAMPLE_PACK = "Show.Name.S01.1080p.WEB.h264-GRP"
+check("a sample clip gets no name", suggest_file_name("show.name.s01e01.1080p.web.h264-grp-sample.mkv", parent_name=SAMPLE_PACK), None)
+check("the episode it samples does", suggest_file_name("show.name.s01e01.1080p.web.h264-grp.mkv", parent_name=SAMPLE_PACK),
+	"1x01 - Show Name - 1080p.mkv")
+check("nor anything inside a Sample folder",
+	suggest_file_name("show.name.s01e01.1080p.web.h264-grp.mkv", parent_name=SAMPLE_PACK, folder_name="Sample"), None)
+check("a movie sample", suggest_file_name("movie.2019.1080p.bluray.x264-grp-sample.mkv", parent_name="Movie.2019.1080p.BluRay.x264-GRP"),
+	None)
+for path in ["show.name.s01e01.1080p.web.h264-grp-sample.mkv", "sample.mkv", "SAMPLE.mkv", "Sample/show.name.s01e01.mkv",
+			"Show/Samples/x.mkv", "D:\\Show\\Sample\\x.mkv", "sample-grp-show.s01e01.mkv", "Movie.2019.Sample.1080p.mkv",
+			"show.s01e01.sample-grp.mkv", "Show [Sample].mkv", "Movie.2019.SAMPLE.mkv", "show.s01e01.samples.mkv", "Samples/"]:
+	check(f"{path} is a sample", is_sample_file(path), True)
+for path in ["Samples.of.Life.2020.mkv", "Movies/Samples.of.Life.2020.mkv", "Sample.People.2000.1080p.mkv",
+			"Free.Sample.2016.1080p.mkv", "The.Sample.2020.mkv", "show.name.s01e01.mkv", "", None]:
+	check(f"{path!r} is no sample", is_sample_file(path), False)
+check("a title starting with Samples is renamed",
+	suggest_file_name("Samples.of.Life.2020.1080p.mkv", parent_name="Coleccion"), "Samples of Life (2020) - 1080p.mkv")
+
+# --- Collection words of the torrent ----------------------------------------------
+check("The Complete Series is no part of the title",
+	suggest_file_name("Friends.S01E01.1080p.BluRay.x264-GRP.mkv", parent_name="Friends.The.Complete.Series.1080p.BluRay.x264-GRP"),
+	"1x01 - Friends - 1080p.mkv")
+for words in ["The.Complete.Series", "Complete.Series", "Complete", "Collection", "Box.Set", "Boxset", "Integral",
+				"Serie.Completa", "Completa", "Pack", "The.Complete.Collection", "Complete.Box.Set", "S01-S10.Complete"]:
+	check(f"nor {words}", suggest_file_name("Friends.S01E01.1080p.mkv", parent_name=f"Friends.{words}.1080p"),
+		"1x01 - Friends - 1080p.mkv")
+check("a season folder of a complete series", suggest_folder_name("Temporada 2", "Friends.The.Complete.Series.1080p"),
+	"T2 - Friends - 1080p")
+# Titles that end with those words keep them
+check("a show called Wolf Pack", suggest_file_name("Wolf.Pack.S01E01.1080p.mkv", parent_name="Wolf.Pack.S01.1080p.WEB"),
+	"1x01 - Wolf Pack - 1080p.mkv")
+check("a bare episode of Wolf Pack", suggest_file_name("01.mkv", parent_name="Wolf.Pack.S01.1080p.WEB"), "1x01 - Wolf Pack - 1080p.mkv")
+check("Wolf Pack, the complete series",
+	suggest_file_name("Wolf.Pack.S01E01.1080p.mkv", parent_name="Wolf.Pack.Complete.Series.1080p"), "1x01 - Wolf Pack - 1080p.mkv")
+check("a season folder of Wolf Pack, the complete series",
+	suggest_folder_name("Season 2", "Wolf.Pack.Complete.Series.1080p"), "T2 - Wolf Pack - 1080p")
+check("Wolf Pack with no season in the torrent",
+	suggest_file_name("Wolf.Pack.S01E01.1080p.mkv", parent_name="Wolf.Pack.1080p.WEB"), "1x01 - Wolf Pack - 1080p.mkv")
+check("a show called The Collection", suggest_file_name("01.mkv", parent_name="The.Collection.S01.1080p"),
+	"1x01 - The Collection - 1080p.mkv")
+check("a movie called The Rat Pack",
+	suggest_file_name("video.mkv", parent_name="The.Rat.Pack.1998.1080p", single_video=True), "The Rat Pack (1998) - 1080p.mkv")
+check("a movie called The Collection",
+	suggest_file_name("video.mkv", parent_name="The.Collection.2012.1080p", single_video=True), "The Collection (2012) - 1080p.mkv")
+
+# --- A season range is no season of a file ----------------------------------------
+check("a bare episode inside several seasons", suggest_file_name("01.mkv", parent_name="Show.Name.S01-S03.1080p"), None)
+check("not even with a template without the season",
+	suggest_file_name("01.mkv", parent_name="Show.Name.S01-S03.1080p", template_series="{title} - {episode.2}"), None)
+check("its season folder tells it", suggest_file_name("01.mkv", parent_name="Show.Name.S01-S03.1080p", folder_name="Temporada 2"),
+	"2x01 - Show Name - 1080p.mkv")
+check("and so does its own marker", suggest_file_name("Show.Name.S02E01.mkv", parent_name="Show.Name.S01-S03.1080p"),
+	"2x01 - Show Name - 1080p.mkv")
+
+# --- Templates that would not make a file name -------------------------------------
+for bad, code, detail in [("{title}/{season}x{episode.2}", "invalid_char", "/"), ("../{title}", "invalid_char", ".."),
+							("{title}\n{year}", "invalid_char", "\\n"), ("{title}\\{year}", "invalid_char", "\\"),
+							("{title}\t{year}", "invalid_char", "\\t"), ("{title}\r\n{year}", "invalid_char", "\\r"),
+							("{title}\u2028{year}", "invalid_char", "\\u2028"), ("{title}\x00", "invalid_char", "\\x00"),
+							("{title}..{year}", "invalid_char", ".."), ("[../]{title}", "invalid_char", ".."),
+							("{title}[/{year}]", "invalid_char", "/"),
+							("{episode.100000000}", "padding_too_wide", "episode.100000000"),
+							("{episodio.5}", "padding_too_wide", "episodio.5"), ("{EPISODE.10}", "padding_too_wide", "EPISODE.10"),
+							("{ temporada .7}", "padding_too_wide", "temporada.7"), ("{season.05}", "padding_too_wide", "season.05"),
+							# The field comes first: padding on the title is the error
+							("{title.10}", "padding_not_allowed", "title")]:
+	try:
+		validate_template(bad)
+		check(f"validate({bad!r}) should fail", "no error", code)
+	except TemplateError as e:
+		check(f"validate({bad!r}) error code", e.code, code)
+		check(f"validate({bad!r}) error detail", e.detail, detail)
+for good, fields in [("{titulo}.{año}.{extension}", ["title", "year", "extension"]), ("{title} ({year})", ["title", "year"]),
+						("{season.4}x{episode.4}", ["season", "episode_number"]), ("{title}. {episode_title}", ["title", "episode_title"]),
+						("{title} - {resolution}[.{extension}]", ["title", "resolution", "extension"])]:
+	check(f"validate({good!r}) is fine", validate_template(good), fields)
+for default in (DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE):
+	check(f"the default {default!r} is valid", bool(validate_template(default)), True)
+# A template saved before these checks still never builds a path or a huge name
+check("a rendered name never holds a path", suggest_name("AC/DC.Live.at.River.Plate.2011.1080p.mkv"), None)
+check("a huge padding renders nothing", render("{episode.1000}", episode_number="7"), None)
+check("inside an optional block, just the block", render("{title}[ {episode.1000}]", title="x", episode_number="7"), "x")
+
+# --- A number behind a dash in the name of a folder ------------------------------
+# 'Friends Season 1 - 10' may be ten seasons as well as the tenth episode, and
+# the episode would then take the pack's name (and the automatic replace would
+# delete the pack). Only the name of a video, or a version ('05v2'), makes it
+# an episode. A list or a count of episodes never is one
+for name in ["Friends Season 1 - 10 [1080p BluRay x265]", "Supernatural Season 1 - 15 [1080p]", "Friends S01 - 10 [1080p]",
+			"Friends T1 - 10", "Friends Temporada 1 - 10", "Serie - Temporada 1 - 01 al 10 [HDTV]", "Serie S01 - 01 to 10 [1080p]",
+			"Serie S01 - 01 & 02 [1080p]", "Serie S01 - 01+02 [1080p]", "Serie S01 - 01, 02 [1080p]",
+			"Serie S01 - 10 Episodes [1080p]", "Serie - Temporada 2 - 10 Capitulos [HDTV]", "Show 2nd Season - 05 [1080p]",
+			"[SubsPlease] Jujutsu Kaisen S2 - 05 (1080p) [ABCD1234]", "Serie S01 - 01 & 02 [1080p].mkv", "Serie S01 - 01+02 [1080p].mkv",
+			"Serie S01 - 01, 02 [1080p].mkv", "Serie - Temporada 1 - 01 al 10 [HDTV].mkv", "Serie S01 - 01 y 02 [HDTV].mkv",
+			"Serie S01 - 10 Episodes [1080p].mkv", "Serie - Temporada 3 - 13 episodios [HDTV 720p].mkv"]:
+	check(f"no single episode in {name!r}", suggest_name(name), None)
+	check(f"no single episode in {name!r} (S prefix)", suggest_name(name, season_prefix="S"), None)
+differ("ten seasons / the tenth episode", "Friends Season 1 - 10 [1080p BluRay x265]", "Friends.S01E10.1080p.BluRay.x265")
+differ("ten seasons / the tenth episode (S prefix)", "Friends Season 1 - 10 [1080p BluRay x265]", "Friends.S01E10.1080p.BluRay.x265",
+	season_prefix="S")
+differ("a list of episodes / its first one", "Serie S01 - 01 & 02 [1080p].mkv", "Serie.S01E01.1080p.mkv")
+check("the tenth episode still is one", suggest_name("Friends.S01E10.1080p.BluRay.x265"), "1x10 - Friends - 1080p")
+check("and the pack still is that show's", (series_identity("Friends Season 1 - 10 [1080p BluRay x265]") or {}).get("key"), "friends")
+check("as a video it is an episode", suggest_name("Friends Season 1 - 10 [1080p].mkv"), "1x10 - Friends - 1080p.mkv")
+check("and so it is with a version", suggest_name("[SubsPlease] Frieren S2 - 03v2 (1080p) [ABCD1234]"), "2x03 - Frieren - 1080p")
+check("an episode followed by its title", suggest_name("[Group] Show S2 - 05 - The Title [1080p].mkv"), "2x05 - Show - 1080p.mkv")
+check("or by the resolution behind a dash", suggest_name("Show S2 - 05 - 1080p.mkv"), "2x05 - Show - 1080p.mkv")
+check("a batch of episodes still is a range", suggest_name("[Group] Show S2 01-12 [1080p]"), "2x01-12 - Show - 1080p")
+check("the video inside such a folder", suggest_file_name("[Group] Show S2 - 05 [1080p].mkv", parent_name="[Group] Show S2 - 05 [1080p]"),
+	"2x05 - Show - 1080p.mkv")
+check("but not one with no name of its own", suggest_file_name("video.mkv", parent_name="[Group] Show S2 - 05 [1080p]", single_video=True),
+	None)
+
+# --- Audio written without a dot ------------------------------------------------
+# The channels of 'DD51' or 'AC3.51' are no stray number, nor is 'R5' a round
+for name, expected in [("Movie.2019.German.DL.DD51.1080p.BluRay.x264-GRP", "Movie (2019) - 1080p"),
+						("Movie.2019.German.DDP51.DL.1080p.WEB.h264-GRP", "Movie (2019) - 1080p"),
+						("Movie.2019.German.DD20.1080p.WEB.h264-GRP", "Movie (2019) - 1080p"),
+						("Movie.2019.MULTi.DTS51.1080p", "Movie (2019) - 1080p"),
+						("Movie.2019.iTA.AC3.51.720p.mkv", "Movie (2019) - 720p.mkv"),
+						("Movie.2019.AAC20.1080p", "Movie (2019) - 1080p"),
+						("Movie.2019.German.EAC3D.DL.1080p.WEB.h264-GRP", "Movie (2019) - 1080p"),
+						("Movie.2019.DTS:X.1080p", "Movie (2019) - 1080p"), ("Movie.2019.HE-AAC.2.0.1080p", "Movie (2019) - 1080p"),
+						("Movie.2019.DDPA5.1.1080p.WEB", "Movie (2019) - 1080p"), ("Movie.2019.6.CH.1080p.mkv", "Movie (2019) - 1080p.mkv"),
+						("Show.S02.6CH.1080p", "T2 - Show - 1080p"),
+						("Show.S01.German.DD51.DL.1080p.BluRay.x264-GRP", "T1 - Show - 1080p"),
+						("Movie.2009.R5.720p.XviD-GRP", "Movie (2009) - 720p"),
+						("Movie.2009.R5.LiNE.720p.x264-GRP", "Movie (2009) - 720p")]:
+	check(f"the audio of {name}", suggest_name(name), expected)
+check("a bare file inside such a pack", suggest_file_name("01.mkv", parent_name="Show.S01.German.DD51.DL.1080p.BluRay.x264-GRP"),
+	"1x01 - Show - 1080p.mkv")
+check("and the single video of such a movie",
+	suggest_file_name("video.mkv", parent_name="Movie.2019.German.DL.DD51.1080p.BluRay.x264-GRP", single_video=True),
+	"Movie (2019) - 1080p.mkv")
+for first, second in [("F1.2024.R20.Mexico.720p.WEB", "F1.2024.R21.Brazil.720p.WEB"), ("F1.2024.R20.720p.WEB", "F1.2024.R21.720p.WEB"),
+						("Movie.2019.CD1.avi", "Movie.2019.CD2.avi"), ("Show.S01.3.5.1080p", "Show.S01.1080p")]:
+	differ(f"{first} / {second}", first, second)
+
+# --- Episode numbers glued to letters --------------------------------------------
+check("Season.1.E05", suggest_name("Show.Season.1.E05.1080p"), "1x05 - Show - 1080p")
+check("Season 1 EP5", suggest_name("Show Season 1 EP5 1080p"), "1x05 - Show - 1080p")
+check("Temporada 1 CAP5", suggest_name("Show Temporada 1 CAP5 1080p"), "1x05 - Show - 1080p")
+check("SEASON 2 EPISODE 3", suggest_name("Show SEASON 2 EPISODE 3 1080p"), "2x03 - Show - 1080p")
+check_fields("Show Temporada 1 e 2 1080p", season="1", episode_number="")  # Portuguese: seasons 1 and 2
+check("which is not season 1 alone", suggest_name("Show Temporada 1 e 2 1080p"), None)
+for first, second in [("Show.Season.1.E05.1080p", "Show.Season.1.E06.1080p"), ("Show Season 1 EP5 1080p", "Show Season 1 EP6 1080p"),
+						("Show Temporada 1 CAP5 1080p", "Show Temporada 1 CAP6 1080p"),
+						("Show 2nd Season EP05 1080p", "Show 2nd Season EP06 1080p"),
+						("Show.2023.EP01.1080p.WEB", "Show.2023.EP02.1080p.WEB"), ("Show.2023.E01.1080p.WEB", "Show.2023.E02.1080p.WEB"),
+						("Doc.2017.1of7.Title.1080p", "Doc.2017.2of7.Title.1080p")]:
+	differ(f"{first} / {second}", first, second)
+	differ(f"{first} / {second} (S prefix)", first, second, season_prefix="S")
+check("an episode after a year is left alone", suggest_name("Show.2023.EP01.1080p.WEB"), None)
+check("so is a part of a series", suggest_name("Doc.2017.1of7.Title.1080p"), None)
+
+# --- Only what every release carries goes unnoticed --------------------------------
+# Whatever a movie carries between its year and the metadata, or a season pack
+# between its season and the metadata, may be what tells it apart. Plain words
+# too: a race, a match, a documentary of a series, the extras of a movie
+for first, second in [("Formula1.2024.Mexico.Race.1080p.WEB.mkv", "Formula1.2024.Brazil.Race.1080p.WEB.mkv"),
+						("NFL.2024.Chiefs.at.Bills.1080p.WEB.mkv", "NFL.2024.Packers.at.Bears.1080p.WEB.mkv"),
+						("Wimbledon.2024.Mens.Final.1080p.WEB.mkv", "Wimbledon.2024.Womens.Final.1080p.WEB.mkv"),
+						("Wimbledon.2024.Final.1080p.WEB.mkv", "Wimbledon.2024.Semi.Final.1080p.WEB.mkv"),
+						("Movie.2019.Behind.the.Scenes.1080p.mkv", "Movie.2019.1080p.mkv"),
+						("Movie.2019.Making.Of.1080p.mkv", "Movie.2019.1080p.mkv"),
+						("Movie.2019.Deleted.Scenes.1080p.mkv", "Movie.2019.1080p.mkv"),
+						("Movie.2019.Interviews.1080p.mkv", "Movie.2019.1080p.mkv"),
+						("Movie.2019.Bloopers.1080p.mkv", "Movie.2019.1080p.mkv"),
+						("Planet.Earth.II.2016.Islands.1080p.BluRay.x264-GRP", "Planet.Earth.II.2016.Mountains.1080p.BluRay.x264-GRP"),
+						("BBC.2019.The.Planets.1080p.WEB.h264-GRP", "BBC.2019.Dynasties.1080p.WEB.h264-GRP"),
+						("Show.S01.Behind.The.Scenes.1080p", "Show.S01.1080p"), ("Show.S01.Special.1080p", "Show.S01.1080p"),
+						("Show.S01.Gag.Reel.1080p", "Show.S01.1080p"), ("Show.S01.S02.1080p", "Show.S01.1080p"),
+						("Show S01 + S02 1080p", "Show S01 1080p"), ("Movie.2019.II.1080p.mkv", "Movie.2019.1080p.mkv"),
+						# A movie followed by the words of a pack may be several of them
+						("Movie.2001.Collection.1080p.mkv", "Movie.2001.1080p.mkv"), ("Movie.2001.Saga.1080p", "Movie.2001.1080p"),
+						("Movie.2001.Trilogy.1080p", "Movie.2001.1080p")]:
+	differ(f"{first} / {second}", first, second)
+	differ(f"{first} / {second} (S prefix)", first, second, season_prefix="S")
+for name, expected in [
+		# Editions and cuts
+		("Blade.Runner.1982.The.Final.Cut.1080p.BluRay.x264-GRP", "Blade Runner (1982) - 1080p"),
+		("Apocalypse.Now.1979.Redux.1080p.BluRay.x264-GRP", "Apocalypse Now (1979) - 1080p"),
+		("Avatar.2009.Extended.Collectors.Edition.1080p.BluRay.x264-GRP", "Avatar (2009) - 1080p"),
+		("Alien.1979.Director's.Cut.1080p.BluRay.x264-GRP", "Alien (1979) - 1080p"),
+		("Terminator.2.1991.Extended.Special.Edition.1080p.BluRay", "Terminator 2 (1991) - 1080p"),
+		("Kingdom.of.Heaven.2005.Directors.Cut.Roadshow.1080p.BluRay", "Kingdom of Heaven (2005) - 1080p"),
+		("Avengers.Endgame.2019.IMAX.Enhanced.2160p.WEB-DL.DDP5.1.Atmos.HDR.HEVC-GRP", "Avengers Endgame (2019) - 4K HDR"),
+		("Movie.2019.Open.Matte.1080p.WEB-DL.x264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.3D.Half-SBS.1080p.BluRay.x264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.Anniversary.Edition.1080p.BluRay", "Movie (2019) - 1080p"),
+		("Movie.1960.Criterion.Collection.1080p.BluRay", "Movie (1960) - 1080p"),
+		("Pelicula (2019) Version Extendida [BluRay 1080p]", "Pelicula (2019) - 1080p"),
+		("Pelicula (2019) Montaje del Director [BluRay 1080p]", "Pelicula (2019) - 1080p"),
+		("Pelicula (2019) Edición Especial 25 Aniversario [BluRay 1080p]", "Pelicula (2019) - 1080p"),
+		# Release flags, languages, subtitles, the video
+		("Movie.2019.REPACK2.1080p.BluRay.x264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.iNTERNAL.1080p.BluRay.x264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.MULTi.TRUEFRENCH.1080p.BluRay.x264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.German.Dubbed.DL.1080p.WEB.h264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.iTA-ENG.1080p.WEB.h264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.Dual.Audio.Hindi.English.1080p.WEB.h264-GRP", "Movie (2019) - 1080p"),
+		("Movie.2019.HFR.1080p.WEB-DL.x264-GRP", "Movie (2019) - 1080p"),
+		("Movie (2019) 10-bit 1080p", "Movie (2019) - 1080p"),
+		("Movie 2019 1080p WEB-DL x264 [Eng Subs]", "Movie (2019) - 1080p"),
+		("Pelicula (2019) [BluRay 1080p][AC3 5.1 Castellano DTS 5.1-Ingles+Subs][ES-EN]", "Pelicula (2019) - 1080p"),
+		("Pelicula (2019) [MicroHD 1080p][AC3 5.1-Castellano-AC3 5.1 Ingles+Subs][ES-EN]", "Pelicula (2019) - 1080p"),
+		("Pelicula (2019) [Dual Latino] [1080p]", "Pelicula (2019) - 1080p"),
+		("Pelicula (2019) [Cast/Ing] [1080p]", "Pelicula (2019) - 1080p"),
+		("Pelicula (2019) [Español] [1080p]", "Pelicula (2019) - 1080p"),
+		("Pelicula (2019) Subtitulada 1080p", "Pelicula (2019) - 1080p"),
+		# A site, a checksum, the group
+		("Pelicula (2019) [www.DonTorrent.com] [1080p]", "Pelicula (2019) - 1080p"),
+		("Gladiator II (2024) [www.site.com] 1080p.mkv", "Gladiator II (2024) - 1080p.mkv"),
+		("[Group] Movie (2019) [ABCD1234].mkv", None),  # No resolution: the default template needs one
+		# Packs: the words of a pack are fine after a range of years or a season
+		("Harry Potter (2001-2011) Complete Collection [1080p]", "Harry Potter (2001-2011) - 1080p"),
+		("Friends.S01-S10.Complete.Series.1080p", "T1-T10 - Friends - 1080p"),
+		("Show.S01.Season.Pack.1080p", "T1 - Show - 1080p"),
+		("Show.S01.REPACK.1080p.WEB.H264-GRP", "T1 - Show - 1080p"),
+		("Show.S01.Uncensored.1080p.WEB.H264-GRP", "T1 - Show - 1080p"),
+		("Show - Season 1 - Complete [1080p]", "T1 - Show - 1080p"),
+		("[Group] Show S2 [Batch] [1080p]", "T2 - Show - 1080p"),
+		("[Group] Show S2 (BD 1080p) [Dual Audio]", "T2 - Show - 1080p"),
+		("Serie Temporada 1 Completa [HDTV 720p]", "T1 - Serie - 720p"),
+		("Serie - Temporada 2 [www.DonTorrent.com] [HDTV 720p]", "T2 - Serie - 720p"),
+		("Serie S01 [1080p][Castellano][Dual]", "T1 - Serie - 1080p")]:
+	check(f"what every release carries: {name}", suggest_name(name), expected)
+check("a checksum is no number",
+	suggest_name("[Group] Movie (2019) [ABCD1234].mkv", template_movie="{title} ({year})[.{extension}]"), "Movie (2019).mkv")
+check("nor is the group", suggest_name("Show.S01-GRP", template_season="{titulo} - T{temporada}"), "Show - T1")
+check("unless it is just a number", suggest_name("Breaking Bad - T01-05", template_season="{titulo} - T{temporada}"), None)
+
+# --- 'Pack' and 'Collection' with no title of the file's own -----------------------
+# They may be the end of the title ('Wolf Pack'), so they only go when the
+# file's own title shows it. Folders and files of the torrent agree
+check("a bare episode of Wolf Pack", suggest_file_name("01.mkv", parent_name="Wolf.Pack.S01-S02.1080p", folder_name="Season 1"),
+	"1x01 - Wolf Pack - 1080p.mkv")
+check("and its folder", suggest_folder_name("Season 1", "Wolf.Pack.S01-S02.1080p"), "T1 - Wolf Pack - 1080p")
+check("a file with just the episode", suggest_file_name("S01E01.mkv", parent_name="Wolf.Pack.S01-S02.1080p"),
+	"1x01 - Wolf Pack - 1080p.mkv")
+check("a bare episode of Rat Pack", suggest_file_name("01.mkv", parent_name="Rat.Pack.S01-S02.1080p", folder_name="Season 1"),
+	"1x01 - Rat Pack - 1080p.mkv")
+check("the single video of Wolf Pack", suggest_file_name("video.mkv", parent_name="Wolf.Pack.1080p.WEB", single_video=True),
+	"Wolf Pack - 1080p.mkv")
+check("the folder of a collection", suggest_folder_name("Temporada 2", "Friends.Collection.1080p"), "T2 - Friends Collection - 1080p")
+check("agrees with its bare files", suggest_file_name("01.mkv", parent_name="Friends.Collection.1080p", folder_name="Temporada 2"),
+	"2x01 - Friends Collection - 1080p.mkv")
+check("a file of its own title shows the show",
+	suggest_file_name("Friends.S02E01.mkv", parent_name="Friends.Collection.1080p", folder_name="Temporada 2"), "2x01 - Friends - 1080p.mkv")
+check("and so does a folder of its own title", suggest_folder_name("Friends.S02", "Friends.Collection.1080p"), "T2 - Friends - 1080p")
+check("a complete collection is no title",
+	suggest_file_name("01.mkv", parent_name="Friends.The.Complete.Collection.1080p", folder_name="Season 1"), "1x01 - Friends - 1080p.mkv")
+check("nor a complete series", suggest_folder_name("Season 1", "Wolf.Pack.Complete.Series.1080p"), "T1 - Wolf Pack - 1080p")
+
+# --- 'Season - N' ------------------------------------------------------------------
+check_fields("Show - Season - 1 - 1080p", title="Show", season="1", chapter="T1", is_series=True)
+check("a season behind a spaced dash", (series_identity("Show Season - 1 1080p") or {}).get("season"), 1)
+check("is renamed", suggest_name("Show - Season - 1 - 1080p"), "T1 - Show - 1080p")
+check("the ordinal one still wins", suggest_name("[Group] Show Name 2nd Season - 05 [1080p].mkv"), "2x05 - Show Name - 1080p.mkv")
+
+# --- More sample clips -------------------------------------------------------------
+for path in ["sample.show.name.s01e01.720p.hdtv.x264-grp.mkv", "Sample.Show.Name.S01E01.mkv", "sample_show.name.s01e01.mkv",
+			"sample_movie.name.2019.1080p.mkv", "Show.S01E01.sample.WEB.mkv", "Show.S01E01.sample.WEB-GRP.mkv",
+			"Show.S01E01.sample.WEB.1080p.mkv"]:
+	check(f"{path} is a sample", is_sample_file(path), True)
+for path in ["Samples_of_Life_2020.mkv", "Samples.of.Life.S01E01.mkv", "Free.Sample.Web.Series.2016.mkv", "Sample.People.2000.1080p.mkv"]:
+	check(f"{path} is no sample", is_sample_file(path), False)
+check("a leading sample at the torrent root gets no name",
+	suggest_file_name("sample.show.name.s01e01.720p.hdtv.x264-grp.mkv", parent_name="Show.Name.S01.720p.HDTV.x264-GRP"), None)
+check("its episode does", suggest_file_name("show.name.s01e01.720p.hdtv.x264-grp.mkv", parent_name="Show.Name.S01.720p.HDTV.x264-GRP"),
+	"1x01 - Show Name - 720p.mkv")
 
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
