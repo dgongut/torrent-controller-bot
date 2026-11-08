@@ -214,7 +214,7 @@
 	"ADD_CANCELLED": "❌ Cancelado, no se ha añadido el torrent",
 	"ADD_USAGE": "Envíame un fichero .torrent, un enlace magnet o una URL a un fichero .torrent y te preguntaré dónde descargarlo",
 	"INPUT_CANCELLED": "❌ Operación cancelada",
-	"INPUT_CANCEL_HINT": "💬 Responde a este mensaje. Escribe <code>cancelar</code> para cancelar.",
+	"INPUT_CANCEL_HINT": "💬 Responde a este mensaje. Pulsa en /cancel para cancelar.",
 	"STARTUP_MESSAGE": "🟢 <b>torrent-controller-bot</b> activo\n✅ Conectado a <b>$2</b>\n🧲 Torrents: <b>$3</b>\n⚙️ <b>v$1</b>",
 	"STARTUP_MESSAGE_ERROR": "🟢 <b>torrent-controller-bot</b> activo\n❌ Error de conexión con el gestor de torrents:\n<code>$2</code>\n⚙️ <b>v$1</b>",
 	"BUTTON_MASS_RESUME": "▶️ Reanudar todos",

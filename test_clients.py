@@ -1186,6 +1186,16 @@ def transmission_session_stats():
 		(3000, 2000, 60, 90000, 80000, 6000, 7))
 
 
+# qBittorrent only knows the free space of its default save path: another
+# folder may be on another disk, so its space is unknown
+free_qbit = qbittorrent_client.QBittorrentClient.__new__(qbittorrent_client.QBittorrentClient)
+free_qbit._get_json = lambda endpoint, params=None, kind=None: (
+	{"save_path": "/downloads/"} if endpoint == "app/preferences" else {"server_state": {"free_space_on_disk": 111}})
+check("qbit: free space of the default save path", free_qbit.get_free_space("/downloads"), 111)
+check("qbit: and of a folder inside it", free_qbit.get_free_space("/downloads/Films"), 111)
+check("qbit: a folder elsewhere is unknown", free_qbit.get_free_space("/mnt/other_disk"), -1)
+check("qbit: a folder only sharing the start is elsewhere", free_qbit.get_free_space("/downloads2"), -1)
+
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
 	print("\n\n".join(FAILED))

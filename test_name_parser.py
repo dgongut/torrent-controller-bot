@@ -227,6 +227,33 @@ check("padded field absent drops the whole optional block",
 	"Minions and Monsters")
 
 # --- End-to-end through suggest_name / suggest_file_name ----------------------
+# A season numbered by its year is no movie, and a spaced extension is still one
+check("an episode of season 2024 gets no movie name", suggest_name("Show.S2024E01.1080p.mkv"), None)
+check("'Title . mkv' keeps its extension out of the title",
+	suggest_name("Show S01E01 - Title . mkv", template_series="{title} - {chapter}[ - {episode_title}][.{extension}]"),
+	"Show - 1x01 - Title.mkv")
+# An anime episode with no season is never taken for a film, fixed release or not
+for name in ("[SubsPlease] Show - 12 [1080p].mkv", "[SubsPlease] Show - 12v2 [1080p].mkv"):
+	check(f"no movie name for {name}", suggest_name(name), None)
+# A sequel's subtitle is never a language of the first film
+for subtitle, video in (("Alien 3.srt", "Alien.mkv"), ("Alien 3.es.srt", "Alien.mkv"), ("Movie-2.srt", "Movie.mkv")):
+	check(f"{subtitle} is not a subtitle of {video}", companion_subtitle_name(subtitle, video, "New.mkv"), None)
+check("a regional language still is", companion_subtitle_name("Alien.es-419.srt", "Alien.mkv", "New.mkv"), "New.es-419.srt")
+# Every episode of a multi-episode file counts: it never shares its name with
+# the single episode or the double it starts with
+for name, expected in (
+		("Show.S01E05.mkv", "1x05 - Show.mkv"),
+		("Show.S01E05.E06.mkv", "1x05-06 - Show.mkv"),
+		("Show.S01E05.S01E06.mkv", "1x05-06 - Show.mkv"),
+		("Show.1x05x06.mkv", "1x05-06 - Show.mkv"),
+		("Show.S01E05E06E07.mkv", "1x05-07 - Show.mkv"),
+		("Show.S01E05-06-07.mkv", "1x05-07 - Show.mkv"),
+		("Show.S01E05.E3.Conference.mkv", "1x05 - Show.mkv")):
+	check(f"multi-episode {name}", suggest_name(name), expected)
+check("suggest_name: an edited audio is no edition of its own",
+	suggest_name("Constantine (2005) [PROPER] [Audio Editado] UHDRIP 2160p DV HDR10 AV1 TrueHD Atmos 7.1-HDZ.mkv",
+		template_movie="{title}[ ({year})] - {resolution}[ {hdr}][.{extension}]"),
+	"Constantine (2005) - 4K HDR.mkv")
 check("suggest_name with padded custom template",
 	suggest_name("Breaking.Bad.S01E03.720p.HDTV.x264.mkv",
 		template_series="{season.2}x{episode.3} - {title}[ - {resolution}][.{extension}]"),

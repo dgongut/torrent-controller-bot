@@ -1098,9 +1098,13 @@ for name, key in titles.items():
 			check(f"{call} repaints the {name} screen", title_of(text), bot.get_text(key))
 			screen(call)  # Back as it was
 
-for call, key in ((bot.build_call("toggleAltSpeed"), "SETTINGS_SPEED_TITLE"), (bot.build_call("toggleDownLimit"), "SETTINGS_SPEED_TITLE"),
-				(bot.build_call("toggleUpLimit"), "SETTINGS_SPEED_TITLE")):
-	check(f"{call} repaints the speed screen", title_of(screen(call)[0]), bot.get_text(key))
+check("toggleAltSpeed repaints the speed screen", title_of(screen(bot.build_call("toggleAltSpeed"))[0]), bot.get_text("SETTINGS_SPEED_TITLE"))
+# Turning on a limit never set anywhere asks for it: there is none to bring back
+for call, action in ((bot.build_call("toggleDownLimit"), "downLimit"), (bot.build_call("toggleUpLimit"), "upLimit")):
+	bot.pending_inputs.clear()
+	press(call)
+	check(f"{call} with no limit known asks for one", [p["action"] for p in bot.pending_inputs.values()], [action])
+bot.pending_inputs.clear()
 fresh()
 press(bot.build_call("toggleAltSpeed"))
 check("turtle mode shows on the speed row", button_texts(bot.build_settings("limits")[1])[0],

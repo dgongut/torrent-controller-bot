@@ -39,6 +39,10 @@ DEFAULTS = {
 	# here: _load only reads back the keys listed, so a missing one was dropped
 	# on every restart and wiped from the file on the next save
 	"tracker_limits": {},
+	# The last global speed limit of each direction, {"down": kbps, "up": kbps},
+	# so turning a limit off and on again brings it back. qBittorrent, Deluge
+	# and Download Station keep no limit while it is off
+	"saved_speed_limits": {},
 }
 
 _lock = threading.Lock()

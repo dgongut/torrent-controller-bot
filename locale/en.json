@@ -214,7 +214,7 @@
 	"ADD_CANCELLED": "❌ Cancelled, the torrent has not been added",
 	"ADD_USAGE": "Send me a .torrent file, a magnet link or a URL to a .torrent file and I will ask you where to download it",
 	"INPUT_CANCELLED": "❌ Operation cancelled",
-	"INPUT_CANCEL_HINT": "💬 Reply to this message. Type <code>cancel</code> to cancel.",
+	"INPUT_CANCEL_HINT": "💬 Reply to this message. Tap /cancel to cancel.",
 	"STARTUP_MESSAGE": "🟢 <b>torrent-controller-bot</b> active\n✅ Connected to <b>$2</b>\n🧲 Torrents: <b>$3</b>\n⚙️ <b>v$1</b>",
 	"STARTUP_MESSAGE_ERROR": "🟢 <b>torrent-controller-bot</b> active\n❌ Connection error with the torrent client:\n<code>$2</code>\n⚙️ <b>v$1</b>",
 	"BUTTON_MASS_RESUME": "▶️ Resume all",

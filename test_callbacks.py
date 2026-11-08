@@ -2168,6 +2168,83 @@ check("a download past its deadline has its connection closed", closed, [True])
 bot_module.URL_DOWNLOAD_DEADLINE = config.URL_DOWNLOAD_DEADLINE
 bot_module.requests.get = _real_requests_get
 
+# A typed folder for a torrent waiting to be added that never comes (cancel
+# typed, the cancel button, another button) brings the folder choice back:
+# the question replaced it, and nothing else leads to that torrent
+def add_folder_screen_after(leave):
+	bot_module.pending_inputs.clear()
+	pending_id = bot_module.new_pending_torrent("Some.Movie.2024", magnet="magnet:?xt=urn:btih:abc")
+	bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("addNewDir", pending_id))
+	EDITS.clear()
+	leave()
+	calls = [data for text, markup in EDITS for data in buttons_of((text, markup))]
+	return bot_module.build_call("addNewDir", pending_id) in calls
+
+
+check("typing cancel on the folder of a new torrent shows the folders again",
+	add_folder_screen_after(lambda: bot_module.handle_text(tg_message("cancelar"))), True)
+check("the cancel button on the folder of a new torrent shows the folders again",
+	add_folder_screen_after(lambda: bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("cancelInput"))), True)
+check("another button while the folder is asked shows the folders again",
+	add_folder_screen_after(lambda: bot_module.drop_pending_input(CHAT_ID, 1)), True)
+bot_module.pending_inputs.clear()
+
+# A typed torrent name with a slash is refused, as for a file or a folder,
+# and '/cancel@Bot' (the command as a group sends it) cancels
+def typed_torrent_rename(answer):
+	bot_module.pending_inputs.clear()
+	CALLS.clear()
+	bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("rename", TORRENT_ID, "a", 0))
+	manual = [c for c in callbacks_of(EDITS[-1][1]) if c.startswith("renameManual")][0]
+	bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, manual)
+	bot_module.handle_text(tg_message(answer, chat_type="private"))
+	return [c for c in CALLS if "rename" in str(c)], EDITS[-1][0]
+
+
+renamed, text = typed_torrent_rename("/cancel@OwnBot")
+check("'/cancel@Bot' cancels a typed rename", (renamed, text), ([], bot_module.get_text("INPUT_CANCELLED")))
+# The prompt offers /cancel to tap: it cancels like the words always did
+for answer in ("/cancel", "/CANCEL", "/cancel@OwnBot", "cancelar", "cancel"):
+	check(f"{answer!r} cancels a question", typed_torrent_rename(answer), ([], bot_module.get_text("INPUT_CANCELLED")))
+check("the question offers /cancel to tap", "/cancel" in bot_module.get_text("INPUT_CANCEL_HINT"), True)
+renamed, text = typed_torrent_rename("Some/Name")
+check("a typed torrent name with a slash is refused", (renamed, "/" in text and "<code>" in text), ([], True))
+bot_module.pending_inputs.clear()
+
+# A global speed limit turned off and on again comes back, even when the
+# manager stores no limit as 0 (qBittorrent) and the bot restarted meanwhile
+class ForgetfulLimits:
+	def __init__(self):
+		self.limits = {"down": 512, "up": 0}
+
+	def get_settings(self):
+		settings = dict(_real_get_settings())
+		for direction, kbps in self.limits.items():
+			settings[f"speed_limit_{direction}"] = kbps
+			settings[f"speed_limit_{direction}_enabled"] = kbps > 0
+		return settings
+
+	def set_speed_limit(self, direction, kbps, enabled):
+		self.limits[direction] = int(kbps) if enabled and kbps else 0
+
+
+forgetful = ForgetfulLimits()
+_real_get_settings, _real_set_speed_limit = bot_module.client.get_settings, bot_module.client.set_speed_limit
+bot_module.client.get_settings, bot_module.client.set_speed_limit = forgetful.get_settings, forgetful.set_speed_limit
+bot_module.bot_settings.set("saved_speed_limits", {})
+bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("toggleDownLimit"))
+check("a global limit turned off is off", forgetful.limits["down"], 0)
+bot_module.bot_settings._settings = None  # A restart: the settings are read back from the file
+bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("toggleDownLimit"))
+check("turned on again, after a restart, it is the limit it had", forgetful.limits["down"], 512)
+bot_module.pending_inputs.clear()
+bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("toggleUpLimit"))
+check("with no limit to bring back, one is asked", (forgetful.limits["up"], bot_module.pending_inputs.get((CHAT_ID, 1), {}).get("action")),
+	(0, "upLimit"))
+bot_module.pending_inputs.clear()
+bot_module.client.get_settings, bot_module.client.set_speed_limit = _real_get_settings, _real_set_speed_limit
+bot_module.bot_settings.set("saved_speed_limits", {})
+
 # Environment values that used to crash the start, or break the lists
 def config_with(**env):
 	run = subprocess.run([sys.executable, "-c", "import config; print(config.TORRENTS_PER_PAGE, config.TORRENT_CLIENT_HOST, "

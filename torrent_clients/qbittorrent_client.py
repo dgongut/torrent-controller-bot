@@ -586,10 +586,12 @@ class QBittorrentClient(TorrentClient):
 			# it, so it does not always match the torrent name
 			root = content_root(paths)
 			if root:
-				# Content inside a folder: rename the folder
-				self._post("torrents/renameFolder", data={
-					"hash": torrent_id, "oldPath": root, "newPath": new_name})
-			elif len(paths) == 1:
+				# Content inside a folder: rename the folder, unless it has that
+				# name already (qBittorrent answers 409 to a rename onto itself)
+				if root != new_name:
+					self._post("torrents/renameFolder", data={
+						"hash": torrent_id, "oldPath": root, "newPath": new_name})
+			elif len(paths) == 1 and paths[0] != new_name:
 				# Single file at top level: rename the file on disk too
 				self._post("torrents/renameFile", data={
 					"hash": torrent_id, "oldPath": paths[0], "newPath": new_name})
@@ -672,7 +674,14 @@ class QBittorrentClient(TorrentClient):
 			raise TorrentClientError(f"Error getting default download dir: {e}")
 
 	def get_free_space(self, path):
+		"""qBittorrent only tells the free space of its default save path: any
+		other folder may be on another disk, so its space is unknown (-1)"""
 		try:
+			if path:
+				save_path = (self._get_json("app/preferences", kind=dict).get("save_path") or "").rstrip("/")
+				folder = path.rstrip("/")
+				if save_path and folder != save_path and not folder.startswith(save_path + "/"):
+					return -1
 			server_state = self._get_json("sync/maindata", kind=dict).get("server_state", {})
 			return server_state.get("free_space_on_disk", -1)
 		except TorrentClientError:

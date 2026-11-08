@@ -88,9 +88,13 @@ _MORE_EPISODES = re.compile(
 # Multi-episode/multi-season packs: S04E01-E08, S01E01E02, 1x01-02, S01-S08
 # (or with T), Temporadas 1-5, Temporada Completa 1 a 5, Seasons 1-5
 _EPISODE_RANGE_PATTERNS = [
+	# Every further episode may repeat the marker and the season, after a dot
+	# or not ('S01E05.E06', 'S01E05.S01E06', 'S01E05E06E07'): the range runs to
+	# the last one, so a triple never reads as the double it starts with
 	re.compile(_SEASON_MARK + r'(\d{1,2})[\s._-]?[Ee][Pp]?(\d{1,3})'
-		r'(?:[\s._-]?-[\s._-]?(?:[Ee][Pp]?)?|[Ee][Pp]?)(\d{1,3})(?![\dpP])'),
-	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})-(?:\1[xX])?(\d{2,3})(?![\dpP])'),
+		r'(?:(?:[\s._-]?-[\s._-]?(?:' + _SEASON_MARK + r'0*\1[\s._-]?)?(?:[Ee][Pp]?)?'
+		r'|[\s._]?(?:' + _SEASON_MARK + r'0*\1[\s._-]?)?[Ee][Pp]?)(\d{1,3}))+(?![\dpP])'),
+	re.compile(r'(?<![\dxX])(\d{1,2})[xX](\d{2,3})(?:[-xX](?:\1[xX])?(\d{2,3}))+(?![\dpP])'),
 ]
 _SEASON_RANGE_PATTERNS = [
 	re.compile(r'\b[Ss](\d{1,2})[\s._-]?-[\s._-]?[Ss](\d{1,2})\b|\b[Tt](\d{1,2})[\s._-]?-[\s._-]?[Tt](\d{1,2})\b'),
@@ -258,7 +262,7 @@ _SHARED_WORDS = frozenset((
 	"extended extendida extendido unrated uncut uncensored censored remastered remaster remasterizada remasterizado "
 	"remasterised restored restaurada restaurado theatrical cinema cine imax enhanced directors director dc cut "
 	"version edition edicion montaje collectors coleccionista ultimate definitive definitiva criterion deluxe redux "
-	"roadshow anniversary aniversario alternate alt despecialized colorized colourized om oar ws fs widescreen "
+	"roadshow anniversary aniversario editado editada edited alternate alt despecialized colorized colourized om oar ws fs widescreen "
 	"fullscreen 3d sbs hsbs hou se ce ue "
 	# Release flags and subtitles
 	"proper repack rerip real internal int limited ltd retail hybrid readnfo read nfo nfofix dirfix syncfix subfix "
@@ -341,8 +345,9 @@ class TemplateError(Exception):
 def _split_extension(filename):
 	if "." in filename:
 		potential_name, potential_ext = filename.rsplit(".", 1)
-		if potential_ext.lower() in VALID_EXTENSIONS:
-			return potential_name, potential_ext
+		# 'Title . mkv' is still a .mkv: the spaces belong to neither part
+		if potential_ext.strip().lower() in VALID_EXTENSIONS:
+			return potential_name.rstrip(), potential_ext.strip()
 	return filename, ""
 
 
@@ -437,6 +442,16 @@ def _tells_apart(dropped, group="", pack=False):
 		if word not in shared and not _SHARED_TOKEN.fullmatch(word):
 			return True
 	return False
+
+
+def _find_episode_range(name):
+	"""The first range of episodes that runs forwards: 'S01E05.E3.Conference'
+	is episode 5 with 'E3' in its title, never the range 5 to 3"""
+	for pattern in _EPISODE_RANGE_PATTERNS:
+		for match in pattern.finditer(name):
+			if int(match.group(3)) > int(match.group(2)):
+				return match
+	return None
 
 
 def _find_first(patterns, name):
@@ -625,7 +640,7 @@ def parse_metadata(filename, season_prefix="T", allow_bare_episode=False):
 	episode_end = None
 	episode_span = None
 	pack_end = None  # End of the marker of a season pack: what follows it is dropped
-	episode_range = _find_first(_EPISODE_RANGE_PATTERNS, name)
+	episode_range = _find_episode_range(name)
 	chapter_range = None if episode_range else _find_chapter_range(name)
 	chapter_year = _find_chapter_year(name)
 	episode_info = _find_episode(name, chapter_year.span() if chapter_year else None)
@@ -959,8 +974,12 @@ def _drop_series_title_from_episode_title(fields):
 
 
 # 'Frieren - 12', 'One Piece - 1100': a number behind a dash ends the title of an
-# episode with no season marker, which no template can name without its season
-_UNMARKED_EPISODE = re.compile(r'\s[-–]\s*\d{1,4}$')
+# episode with no season marker, which no template can name without its season.
+# Also with the version of a fixed release ('Frieren - 12v2')
+_UNMARKED_EPISODE = re.compile(r'\s[-–]\s*\d{1,4}(?:[vV]\d{1,2})?$')
+# 'Show.S2024E01': a season numbered by its year, which the season of no
+# template can hold (a renamed '2024x01' would not even read back as one)
+_YEAR_SEASON_EPISODE = re.compile(r'(?<![A-Za-z0-9])[SsTt](?:19|20)\d{2}[\s._-]?[Ee]\d{1,3}(?!\d)')
 
 
 def _render(template, fields, filename):
@@ -970,6 +989,9 @@ def _render(template, fields, filename):
 		return None
 	# Without a year, nothing tells a movie apart from such an episode
 	if not fields["is_series"] and not fields["year"] and _UNMARKED_EPISODE.search(fields["title"]):
+		return None
+	# Nor is an episode of a season numbered by its year a movie
+	if not fields["is_series"] and _YEAR_SEASON_EPISODE.search(fields["title"]):
 		return None
 	try:
 		suggested = render_template(template, fields)
@@ -1223,7 +1245,9 @@ def companion_subtitle_name(subtitle_name, video_name, new_video_name):
 	after the video is renamed, preserving any language suffix and its own
 	extension. Returns None when the subtitle does not belong to the video:
 	its name has to be the video's, alone or followed by a separator ('01.es'
-	goes with '01', '10' does not go with '1')"""
+	goes with '01', '10' does not go with '1'), and what follows can not start
+	with a number: 'Alien 3.srt' or 'Movie-2.srt' is the sequel's, never a
+	language of 'Alien' or 'Movie'"""
 	subtitle_stem, _, subtitle_ext = subtitle_name.rpartition(".")
 	if not subtitle_stem or subtitle_ext.lower() not in SUBTITLE_EXTENSIONS:
 		return None
@@ -1232,6 +1256,8 @@ def companion_subtitle_name(subtitle_name, video_name, new_video_name):
 		return None
 	suffix = subtitle_stem[len(video_stem):]
 	if suffix and suffix[0] not in "._- ":
+		return None
+	if re.match(r'[._\- ]+\d+(?![A-Za-z])', suffix):
 		return None
 	new_stem = _split_extension(new_video_name)[0]
 	return f"{new_stem}{suffix}.{subtitle_ext}"

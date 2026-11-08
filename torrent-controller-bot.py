@@ -28,7 +28,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1471,14 +1471,25 @@ def subtitle_renames(torrent, video_path, new_name, subtitles=None):
 	renames = []
 	folder = file_folder(video_path)
 	video_file = file_basename(video_path)
+	videos = [path for path, _, _ in torrent.files if file_folder(path) == folder and is_video_file(path)]
 	candidates = (subtitles if subtitles is not None else subtitles_by_folder(torrent)).get(folder, [])
 	for path in candidates:
 		if path == video_path:
 			continue
 		companion = companion_subtitle_name(file_basename(path), video_file, new_name)
-		if companion and companion != file_basename(path):
+		if companion and companion != file_basename(path) and subtitle_owner(path, videos) == video_path:
 			renames.append((path, companion))
 	return renames
+
+
+def subtitle_owner(subtitle_path, videos):
+	"""The video a subtitle goes with when several of its folder would take
+	it: the one with the longest name ('Alien Resurrection.es.srt' is the
+	one of 'Alien Resurrection.mkv', not of 'Alien.mkv'), the first one on a
+	tie ('Ep.mkv' and 'Ep.mp4'), so a subtitle is only ever renamed once"""
+	subtitle = file_basename(subtitle_path)
+	owners = [video for video in videos if companion_subtitle_name(subtitle, file_basename(video), "x") is not None]
+	return max(owners, key=lambda video: len(file_basename(video).rpartition(".")[0]), default=None)
 
 
 def build_rename_plan(torrent, only_path=None, within=""):
@@ -2415,8 +2426,10 @@ def keep_hand_limit(torrent_id, fields):
 def retry_failed_rule_changes(torrents):
 	"""The rule changes that failed, applied as they would have been: the
 	field changed, to every torrent that follows the rule"""
+	# Copies: a change failing meanwhile adds its field to the set kept here,
+	# and must still be there after this round
 	with _rule_retries_lock:
-		retries = dict(_rule_retries)
+		retries = {tracker: frozenset(fields) for tracker, fields in _rule_retries.items()}
 	for tracker, fields in retries.items():
 		rule = tracker_limits.get_rule(tracker)
 		try:
@@ -2426,8 +2439,11 @@ def retry_failed_rule_changes(torrents):
 			warning(f"Cannot apply the changed limits of the tracker {tracker} yet: {e}")
 			continue
 		with _rule_retries_lock:
-			if _rule_retries.get(tracker) == fields:
-				del _rule_retries[tracker]
+			left = _rule_retries.get(tracker, set()) - fields
+			if left:
+				_rule_retries[tracker] = left
+			else:
+				_rule_retries.pop(tracker, None)
 
 
 def apply_pending_tracker_limits(torrents):
@@ -3989,6 +4005,30 @@ def expected_info_hash(magnet=None, torrent_data=None):
 
 
 # ---------------------------------------------------------------------------
+# GLOBAL SPEED LIMITS
+# ---------------------------------------------------------------------------
+
+def saved_speed_limit(direction):
+	return (bot_settings.get("saved_speed_limits") or {}).get(direction) or 0
+
+
+def remember_speed_limit(direction, kbps):
+	if kbps and kbps > 0:
+		saved = dict(bot_settings.get("saved_speed_limits") or {})
+		saved[direction] = int(kbps)
+		bot_settings.set("saved_speed_limits", saved)
+
+
+def turn_speed_limit_off(direction, settings=None):
+	"""Off, keeping the limit it had: most managers forget it (qBittorrent
+	stores no limit as 0) or keep it only until the bot restarts"""
+	settings = settings or client.get_settings()
+	if settings.get(f"speed_limit_{direction}_enabled"):
+		remember_speed_limit(direction, settings.get(f"speed_limit_{direction}"))
+	client.set_speed_limit(direction, None, enabled=False)
+
+
+# ---------------------------------------------------------------------------
 # MASS ACTIONS
 # ---------------------------------------------------------------------------
 
@@ -4179,12 +4219,29 @@ def pop_pending_input(chat_id, user_id, thread_id=None, any_thread=False):
 		return pending_inputs.pop((chat_id, user_id))
 
 
+def back_to_add_dir(chat_id, pending, message_id=None):
+	"""A typed folder for a torrent waiting to be added that never came: the
+	question took the place of the folder choice, so that choice comes back,
+	otherwise nothing would lead to the torrent any more and it would never be
+	added. False when the question was another one, or the torrent is gone"""
+	if not pending or pending.get("action") != "addDir":
+		return False
+	pending_id = pending["pending_id"]
+	pending_torrent = get_pending_torrent(pending_id)
+	if pending_torrent is None:
+		return False
+	ask_download_dir(chat_id, pending_id, pending_torrent.get("name") or "", thread_id=pending.get("thread"),
+					message_id=message_id)
+	return True
+
+
 def drop_pending_input(chat_id, user_id):
 	"""The user did something else (a button, a command, a file): the question
 	is abandoned, and its prompt goes with it"""
 	pending = pop_pending_input(chat_id, user_id, any_thread=True)
 	if pending and pending.get("prompt_message_id"):
 		delete_message(chat_id, pending["prompt_message_id"])
+	back_to_add_dir(chat_id, pending)
 	return pending
 
 
@@ -4213,7 +4270,10 @@ def handle_pending_input(message, pending):
 	# The paginated message is still on screen, so a "back" button here would duplicate it
 	back_markup = close_markup() if action == "gotoPage" else back_close_markup(pending.get("back_call"))
 
-	if not text or text.lower() in ("/cancel", "cancel", "cancelar"):
+	# '/cancel@Bot' is how a group sends the command
+	if not text or text.lower() in ("cancel", "cancelar") or re.fullmatch(r'/cancel(?:@\w+)?', text, re.IGNORECASE):
+		if back_to_add_dir(chat_id, pending):
+			return
 		send_message(chat_id, get_text("INPUT_CANCELLED"), reply_markup=back_markup, thread_id=thread_id)
 		return
 
@@ -4233,6 +4293,12 @@ def handle_pending_input(message, pending):
 		dispatch_callback(chat_id, pending["target_message_id"], message.from_user.id, f"{pending['base']}|{number - 1}",
 						thread_id=thread_id)
 	elif action == "rename":
+		if "/" in text:
+			# A torrent name is its folder or its file: a slash would move it
+			torrent = client.get_torrent(pending["torrent_id"])
+			key = "FOLDER_RENAME_INVALID" if torrent and torrent_is_folder(torrent) else "FILE_RENAME_INVALID"
+			send_message(chat_id, get_text(key), reply_markup=back_markup, thread_id=thread_id)
+			return
 		try:
 			# The check and the rename go together, see auto_rename_torrent
 			with _rename_lock:
@@ -4420,9 +4486,10 @@ def handle_pending_input(message, pending):
 		direction = "down" if action == "downLimit" else "up"
 		try:
 			if kbps == 0:
-				client.set_speed_limit(direction, None, enabled=False)
+				turn_speed_limit_off(direction)
 			else:
 				client.set_speed_limit(direction, kbps, enabled=True)
+				remember_speed_limit(direction, kbps)
 			send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"), screen="speed")
 		except TorrentClientError as e:
 			send_message(chat_id, get_text("ERROR_GENERIC", html.escape(str(e))), reply_markup=back_markup, thread_id=thread_id)
@@ -5575,11 +5642,19 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			render_settings(chat_id, message_id, "speed")
 
 		elif command in ("toggleDownLimit", "toggleUpLimit"):
+			direction = "down" if command == "toggleDownLimit" else "up"
 			settings = client.get_settings()
-			if command == "toggleDownLimit":
-				client.set_speed_limit("down", None, enabled=not settings["speed_limit_down_enabled"])
+			if settings[f"speed_limit_{direction}_enabled"]:
+				turn_speed_limit_off(direction, settings)
 			else:
-				client.set_speed_limit("up", None, enabled=not settings["speed_limit_up_enabled"])
+				kbps = settings[f"speed_limit_{direction}"] or saved_speed_limit(direction)
+				if not kbps:
+					# No limit known to bring back: asked, as when setting one
+					ask_for_input(chat_id, user_id, f"{direction}Limit",
+								get_text("SETTINGS_ASK_DOWN_LIMIT" if direction == "down" else "SETTINGS_ASK_UP_LIMIT"),
+								thread_id=thread_id, message_id=message_id, back_call=settings_call("speed"))
+					return
+				client.set_speed_limit(direction, kbps, enabled=True)
 			render_settings(chat_id, message_id, "speed")
 
 		elif command == "globalRatioSet":
@@ -5721,7 +5796,9 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 		elif command == "cancelInput":
 			pending_input = pop_pending_input(chat_id, user_id, any_thread=True)
 			back_call = (pending_input or {}).get("back_call")
-			if back_call:
+			if back_to_add_dir(chat_id, pending_input, message_id=message_id):
+				pass
+			elif back_call:
 				edit_message(chat_id, message_id, get_text("INPUT_CANCELLED"), back_close_markup(back_call))
 			else:
 				show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)

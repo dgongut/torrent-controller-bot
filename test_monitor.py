@@ -1727,6 +1727,41 @@ CLIENT.remove_torrents = _real_client_remove
 check("a manager busy right after the delete does not stop the rename", CLIENT.torrents[new.id].name, MOVIE_RENAMED)
 check("nor the notice of what was done", any(replaced_text([old], MOVIE_RENAMED) in t for t in texts()), True)
 
+# Each subtitle is renamed once, with the video it goes with: the longest
+# name of its folder, the first one on a tie
+folder = "Show.Name.S01.1080p"
+subs_torrent = TorrentInfo(id=new_id(), name=folder, status=TorrentStatus.SEEDING, progress=100, total_size=1, download_dir="/d", files=[
+	(f"{folder}/Show.Name.S01E01.1080p.mkv", 400, True), (f"{folder}/Show.Name.S01E01.1080p.mp4", 400, True),
+	(f"{folder}/Show.Name.S01E01.1080p.srt", 1, True)])
+subtitle_plan = [old for old, _ in bot.build_rename_plan(subs_torrent)[0] if old.endswith(".srt")]
+check("a subtitle two videos share is renamed once", subtitle_plan, [f"{folder}/Show.Name.S01E01.1080p.srt"])
+videos = ["Films/Alien.mkv", "Films/Alien Resurrection.mkv"]
+check("a subtitle goes with the longest name it matches", bot.subtitle_owner("Films/Alien Resurrection.es.srt", videos), videos[1])
+check("and the shorter one keeps its own", bot.subtitle_owner("Films/Alien.es.srt", videos), videos[0])
+
+# A rule change that fails while the retry of another one runs stays queued
+bot_settings.set("tracker_limits", {"t.org": {"ratio": 2.0, "down": 100, "up": 0}})
+bot._rule_retries.clear()
+bot._rule_retries["t.org"] = {"ratio"}
+_real_apply_rule_fields = bot.apply_rule_fields
+applied_fields = []
+
+
+def apply_while_another_fails(ids, rule, fields):
+	applied_fields.append(list(fields))
+	if len(applied_fields) == 1:
+		with bot._rule_retries_lock:
+			bot._rule_retries.setdefault("t.org", set()).add("down")
+
+
+bot.apply_rule_fields = apply_while_another_fails
+bot.retry_failed_rule_changes([])
+check("the retried field is done, the one failing meanwhile is kept", bot._rule_retries, {"t.org": {"down"}})
+bot.retry_failed_rule_changes([])
+check("and it is applied on the next round", (applied_fields[-1], bot._rule_retries), (["down"], {}))
+bot.apply_rule_fields = _real_apply_rule_fields
+bot_settings.set("tracker_limits", {})
+
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
 	print("\n\n".join(FAILED))
