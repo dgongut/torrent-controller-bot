@@ -1247,7 +1247,7 @@ check("an unauthorized command is not counted", pending_usage().get("cmd_version
 metrics = bot_module.collect_telemetry_metrics()
 check("the metrics are exactly the declared ones", sorted(metrics), sorted([
 	"client", "language", "admins", "telegram_group", "torrents_per_page", "notify_completed",
-	"notify_errors", "notify_external_added", "notify_ratio_reached", "auto_download", "auto_download_dir", "auto_category",
+	"notify_errors", "notify_external_added", "notify_ratio_reached", "auto_remove_ratio", "notify_auto_removed", "auto_download", "auto_download_dir", "auto_category",
 	"auto_rename", "auto_rename_files", "auto_rename_external", "auto_replace", "auto_move_series", "auto_move_series_external",
 	"low_space_warning", "favorite_dirs", "tracker_limits",
 	"custom_templates", "torrents", "transmission_major"]))
@@ -1262,6 +1262,14 @@ check("the ratio limit notice is reported", metrics["notify_ratio_reached"], Tru
 bot_module.client.supports_ratio_limit = False
 check("but never as on for a manager without ratio limits", bot_module.collect_telemetry_metrics()["notify_ratio_reached"], False)
 bot_module.client.supports_ratio_limit = True
+check("the automatic removal is reported off by default", (metrics["auto_remove_ratio"], metrics["notify_auto_removed"]), (False, False))
+bot_module.bot_settings.set("auto_remove_ratio", True)
+check("and on once turned on, with its notice", [bot_module.collect_telemetry_metrics()[k] for k in ("auto_remove_ratio", "notify_auto_removed")], [True, True])
+bot_module.client.supports_ratio_limit = False
+check("but never as on for a manager without ratio limits",
+	[bot_module.collect_telemetry_metrics()[k] for k in ("auto_remove_ratio", "notify_auto_removed")], [False, False])
+bot_module.client.supports_ratio_limit = True
+bot_module.bot_settings.set("auto_remove_ratio", False)
 for name, version, expected in (("qbittorrent", "qBittorrent 5.2.4", 5), ("transmission", "Transmission 4.1.3 (abc)", 4), ("deluge", "Deluge 2.2.0", 2)):
 	_real_test_connection, _real_client_name = bot_module.client.test_connection, bot_module.TORRENT_CLIENT
 	bot_module.client.test_connection = lambda version=version: version

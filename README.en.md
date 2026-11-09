@@ -34,6 +34,7 @@ Control your torrent client from a single place.
 - ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits
 - ✅ Notifications for completed downloads, torrent errors, torrents added outside the bot and torrents that stop seeding at their ratio limit, with a button to keep them seeding (can be toggled from the settings)
+- ✅ Remove from the manager the torrents that stop seeding at their limit (ratio or seeding time), leaving the downloaded files untouched, with an optional notice (off by default)
 - ✅ Automatic download without asking for the path, with a configurable directory
 - ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains and the torrents added outside the bot (can be toggled from the settings)
 - ✅ Replace a previous copy: when the name a download should take already belongs to another torrent, on completion it offers to delete the old one (with its data) and keep the new one, or does it without asking if you turn that on
@@ -172,6 +173,7 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 | Speed limits | ✅ | ✅ | ✅ | ✅ |
 | Alternative speed (turtle mode) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Ratio limit, per torrent and the manager's | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
+| Remove from the manager at its limit | ✅ ¹³ | ✅ ¹³ | ✅ ¹³ | ❌ ⁶ |
 | Speed limit per torrent | ✅ | ✅ | ✅ | ❌ ⁶ |
 | Limits per tracker | ✅ | ✅ ⁸ | ✅ ⁸ | ❌ ⁶ |
 | Reannounce to the tracker | ✅ | ✅ | ✅ | ❌ ⁷ |
@@ -204,6 +206,8 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 ¹¹ qBittorrent has no low priority: a file is downloaded with normal or high priority, or not at all.
 
 ¹² Needs DSM 7. Download Station still counts the files left out in the size of a task.
+
+¹³ The bot removes the torrent when the manager stops it for one of its limits, never when you pause it. qBittorrent has ratio and seeding time limits, the latter set in the manager itself; Transmission and Deluge, only ratio.
 
 ## Synology Download Station
 

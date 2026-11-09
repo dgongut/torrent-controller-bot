@@ -34,6 +34,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
 - ✅ Notificaciones de descarga completada, de errores en torrents, de torrents añadidos fuera del bot y de torrents que dejan de compartir al llegar a su límite de ratio, con un botón para que sigan compartiendo (activables desde los ajustes)
+- ✅ Quitar del gestor los torrents que dejan de compartir al llegar a su límite (de ratio o de tiempo compartiendo), sin tocar los ficheros descargados, con aviso opcional (desactivado por defecto)
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
 - ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene y de los torrents añadidos fuera del bot (activable desde los ajustes)
 - ✅ Sustituir una versión anterior: si el nombre que le toca a una descarga ya lo tiene otro torrent, al terminar te ofrece borrar el anterior (con sus datos) y quedarte con el nuevo, o lo hace sin preguntar si lo activas
@@ -173,6 +174,7 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Límites de velocidad | ✅ | ✅ | ✅ | ✅ |
 | Velocidad alternativa (modo tortuga) | ✅ | ✅ | ❌ ¹ | ❌ ¹ |
 | Límite de ratio, por torrent y del gestor | ✅ | ✅ | ✅ ⁵ | ❌ ⁶ |
+| Quitar del gestor al llegar a su límite | ✅ ¹³ | ✅ ¹³ | ✅ ¹³ | ❌ ⁶ |
 | Límite de velocidad por torrent | ✅ | ✅ | ✅ | ❌ ⁶ |
 | Límites por tracker | ✅ | ✅ ⁸ | ✅ ⁸ | ❌ ⁶ |
 | Reanunciar al tracker | ✅ | ✅ | ✅ | ❌ ⁷ |
@@ -205,6 +207,8 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 ¹¹ qBittorrent no tiene prioridad baja: un archivo se descarga con prioridad normal o alta, o no se descarga.
 
 ¹² Hace falta DSM 7. Download Station sigue contando en el tamaño de una tarea los archivos que no se descargan.
+
+¹³ El bot quita el torrent cuando el gestor lo para por uno de sus límites, nunca cuando lo pausas tú. qBittorrent tiene límite de ratio y de tiempo compartiendo, que se configura en el propio gestor; Transmission y Deluge, solo de ratio.
 
 ## Download Station de Synology
 

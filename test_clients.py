@@ -1109,6 +1109,22 @@ def fresh_transmission():
 
 
 @scenario
+def seeding_time_limits():
+	# The seeding time limit stops a torrent besides the ratio: the automatic removal tells it apart from a pause
+	torrents = {}
+	for torrent_hash, limit in (("a" * 40, 120), ("b" * 40, -1)):
+		torrent = qbit_torrent(torrent_hash, "Limits", state="stoppedUP", progress=1.0)
+		torrent["max_seeding_time"] = limit
+		torrents[torrent_hash] = torrent
+	_api, qbit = fresh_qbit(torrents)
+	check("qBittorrent reports its seeding time limit in seconds", qbit.get_torrent("a" * 40).seeding_time_limit, 7200)
+	check("none is -1", qbit.get_torrent("b" * 40).seeding_time_limit, -1)
+	rpc, transmission = fresh_transmission()
+	rpc.add(transmission_torrent(1, "0" * 40, "Limits", status=0, percent=1.0))
+	check("Transmission has no seeding time limit", transmission.get_torrent("0" * 40).seeding_time_limit, -1)
+
+
+@scenario
 def transmission_duplicates():
 	# D9: Transmission hands back the torrent it already had
 	rpc, transmission = fresh_transmission()

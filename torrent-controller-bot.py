@@ -28,7 +28,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.13.1"
+VERSION = "1.14.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -2838,9 +2838,23 @@ SETTING_SCREENS = {
 	"low_space_warning": "notify", "notify_ratio_reached": "notify",
 	"auto_download": "add", "auto_move_series": "add", "auto_move_series_external": "add",
 	"auto_rename": "rename", "auto_rename_files": "rename", "auto_rename_external": "rename",
-	"auto_replace": "rename",
+	"auto_replace": "rename", "auto_remove_ratio": "limits", "notify_auto_removed": "notify",
 }
-NOTIFY_SETTINGS = ("notify_completed", "notify_errors", "notify_external_added", "low_space_warning", "notify_ratio_reached")
+
+
+def auto_remove_ratio_enabled():
+	return client.supports_ratio_limit and bool(bot_settings.get("auto_remove_ratio"))
+
+
+def available_notices():
+	"""The notices this manager can give. Where the ratio limit stops a
+	torrent, there is one notice or the other: with the automatic removal on
+	the torrent is gone, so the notice offering to keep it seeding gives way
+	to the one telling it was removed"""
+	notices = ["notify_completed", "notify_errors", "notify_external_added", "low_space_warning"]
+	if client.supports_ratio_limit:
+		notices.append("notify_auto_removed" if auto_remove_ratio_enabled() else "notify_ratio_reached")
+	return notices
 
 
 def settings_call(screen="main"):
@@ -2887,7 +2901,7 @@ def build_settings_main():
 		markup.add(InlineKeyboardButton(text, callback_data=call))
 
 	row(get_text("SETTINGS_ROW_LIMITS"), settings_call("limits"))
-	notices = [key for key in NOTIFY_SETTINGS if key != "notify_ratio_reached" or client.supports_ratio_limit]
+	notices = available_notices()
 	enabled_notices = sum(1 for key in notices if bot_settings.get(key))
 	row(get_text("SETTINGS_ROW_NOTIFY", enabled_notices, len(notices)), settings_call("notify"))
 	add_mode = "ADD_MODE_AUTO" if bot_settings.get("auto_download") else "ADD_MODE_ASK"
@@ -2913,7 +2927,11 @@ def build_settings_limits():
 	if tracker_limits_supported():
 		markup.add(InlineKeyboardButton(get_text("SETTINGS_ROW_TRACKER_LIMITS", len(tracker_limits.rules())),
 										callback_data=settings_call("tlimits")))
-	return "\n".join([get_text("SETTINGS_LIMITS_TITLE"), "", get_text("SETTINGS_LIMITS_HELP")]), settings_nav(markup)
+	lines = [get_text("SETTINGS_LIMITS_TITLE"), "", get_text("SETTINGS_LIMITS_HELP")]
+	if client.supports_ratio_limit:
+		markup.add(toggle_button("auto_remove_ratio", "BUTTON_SETTING_AUTO_REMOVE_RATIO"))
+		lines += ["", get_text("SETTINGS_AUTO_REMOVE_RATIO_ON" if auto_remove_ratio_enabled() else "SETTINGS_AUTO_REMOVE_RATIO_OFF")]
+	return "\n".join(lines), settings_nav(markup)
 
 
 def build_settings_speed():
@@ -2960,8 +2978,10 @@ def build_settings_notify():
 	markup.add(toggle_button("notify_errors", "BUTTON_SETTING_NOTIFY_ERRORS"))
 	markup.add(toggle_button("notify_external_added", "BUTTON_SETTING_NOTIFY_EXTERNAL"))
 	markup.add(toggle_button("low_space_warning", "BUTTON_SETTING_LOW_SPACE"))
-	if client.supports_ratio_limit:
+	if "notify_ratio_reached" in available_notices():
 		markup.add(toggle_button("notify_ratio_reached", "BUTTON_SETTING_NOTIFY_RATIO"))
+	if "notify_auto_removed" in available_notices():
+		markup.add(toggle_button("notify_auto_removed", "BUTTON_SETTING_NOTIFY_AUTO_REMOVED"))
 	return "\n".join(lines), settings_nav(markup)
 
 
@@ -3113,6 +3133,8 @@ def collect_telemetry_metrics():
 		"notify_errors": bool(bot_settings.get("notify_errors")),
 		"notify_external_added": bool(bot_settings.get("notify_external_added")),
 		"notify_ratio_reached": client.supports_ratio_limit and bool(bot_settings.get("notify_ratio_reached")),
+		"auto_remove_ratio": auto_remove_ratio_enabled(),
+		"notify_auto_removed": auto_remove_ratio_enabled() and bool(bot_settings.get("notify_auto_removed")),
 		"auto_download": bool(bot_settings.get("auto_download")),
 		"auto_download_dir": bool(bot_settings.get("auto_download_dir")),
 		"auto_category": bool(bot_settings.get("auto_category")),
@@ -3623,12 +3645,31 @@ def handle_completed(torrent):
 		notify(text)
 
 
+def seeding_limit_reached(torrent):
+	"""The limit of the manager that stopped a torrent that was seeding, as
+	(kind, text telling it), or None when it reached none: someone paused it.
+	Ratio, and seeding time where the manager has it (only qBittorrent)"""
+	if torrent.ratio_limit >= 0 and torrent.ratio + 0.005 >= torrent.ratio_limit:
+		return "ratio", get_text("LIMIT_REACHED_RATIO", f"{torrent.ratio_limit:g}")
+	if torrent.seeding_time_limit > 0 and torrent.seeding_time >= torrent.seeding_time_limit:
+		return "seeding time", get_text("LIMIT_REACHED_TIME", format_eta(torrent.seeding_time_limit))
+	return None
+
+
 def handle_seeding_stopped(torrent_id):
-	"""A torrent went from seeding to stopped: when it was its ratio limit that
-	stopped it (and not someone pausing it), tells so, with a way to keep it
-	seeding. The light listing does not carry the ratio, so it is read here"""
+	"""A torrent went from seeding to stopped: when it was a limit of the
+	manager that stopped it (and not someone pausing it), removes it from the
+	manager (automatic removal) or, for the ratio limit, tells so with a way to
+	keep it seeding. The light listing does not carry the limits, so they are
+	read here"""
 	torrent = client.get_torrent(torrent_id)
-	if torrent is None or torrent.ratio_limit < 0 or torrent.ratio + 0.005 < torrent.ratio_limit:
+	reached = seeding_limit_reached(torrent) if torrent else None
+	if reached is None:
+		return
+	if auto_remove_ratio_enabled():
+		remove_at_limit(torrent, *reached)
+		return
+	if reached[0] != "ratio" or not bot_settings.get("notify_ratio_reached"):
 		return
 	count_usage("auto_notify_ratio")
 	markup = InlineKeyboardMarkup()
@@ -3637,6 +3678,24 @@ def handle_seeding_stopped(torrent_id):
 		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
 	)
 	notify(get_text("NOTIFY_RATIO_REACHED", html.escape(torrent.name), f"{torrent.ratio_limit:g}"), reply_markup=markup)
+
+
+def remove_at_limit(torrent, kind, reason):
+	"""Removes from the manager a torrent one of its limits stopped. Only the
+	torrent: its files stay where they are. The monitor sees the stop once, so
+	a removal that fails is told even with the notice off: nothing will try
+	again and the torrent is still there"""
+	name = html.escape(torrent.name)
+	try:
+		client.remove_torrents([torrent.id], delete_data=False)
+	except TorrentClientError as e:
+		warning(f"Cannot remove {torrent.name}, which reached its {kind} limit: {e}")
+		notify(get_text("NOTIFY_AUTO_REMOVE_FAILED", name, reason, html.escape(str(e))))
+		return
+	count_usage("auto_remove_ratio")
+	debug(f"Removed {torrent.name}, which reached its {kind} limit")
+	if bot_settings.get("notify_auto_removed"):
+		notify(get_text("NOTIFY_AUTO_REMOVED", name, reason, html.escape(torrent.download_dir or "")))
 
 
 # Torrents added through the bot that the monitor has not seen yet: id -> ts.
@@ -5966,11 +6025,11 @@ def poll_torrents(states):
 				except Exception as e:
 					warning(f"Cannot handle the completion of {torrent.name}: {e}")
 			if (prev and prev.get("status") == TorrentStatus.SEEDING and state["status"] == TorrentStatus.PAUSED
-					and client.supports_ratio_limit and bot_settings.get("notify_ratio_reached")):
+					and client.supports_ratio_limit and (bot_settings.get("notify_ratio_reached") or auto_remove_ratio_enabled())):
 				try:
 					handle_seeding_stopped(torrent.id)
 				except Exception as e:
-					warning(f"Cannot tell why {torrent.name} stopped seeding: {e}")
+					warning(f"Cannot handle {torrent.name} stopping seeding: {e}")
 			if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
 				count_usage("auto_notify_error")
 				notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))

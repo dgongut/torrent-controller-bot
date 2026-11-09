@@ -1458,6 +1458,132 @@ stopped.status = TorrentStatus.PAUSED
 states = poll(None)
 poll(states)
 check("a torrent already stopped at startup is not told", NOTIFIED, [])
+
+# Automatic removal: the torrent leaves the manager, never its files, and
+# the notice offering to keep it seeding gives way to the one telling it
+
+
+def auto_removed_text(torrent, reason=None):
+	reason = reason or bot.get_text("LIMIT_REACHED_RATIO", f"{torrent.ratio_limit:g}")
+	return bot.get_text("NOTIFY_AUTO_REMOVED", bot.html.escape(torrent.name), reason, bot.html.escape(torrent.download_dir))
+
+
+def removals():
+	return [c for c in CLIENT.calls if c[0] == "remove_torrents"]
+
+
+bot_settings.set("auto_remove_ratio", True)
+bot_settings.set("notify_auto_removed", True)
+fresh()
+reached, paused_by_hand, no_limit, still_seeding = seeding(), seeding(ratio=0.2), seeding(limit=-1), seeding()
+states = poll(None)
+for torrent in (reached, paused_by_hand, no_limit):
+	CLIENT.torrents[torrent.id].status = TorrentStatus.PAUSED
+states = poll(states)
+check("a torrent stopped at its ratio limit is removed, and only that one", removals(), [("remove_torrents", [reached.id], False)])
+check("without its data", removals()[0][2], False)
+check("and the removal is told instead of the ratio notice", texts(), [auto_removed_text(reached)])
+check("with nothing to press: the torrent is gone", MARKUPS[-1], None)
+check("the others are still there", sorted(CLIENT.torrents), sorted([paused_by_hand.id, no_limit.id, still_seeding.id]))
+states = poll(states)
+check("a torrent that is gone is not removed again", len(removals()), 1)
+check("nor told again", len(NOTIFIED), 1)
+
+fresh()
+bot_settings.set("notify_ratio_reached", False)
+bot_settings.set("notify_auto_removed", False)
+quiet = seeding()
+states = poll(None)
+CLIENT.torrents[quiet.id].status = TorrentStatus.PAUSED
+poll(states)
+check("the removal works with both notices off", removals(), [("remove_torrents", [quiet.id], False)])
+check("and then nothing is told", NOTIFIED, [])
+
+fresh()
+failing = seeding()
+states = poll(None)
+CLIENT.torrents[failing.id].status = TorrentStatus.PAUSED
+CLIENT.fail_remove = TorrentClientError("busy")
+poll(states)
+CLIENT.fail_remove = None
+check("a removal that fails is told even with the notice off", texts(), [bot.get_text(
+	"NOTIFY_AUTO_REMOVE_FAILED", bot.html.escape(failing.name), bot.get_text("LIMIT_REACHED_RATIO", f"{failing.ratio_limit:g}"), "busy")])
+check("and logged", any("Cannot remove" in w for w in WARNINGS), True)
+check("the torrent stays", failing.id in CLIENT.torrents, True)
+
+fresh()
+stopped = seeding()
+stopped.status = TorrentStatus.PAUSED
+states = poll(None)
+poll(states)
+check("a torrent already stopped at startup is not removed", removals(), [])
+
+# The seeding time limit (qBittorrent), with no ratio limit in the way
+
+
+def timed(seeding_time, time_limit=-1):
+	torrent = seeding(ratio=0.1, limit=-1)
+	torrent.seeding_time, torrent.seeding_time_limit = seeding_time, time_limit
+	return torrent
+
+
+bot_settings.set("notify_auto_removed", True)
+fresh()
+by_time = timed(7300, time_limit=7200)
+short_time = timed(3600, time_limit=7200)
+no_limit = timed(9000)
+states = poll(None)
+for torrent in (by_time, short_time, no_limit):
+	CLIENT.torrents[torrent.id].status = TorrentStatus.PAUSED
+poll(states)
+check("the torrent stopped at its seeding time limit is removed, the ones paused before it are not",
+	[c[1][0] for c in removals()], [by_time.id])
+check("and its removal tells the limit that stopped it", texts(),
+	[auto_removed_text(by_time, bot.get_text("LIMIT_REACHED_TIME", bot.format_eta(7200)))])
+
+bot_settings.set("auto_remove_ratio", False)
+fresh()
+quiet_time = timed(7300, time_limit=7200)
+states = poll(None)
+CLIENT.torrents[quiet_time.id].status = TorrentStatus.PAUSED
+poll(states)
+check("with the removal off, a time limit is not told as a ratio one", (NOTIFIED, removals()), ([], []))
+bot_settings.set("auto_remove_ratio", True)
+
+FakeClient.supports_ratio_limit = False
+fresh()
+unsupported = seeding()
+states = poll(None)
+CLIENT.torrents[unsupported.id].status = TorrentStatus.PAUSED
+poll(states)
+check("a manager without ratio limits never removes anything", removals(), [])
+FakeClient.supports_ratio_limit = True
+
+# The settings: the switch lives with the limits, and the notices offer the
+# one that applies
+fresh()
+bot_settings.set("auto_remove_ratio", False)
+_text, limit_buttons = settings_screen("limits")
+check("the limits offer the removal", "toggleSetting|auto_remove_ratio" in limit_buttons, True)
+_text, notify_buttons = settings_screen("notify")
+check("with it off, the ratio notice is offered", "toggleSetting|notify_ratio_reached" in notify_buttons, True)
+check("and not the removal one", "toggleSetting|notify_auto_removed" in notify_buttons, False)
+toggle("auto_remove_ratio")
+check("the removal turns on", bot_settings.get("auto_remove_ratio"), True)
+check("repainting the limits", bot.get_text("SETTINGS_AUTO_REMOVE_RATIO_ON") in EDITS[-1][0], True)
+_text, notify_buttons = settings_screen("notify")
+check("with it on, the removal notice is offered", "toggleSetting|notify_auto_removed" in notify_buttons, True)
+check("instead of the ratio one", "toggleSetting|notify_ratio_reached" in notify_buttons, False)
+check("the notices row still counts five", len(bot.available_notices()), 5)
+FakeClient.supports_ratio_limit = False
+_text, limit_buttons = settings_screen("limits")
+check("a manager without ratio limits does not offer the removal", "toggleSetting|auto_remove_ratio" in limit_buttons, False)
+check("nor its notice", "notify_auto_removed" in bot.available_notices(), False)
+FakeClient.supports_ratio_limit = True
+toggle("auto_remove_ratio")
+check("the removal turns off", bot_settings.get("auto_remove_ratio"), False)
+bot_settings.set("notify_auto_removed", True)
+bot_settings.set("notify_ratio_reached", True)
 FakeClient.supports_ratio_limit = False
 
 # ---------------------------------------------------------------------------
@@ -1594,8 +1720,9 @@ check("which the other filters keep", bot.build_call("mass", "ratio", "all") in 
 _, markup = bot.build_settings()
 check("the settings group every limit under one row", [b.callback_data for row in markup.keyboard for b in row][0], bot.settings_call("limits"))
 _, markup = bot.build_settings("limits")
-check("speed, ratio and tracker limits, then back to the main settings", [b.callback_data for row in markup.keyboard for b in row],
-	[bot.settings_call("speed"), bot.settings_call("ratio"), bot.settings_call("tlimits"), bot.settings_call(), bot.build_call("cerrar")])
+check("speed, ratio and tracker limits, the removal at the ratio, then back to the main settings", [b.callback_data for row in markup.keyboard for b in row],
+	[bot.settings_call("speed"), bot.settings_call("ratio"), bot.settings_call("tlimits"), bot.build_call("toggleSetting", "auto_remove_ratio"),
+	bot.settings_call(), bot.build_call("cerrar")])
 for sub in ("speed", "ratio", "tlimits"):
 	_, markup = bot.build_settings(sub)
 	check(f"the {sub} screen goes back to the limits", markup.keyboard[-1][0].callback_data, bot.settings_call("limits"))
