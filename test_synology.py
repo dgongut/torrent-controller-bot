@@ -54,6 +54,11 @@ warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 
 import requests
 
+# For the bot itself, loaded at the end to try its automatic mover against the NAS
+os.environ.setdefault("TELEGRAM_TOKEN", "0:fake")
+os.environ.setdefault("TELEGRAM_ADMIN", "1")
+os.environ.setdefault("LOCALE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "locale"))
+
 import config
 from torrent_clients import synology_client as sc
 from torrent_clients.base import (
@@ -1915,6 +1920,83 @@ try:
 finally:
 	sc.requests = types.SimpleNamespace(Session=lambda: FakeSession(CURRENT["dsm"]))
 	server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# THE AUTOMATIC MOVER
+# ---------------------------------------------------------------------------
+# The whole bot against the NAS: Download Station tells its folders without
+# the leading slash, its free space by shared folder, and its move only
+# returns once File Station has the data in the new folder
+
+import importlib.util
+import time as real_time
+import auto_mover
+import torrent_clients
+
+dsm = nas()
+dsm.free = {"downloads": 35 * GB, "video": 2000 * GB}
+old_a = dsm.add_task("Movie.A", destination="downloads/PELICULAS", files=[("a.mkv", 30 * GB)], completed_time=1700001000)
+old_b = dsm.add_task("Show.B.S01", destination="downloads/SERIES/Show B", files=episodes(3, 10 * GB), completed_time=1700002000)
+old_c = dsm.add_task("Movie.C", destination="downloads/PELICULAS", files=[("c.mkv", 30 * GB)], completed_time=1700003000)
+left = dsm.add_task("Movie.D", destination="downloads/PELICULAS", files=[("d.mkv", 30 * GB)], completed_time=1700004000)
+recent = dsm.add_task("Movie.New", destination="downloads/PELICULAS", files=[("n.mkv", 30 * GB)], completed_time=int(real_time.time()) - 3600)
+elsewhere = dsm.add_task("Movie.Kept", destination="video/library", files=[("k.mkv", 30 * GB)], completed_time=1700000500)
+mover_client = connect(dsm)
+torrent_clients.create_client = lambda config_module: mover_client
+_spec = importlib.util.spec_from_file_location("tcbot", os.path.join(os.path.dirname(os.path.abspath(__file__)), "torrent-controller-bot.py"))
+bot = importlib.util.module_from_spec(_spec)
+sys.modules["tcbot"] = bot
+_spec.loader.exec_module(bot)
+MOVER_SENT, MOVER_EDITS = [], []
+bot.bot.send_message = lambda chat_id, text, **k: (MOVER_SENT.append(text), types.SimpleNamespace(message_id=len(MOVER_SENT)))[1]
+bot.bot.edit_message_text = lambda text, chat_id, message_id, **k: MOVER_EDITS.append(text) or True
+bot.AUTO_MOVER_WATCH_SECONDS = 0.01
+bot.AUTO_MOVER_SETTLE_SECONDS = 0
+
+
+def mover_over():
+	deadline = real_time.time() + 10
+	while bot._auto_mover_job[0] and real_time.time() < deadline:
+		real_time.sleep(0.01)
+	return bot._auto_mover_job[0] is None
+
+
+check("the mover: a folder typed with slashes is stored the way Download Station writes it",
+	(bot.set_mover_field("source", "/downloads/"), bot.set_mover_field("target", "/video"),
+	bot.bot_settings.get("auto_mover_source"), bot.bot_settings.get("auto_mover_target")), (None, None, "downloads", "video"))
+bot.bot_settings.set("auto_mover_min_free_gb", 40)
+bot.bot_settings.set("auto_mover_wanted_free_gb", 100)
+bot.bot_settings.set("auto_mover_min_days", 7)
+text, _markup = bot.build_settings("mover")
+check("the mover: the screen tells the free space of each shared folder",
+	(f"<code>downloads</code> · {bot.get_text('MOVER_FREE', bot.sizeof_fmt(35 * GB))}" in text,
+	f"<code>video</code> · {bot.get_text('MOVER_FREE', bot.sizeof_fmt(2000 * GB))}" in text), (True, True))
+plan = bot.auto_mover_plan()
+check("the mover: under the minimum, the oldest tasks of the source are picked", (plan.outcome, [t.id for t in plan.torrents]), ("move", [old_a, old_b, old_c]))
+bot.bot_settings.set("auto_mover", True)
+bot.auto_mover_tick()
+check("the mover: the move ends", mover_over(), True)
+check("the mover: each task points at the same subfolder of the target, created when missing",
+	(dsm.where(old_a), dsm.where(old_b), dsm.where(old_c), dsm.isdir("/video/SERIES/Show B")),
+	("video/PELICULAS", "video/SERIES/Show B", "video/PELICULAS", True))
+check("the mover: with its data, and seeding again",
+	("/video/PELICULAS/Movie.A/a.mkv" in dsm.fs, "/downloads/PELICULAS/Movie.A" in dsm.fs, dsm.size_under("/video/SERIES/Show B/Show.B.S01"),
+	dsm.status(old_a), dsm.status(old_b), dsm.broken), (True, False, 30 * GB, "seeding", "seeding", []))
+check("the mover: the others stay where they were", (dsm.where(left), dsm.where(recent), dsm.where(elsewhere)),
+	("downloads/PELICULAS", "downloads/PELICULAS", "video/library"))
+check("the mover: the notice tells them moved", bot.get_text("MOVER_DONE", bot.get_text("MOVER_TORRENTS", 3), bot.sizeof_fmt(90 * GB), "downloads", "video") in MOVER_EDITS[-1], True)
+
+# Something of the same name already in the target: Download Station is not asked to overwrite it
+dsm.free["downloads"] = 35 * GB
+dsm.put("/video/PELICULAS/Movie.D/other.mkv", 5)
+bot.bot_settings.set("auto_mover", True)
+bot.auto_mover_tick()
+check("the mover: a move the NAS refuses ends too", mover_over(), True)
+check("the mover: the task stays in the source with its data", (dsm.where(left), "/downloads/PELICULAS/Movie.D/d.mkv" in dsm.fs, dsm.status(left)), ("downloads/PELICULAS", True, "seeding"))
+# In a message of its own: an edit of the notice would tell nobody
+check("the mover: it is told as not moved, with why", (bot.get_text("MOVER_FAILED", bot.get_text("MOVER_TORRENTS_ONE")) in MOVER_SENT[-1], "already exists" in MOVER_SENT[-1]), (True, True))
+check("the mover: and turned off", bot.bot_settings.get("auto_mover"), False)
 
 
 if FAILED:

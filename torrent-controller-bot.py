@@ -23,12 +23,13 @@ from logger import debug, error, warning
 from message_queue import MessageQueue, describe_error
 from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, is_sample_file, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
 from torrent_clients import DuplicateTorrentError, RestartRequiredError, expected_torrent_ids, FILE_HIGH, FILE_LOW, FILE_NORMAL, FILE_SKIP, PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, content_root, create_client
+import auto_mover
 import bot_settings
 import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -326,6 +327,17 @@ def edit_message(chat_id, message_id, text, reply_markup=None):
 		if "message is not modified" not in str(e):
 			warning(f"Cannot edit message {message_id}: {e}")
 		return None
+
+
+def send_notice(chat_id, text, thread_id=None):
+	"""A message with nothing to press that goes away by itself: what was
+	just done, told without leaving anything behind to close"""
+	sent = send_message(chat_id, text, thread_id=thread_id)
+	if sent:
+		timer = threading.Timer(NOTICE_SECONDS, delete_message, (chat_id, sent.message_id))
+		timer.daemon = True
+		timer.start()
+	return sent
 
 
 def delete_message(chat_id, message_id):
@@ -1095,6 +1107,9 @@ def mass_menu_rows(filter_key, total):
 			InlineKeyboardButton(get_text("BUTTON_MASS_PAUSE"), callback_data=build_call("mass", "pause", filter_key)),
 		])
 		rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key))])
+		if client.supports_categories:
+			# Where the folders go by category, the category is what is changed, not the folder
+			rows[-1].append(InlineKeyboardButton(get_text("BUTTON_MASS_CATEGORY"), callback_data=build_call("mass", "cat", filter_key)))
 	# On a tracker filter the limits of the tracker take the place of the ratio
 	# of all: they cover the torrents there are now and the ones that arrive
 	tracker = list_tracker(filter_key) if tracker_limits_supported() else None
@@ -2839,6 +2854,7 @@ SETTING_SCREENS = {
 	"auto_download": "add", "auto_move_series": "add", "auto_move_series_external": "add",
 	"auto_rename": "rename", "auto_rename_files": "rename", "auto_rename_external": "rename",
 	"auto_replace": "rename", "auto_remove_ratio": "limits", "notify_auto_removed": "notify",
+	"auto_mover": "mover",
 }
 
 
@@ -2909,6 +2925,7 @@ def build_settings_main():
 	if client.supports_rename:
 		row(get_text("SETTINGS_ROW_RENAME", on_off(auto_rename_enabled())), settings_call("rename"))
 	row(get_text("SETTINGS_ROW_FAV_DIRS", len(bot_settings.get("favorite_dirs") or [])), build_call("favDirsMenu"))
+	row(get_text("SETTINGS_ROW_MOVER", on_off(auto_mover_enabled())), settings_call("mover"))
 	row(get_text("SETTINGS_ROW_TELEMETRY", on_off(telemetry_on())), build_call("telemetryMenu"))
 	settings_nav(markup, back=build_call("dashboard"))
 	lines = [get_text("SETTINGS_TITLE", settings["version"]), "",
@@ -3018,6 +3035,716 @@ def build_settings_rename():
 	return "\n".join(lines), settings_nav(markup)
 
 
+# ---------------------------------------------------------------------------
+# AUTOMATIC MOVER
+# ---------------------------------------------------------------------------
+# One rule, see auto_mover.py: when the source folder runs low on space, the
+# torrents finished longest ago go to the same place under the target folder.
+# The free space is the one the manager tells: the bot does not see the disks.
+# A move is only told as done once the torrents are seen in their new folder:
+# qBittorrent and Deluge take the order and move later, and say nothing when
+# they could not
+
+# The fields of the rule that are typed: field -> (setting, text of the question)
+MOVER_FIELDS = {
+	"source": ("auto_mover_source", "MOVER_ASK_SOURCE"),
+	"target": ("auto_mover_target", "MOVER_ASK_TARGET"),
+	"min": ("auto_mover_min_free_gb", "MOVER_ASK_MIN_FREE"),
+	"wanted": ("auto_mover_wanted_free_gb", "MOVER_ASK_WANTED_FREE"),
+	"days": ("auto_mover_min_days", "MOVER_ASK_DAYS"),
+}
+
+# What a pass found that the user has to know and the monitor tells only once
+MOVER_QUIET_SECONDS = 120  # After a move, how long the errors of its torrents are still the mover's to tell
+MOVER_MAX_CHOICES = 6  # Folders offered with a button for the source or the target
+# What may follow a typed number, and what it is worth in GB or in days
+MOVER_SIZE_UNITS = {"": 1, "g": 1, "gb": 1, "gib": 1, "gigas": 1, "t": 1024, "tb": 1024, "tib": 1024, "teras": 1024,
+					"m": 1 / 1024, "mb": 1 / 1024, "mib": 1 / 1024, "megas": 1 / 1024}
+MOVER_DAY_UNITS = {unit: 1 for unit in ("", "d", "dia", "dias", "día", "días", "day", "days")}
+MOVER_PROBLEMS = ("none", "target_full", "same_disk", "unknown")
+MOVER_UNKNOWN_PASSES = 3  # Passes in a row without the free space of the source before it is told
+
+_mover_quiet = {}  # id -> until when the monitor leaves the errors of a torrent to the notice of the mover
+_auto_mover_job = [None]  # {"count": torrents being moved} while a move of the mover is going on
+_auto_mover_unknown = [0]  # Passes in a row in which the manager did not tell the free space of the source
+_auto_mover_told = [None]  # The problem the monitor told last, so it is not told every five minutes
+_auto_mover_lock = threading.Lock()
+_auto_mover_run_lock = threading.Lock()  # One pass at a time, the monitor's or the one asked by hand
+
+
+class MoverPlan:
+	"""What a pass of the mover found, see auto_mover_plan"""
+
+	def __init__(self, outcome, rule, free=-1, units=(), skipped=None, target_free=-1):
+		self.outcome = outcome
+		self.rule = rule
+		self.free = free
+		self.units = list(units)
+		self.skipped = skipped or {}
+		self.target_free = target_free
+		self.torrents = [torrent for unit in self.units for torrent in unit.torrents]
+		self.size = sum(unit.size for unit in self.units)
+
+
+def mover_number(key):
+	"""A margin of the rule, the default one when the file holds nonsense"""
+	value = bot_settings.get(key)
+	if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+		return bot_settings.DEFAULTS[key]
+	return value
+
+
+def auto_mover_rule():
+	"""The rule as the settings hold it, with the margins in bytes and seconds"""
+	return {
+		"source": bot_settings.get("auto_mover_source") or "",
+		"target": bot_settings.get("auto_mover_target") or "",
+		"min_free": mover_number("auto_mover_min_free_gb") * auto_mover.GB,
+		"wanted_free": mover_number("auto_mover_wanted_free_gb") * auto_mover.GB,
+		"min_seconds": mover_number("auto_mover_min_days") * auto_mover.DAY,
+	}
+
+
+def auto_mover_configured():
+	rule = auto_mover_rule()
+	return bool(rule["source"] and rule["target"]) and auto_mover.paths_error(rule["source"], rule["target"]) is None
+
+
+def auto_mover_enabled():
+	return bool(bot_settings.get("auto_mover")) and auto_mover_configured()
+
+
+def mover_free(path):
+	"""Free bytes the manager tells for a folder, -1 when it does not"""
+	free = client.get_free_space(path)
+	return free if isinstance(free, (int, float)) and not isinstance(free, bool) and free >= 0 else -1
+
+
+def mover_target_free(path):
+	"""(free bytes, whether the folder is there) of the target. A manager only
+	tells the space of a folder that exists, and the target, or the subfolder
+	of it a torrent goes to, may still have to be made: its space is then the
+	one of the closest folder above it that is there"""
+	free = mover_free(path)
+	if free >= 0:
+		return free, True
+	parent = auto_mover.normalize_dir(path)
+	while parent.strip("/"):
+		# Up to the root itself: a folder at the top that is not there is the
+		# commonest slip, a path typed wrong
+		parent = parent.rsplit("/", 1)[0] if "/" in parent.strip("/") else ("/" if parent.startswith("/") else "")
+		if not parent:
+			break
+		free = mover_free(parent)
+		if free >= 0:
+			return free, False
+	return -1, True
+
+
+def auto_mover_plan(force=False):
+	"""What the mover would do right now, a MoverPlan whose outcome is:
+	"busy": a move it ordered is still going on.
+	"unknown": the manager does not tell the free space of the source.
+	"enough": there is no need to move anything.
+	"wait": the manager is checking or moving torrents of the source, by hand
+	or from before a restart of the bot: the space they free is not there yet.
+	"none": space is needed, but no torrent may be moved (skipped tells why).
+	"same_disk": the target tells the same free space as the source, so they
+	are the same disk and moving would free nothing.
+	"target_full": what would be moved does not fit in the target.
+	"move": units holds what to move.
+	force is the pass asked by hand, which does not wait for the space to drop
+	under the minimum: it moves whenever the wanted free space is not there"""
+	rule = auto_mover_rule()
+	with _auto_mover_lock:
+		if _auto_mover_job[0]:
+			return MoverPlan("busy", rule)
+	free = mover_free(rule["source"])
+	if free < 0:
+		return MoverPlan("unknown", rule)
+	if free >= (rule["wanted_free"] if force else rule["min_free"]):
+		return MoverPlan("enough", rule, free)
+	torrents = client.get_torrents()
+	if any(torrent.status == TorrentStatus.CHECKING and auto_mover.is_under(torrent.download_dir, rule["source"]) for torrent in torrents):
+		return MoverPlan("wait", rule, free)
+	units, skipped = auto_mover.candidates(torrents, rule["source"], rule["min_seconds"], time.time())
+	picked = auto_mover.pick(units, free, rule["wanted_free"])
+	if not picked:
+		return MoverPlan("none", rule, free, skipped=skipped)
+	plan = MoverPlan("move", rule, free, picked, skipped, mover_target_free(rule["target"])[0])
+	if plan.target_free >= 0:
+		# The source is read again: a download going on changes it between the
+		# two readings, and one disk told twice would then look like two
+		again = mover_free(rule["source"])
+		if again >= 0 and min(free, again) <= plan.target_free <= max(free, again):
+			plan.outcome = "same_disk"
+		elif plan.size > plan.target_free:
+			plan.outcome = "target_full"
+	return plan
+
+
+def mover_count(count):
+	return get_text("MOVER_TORRENTS_ONE") if count == 1 else get_text("MOVER_TORRENTS", count)
+
+
+def mover_days():
+	days = mover_number("auto_mover_min_days")
+	return get_text("MOVER_DAYS_ONE") if days == 1 else get_text("MOVER_DAYS_MANY", f"{days:g}")
+
+
+def mover_listing(torrents, rule=None, reasons=None):
+	"""One line per torrent, the first AUTO_MOVER_MAX_LISTED of them, the ones
+	sharing their data on one line. With the rule, under the folder each one
+	is in and the one it goes to; with reasons, {id: text}, the ones not moved for the same reason
+	together, followed by it"""
+	entries = {}  # (folder, name) -> [torrent, how many, reason]
+	for torrent in torrents:
+		entry = entries.setdefault((torrent.download_dir, torrent.name), [torrent, 0, (reasons or {}).get(str(torrent.id))])
+		entry[1] += 1
+	ordered = list(entries.values())
+	if reasons:
+		# The ones that failed for the same reason together, and the reason once
+		distinct = list(dict.fromkeys(reason for _torrent, _count, reason in ordered))
+		ordered.sort(key=lambda entry: distinct.index(entry[2]))
+	if rule:
+		# Each folder once, in the order they first show up, with all of its
+		# torrents under it: they come by age, which mixes the folders
+		folders = list(dict.fromkeys(entry[0].download_dir for entry in ordered))
+		ordered.sort(key=lambda entry: folders.index(entry[0].download_dir))
+	shown = ordered[:AUTO_MOVER_MAX_LISTED]
+	lines, folder = [], None
+	for index, (torrent, count, reason) in enumerate(shown):
+		if rule and torrent.download_dir != folder:
+			# From where to where: the torrents are still in the first one
+			folder = torrent.download_dir
+			target = auto_mover.target_dir(folder, rule["source"], rule["target"])
+			lines.append(f"📁 <code>{html.escape(auto_mover.normalize_dir(folder))}</code> → <code>{html.escape(target or '')}</code>")
+		line = f"• {html.escape(truncate(torrent.name, 60))} ({sizeof_fmt(torrent.total_size)})"
+		if count > 1:
+			line += f" ×{count}"
+		lines.append(line)
+		if reason and (index + 1 == len(shown) or shown[index + 1][2] != reason):
+			lines.append(f"   <i>{html.escape(truncate(reason, 300))}</i>")
+	if len(entries) > len(shown):
+		lines.append(get_text("MOVER_AND_MORE", len(entries) - len(shown)))
+	return "\n".join(lines)
+
+
+def mover_tells(torrent_id):
+	"""Whether an error of the torrent is the mover's to tell: it is moving
+	it, or just did, and its notice names the ones that failed with why. The
+	monitor telling each of them again would be the same news twice"""
+	with _auto_mover_lock:
+		until = _mover_quiet.get(str(torrent_id))
+		if until is not None and until < time.time():
+			del _mover_quiet[str(torrent_id)]
+			until = None
+		return until is not None
+
+
+def mover_failure_reason(torrent_id):
+	"""Why the manager says a torrent was not moved, or that it does not say"""
+	try:
+		torrent = client.get_torrent(torrent_id)
+	except TorrentClientError:
+		torrent = None
+	message = (torrent.error_message if torrent else "") or ""
+	# qBittorrent only tells "Error"
+	return message if len(message) > 8 else get_text("MOVER_REASON_SILENT")
+
+
+def mover_watch(rule, torrents, failed, stopped):
+	"""Waits until the manager is done with the torrents whose move order it
+	took. Returns the ones seen out of the source and adds to failed, {id:
+	reason}, the ones it left there: in error, not being moved any more, or
+	not there after AUTO_MOVER_TIMEOUT. One removed meanwhile is neither.
+	stopped gets the ones the manager left stopped in error for not moving them"""
+	pending = {str(torrent.id): torrent for torrent in torrents}
+	moved = []
+	started = time.time()
+	while pending:
+		try:
+			listed = {str(torrent.id): torrent for torrent in client.get_torrents()}
+		except TorrentClientError:
+			listed = None  # Transmission does not answer while it moves
+		elapsed = time.time() - started
+		if listed is not None:
+			for torrent_id, torrent in list(pending.items()):
+				now = listed.get(torrent_id)
+				if now is None:
+					del pending[torrent_id]
+				elif now.status == TorrentStatus.CHECKING:
+					continue  # How qBittorrent and Deluge tell a torrent being moved
+				elif not auto_mover.is_under(now.download_dir, rule["source"]):
+					moved.append(torrent)
+					del pending[torrent_id]
+				elif auto_mover.in_error(now) or elapsed >= AUTO_MOVER_GRACE_SECONDS:
+					failed[torrent_id] = mover_failure_reason(torrent_id)
+					if auto_mover.in_error(now):
+						stopped.append(torrent)
+					del pending[torrent_id]
+		if pending and elapsed >= AUTO_MOVER_TIMEOUT:
+			for torrent_id in pending:
+				failed[torrent_id] = get_text("MOVER_REASON_TIMEOUT")
+			break
+		if pending:
+			time.sleep(AUTO_MOVER_WATCH_SECONDS)
+	return moved
+
+
+def mover_restart(torrents):
+	"""Puts back as they were the torrents a failed move left stopped in
+	error (Transmission, Deluge): their data is intact where it was, and left
+	like that they would neither seed nor be moved once the problem is solved"""
+	if not torrents:
+		return
+	try:
+		client.resume_torrents([torrent.id for torrent in torrents])
+		paused = [torrent.id for torrent in torrents if torrent.status == TorrentStatus.PAUSED]
+		if paused:
+			client.pause_torrents(paused)
+	except TorrentClientError as e:
+		warning(f"Automatic mover: cannot restart the torrents that were not moved: {e}")
+
+
+def mover_occupied(source):
+	"""The bytes the torrents of the source have on disk, the ones sharing
+	their data counted once. None when the manager does not answer"""
+	try:
+		torrents = client.get_torrents()
+	except TorrentClientError:
+		return None
+	sizes = {}
+	for torrent in torrents:
+		if torrent.download_dir and auto_mover.is_under(torrent.download_dir, source):
+			size = (torrent.total_size or 0) * min(max(torrent.progress or 0, 0), 100) / 100
+			key = (torrent.download_dir, torrent.name)
+			sizes[key] = max(sizes.get(key, 0), size)
+	return sum(sizes.values())
+
+
+def mover_job(plan, sent, chat_id, thread_id):
+	"""The move of a plan, in its own thread: orders it, waits for the manager
+	to be done and tells how it went on the notice that announced it. After a
+	failure, or a move that freed nothing, the mover is turned off: the next
+	pass would only run into the same"""
+	rule = plan.rule
+	source, target = html.escape(rule["source"]), html.escape(rule["target"])
+	ordered, failed = [], {}
+	occupied = mover_occupied(rule["source"])
+	for target_dir, group in auto_mover.group_by_target(plan.units, rule["source"], rule["target"]):
+		ids = [torrent.id for torrent in group]
+		order = register_move_order(ids)
+		reason = run_move_order(lambda: client.move_torrents(ids, target_dir), ids, order, target_dir, plain=True)
+		if reason is None:
+			ordered += group
+		elif reason != get_text("MOVE_SUPERSEDED"):
+			# Superseded: sent somewhere else by hand meanwhile, which is no failure
+			failed.update({str(torrent.id): reason for torrent in group})
+	stopped = []
+	moved = mover_watch(rule, ordered, failed, stopped)
+	mover_restart(stopped)
+	blocks = [get_text("SETTINGS_MOVER_TITLE")]
+	if moved:
+		blocks.append(f"{get_text('MOVER_DONE', mover_count(len(moved)), mover_size(moved), source, target)}\n{mover_listing(moved, rule)}")
+	not_moved = [torrent for torrent in plan.torrents if str(torrent.id) in failed]
+	if not_moved:
+		blocks.append(f"{get_text('MOVER_FAILED', mover_count(len(not_moved)))}\n{mover_listing(not_moved, reasons=failed)}")
+	if not moved and not not_moved:
+		blocks.append(get_text("MOVER_GONE"))
+	turned_off = bool(not_moved) and bool(bot_settings.get("auto_mover"))
+	if turned_off:
+		bot_settings.set("auto_mover", False)
+		blocks.append(get_text("MOVER_TURNED_OFF"))
+	done = "\n\n".join(blocks)
+	# Good news takes the place of the notice. Bad news is a message of its
+	# own: Telegram tells nobody of an edit, and this one says the mover is off
+	if not sent or not_moved or not edit_message(chat_id, sent.message_id, done):
+		if sent:
+			delete_message(chat_id, sent.message_id)
+		send_message(chat_id, done, thread_id=thread_id)
+	bot_settings.set("auto_mover_notice", None)
+	# The space the move freed is only trusted a while later: qBittorrent
+	# takes about half a minute to tell it
+	if not moved:
+		return
+	with _auto_mover_lock:
+		if _auto_mover_job[0]:
+			_auto_mover_job[0]["settling"] = True  # Told as moved: what is left is the wait
+	time.sleep(AUTO_MOVER_SETTLE_SECONDS)
+	if not not_moved and bot_settings.get("auto_mover"):
+		free = mover_free(rule["source"])
+		occupied_now = mover_occupied(rule["source"])
+		if free < 0 or occupied is None or occupied_now is None:
+			return
+		# Free space plus what the torrents of the source take stays the same
+		# when what left the source freed its room, whatever was downloaded
+		# or added meanwhile. It drops by what was moved when it freed nothing
+		# Nearly all of it, so that something else writing to the disk
+		# meanwhile is not taken for a move that freed nothing
+		lost = (plan.free + occupied) - (free + occupied_now)
+		if lost > mover_size_bytes(moved) * 0.9:
+			bot_settings.set("auto_mover", False)
+			send_message(chat_id, f"{get_text('SETTINGS_MOVER_TITLE')}\n\n{get_text('MOVER_NO_GAIN', sizeof_fmt(plan.free), sizeof_fmt(free))}", thread_id=thread_id)
+
+
+def mover_size(torrents):
+	return sizeof_fmt(mover_size_bytes(torrents))
+
+
+def mover_size_bytes(torrents):
+	"""What the torrents take on disk, the ones sharing their data counted once"""
+	seen, total = set(), 0
+	for torrent in torrents:
+		key = (torrent.download_dir, torrent.name)
+		if key not in seen:
+			seen.add(key)
+			total += torrent.total_size or 0
+	return total
+
+
+def run_auto_mover(force=False, chat_id=None, thread_id=None):
+	"""One pass of the mover: when there is something to move, tells it and
+	moves it in the background. Returns the MoverPlan of the pass"""
+	with _auto_mover_run_lock:
+		plan = auto_mover_plan(force)
+		if plan.outcome != "move":
+			return plan
+		with _auto_mover_lock:
+			_auto_mover_job[0] = {"count": len(plan.torrents)}
+			_mover_quiet.update({str(torrent.id): float("inf") for torrent in plan.torrents})
+	count_usage("auto_mover")
+	rule = plan.rule
+	debug(f"Automatic mover: {sizeof_fmt(plan.free)} free in {rule['source']}, moving {len(plan.torrents)} torrents to {rule['target']}")
+	text = "\n\n".join([
+		get_text("SETTINGS_MOVER_TITLE"),
+		f"{get_text('MOVER_MOVING', mover_count(len(plan.torrents)), sizeof_fmt(plan.size), html.escape(rule['source']), html.escape(rule['target']), sizeof_fmt(plan.free), sizeof_fmt(plan.free + plan.size))}"
+		f"\n{mover_listing(plan.torrents, rule)}",
+		*mover_short_text(plan),
+		get_text("MOVER_MOVING_WAIT")])
+	sent = notify(text, chat_id=chat_id, thread_id=thread_id)
+	if chat_id is None:
+		chat_id, thread_id = (TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]), TELEGRAM_THREAD
+	if sent:
+		# Remembered across a restart, see mover_close_lost_notice
+		bot_settings.set("auto_mover_notice", [chat_id, sent.message_id, thread_id])
+
+	def worker():
+		try:
+			mover_job(plan, sent, chat_id, thread_id)
+		except Exception as e:
+			error(f"Automatic mover: {e}")
+			mover_close_lost_notice()
+		finally:
+			with _auto_mover_lock:
+				_auto_mover_job[0] = None
+				# The monitor may still be about to see what the move left
+				until = time.time() + MOVER_QUIET_SECONDS
+				_mover_quiet.update({str(torrent.id): until for torrent in plan.torrents})
+
+	threading.Thread(target=worker, daemon=True).start()
+	return plan
+
+
+def mover_close_lost_notice():
+	"""The notice of a move nobody is following any more, because the bot was
+	restarted or failed meanwhile, would say for ever that it will change:
+	it is replaced by one telling that how it ended is not known"""
+	notice = bot_settings.get("auto_mover_notice")
+	if not isinstance(notice, list) or len(notice) != 3:
+		return
+	bot_settings.set("auto_mover_notice", None)
+	chat_id, message_id, thread_id = notice
+	delete_message(chat_id, message_id)
+	send_message(chat_id, f"{get_text('SETTINGS_MOVER_TITLE')}\n\n{get_text('MOVER_LOST')}", thread_id=thread_id)
+
+
+def auto_mover_tick():
+	"""The pass of the monitor. Silent unless it moves something, or finds a
+	problem the user has to solve, which is told once and not on every pass"""
+	if not auto_mover_enabled():
+		_auto_mover_told[0] = None
+		return
+	plan = run_auto_mover()
+	if plan.outcome == "unknown":
+		# A manager that is busy or down does not tell it either: only after
+		# a few passes in which it does answer is the folder the problem
+		_auto_mover_unknown[0] += 1
+		if _auto_mover_unknown[0] < MOVER_UNKNOWN_PASSES or _auto_mover_told[0] == "unknown":
+			return
+		try:
+			client.get_torrents()
+		except TorrentClientError:
+			return
+	else:
+		_auto_mover_unknown[0] = 0
+	if plan.outcome in MOVER_PROBLEMS:
+		if _auto_mover_told[0] != plan.outcome:
+			_auto_mover_told[0] = plan.outcome
+			notify(f"{get_text('SETTINGS_MOVER_TITLE')}\n\n{mover_outcome_text(plan)}")
+	elif plan.outcome in ("enough", "move"):
+		_auto_mover_told[0] = None
+
+
+def mover_skipped_lines(plan):
+	"""Why the torrents of the source that are not moved stay, one line per reason"""
+	texts = {
+		auto_mover.SKIP_RECENT: lambda count: get_text("MOVER_SKIP_RECENT", mover_count(count), mover_days()),
+		auto_mover.SKIP_UNFINISHED: lambda count: get_text("MOVER_SKIP_UNFINISHED", mover_count(count)),
+		auto_mover.SKIP_BUSY: lambda count: get_text("MOVER_SKIP_BUSY", mover_count(count)),
+		auto_mover.SKIP_MANAGED: lambda count: get_text("MOVER_SKIP_MANAGED", mover_count(count)),
+		auto_mover.SKIP_UNDATED: lambda count: get_text("MOVER_SKIP_UNDATED", mover_count(count)),
+	}
+	return [texts[reason](plan.skipped[reason]) for reason in auto_mover.SKIP_REASONS if plan.skipped.get(reason)]
+
+
+def mover_short_text(plan):
+	"""[what to tell] when moving everything that can be moved does not get
+	to the free space wanted: that it will not, and what holds the rest back.
+	Empty when it gets there"""
+	rule = plan.rule
+	if plan.free + plan.size >= rule["wanted_free"]:
+		return []
+	wanted, source = sizeof_fmt(rule["wanted_free"]), html.escape(rule["source"])
+	skipped = mover_skipped_lines(plan)
+	if not skipped:
+		return [get_text("MOVER_SHORT_ALL", wanted, source)]
+	return ["\n".join([get_text("MOVER_SHORT_REST", wanted)] + skipped)]
+
+
+def mover_busy_text(job):
+	"""Why nothing is moved right now: a move is going on, or one just ended
+	and the manager is given a while to tell the space it freed"""
+	if job.get("settling"):
+		return get_text("MOVER_SETTLING")
+	return get_text("MOVER_BUSY", mover_count(job.get("count", 0)))
+
+
+def mover_outcome_text(plan):
+	"""What a pass would do, or why it does nothing"""
+	rule = plan.rule
+	source = html.escape(rule["source"])
+	if plan.outcome == "busy":
+		with _auto_mover_lock:
+			job = _auto_mover_job[0] or {}
+		return mover_busy_text(job)
+	if plan.outcome == "unknown":
+		return mover_unknown_text()
+	if plan.outcome == "wait":
+		return get_text("MOVER_WAIT", source)
+	if plan.outcome == "enough":
+		return get_text("MOVER_ENOUGH", sizeof_fmt(plan.free), source, sizeof_fmt(rule["wanted_free"]))
+	if plan.outcome == "none":
+		lines = [get_text("MOVER_NONE", sizeof_fmt(plan.free), source)] + (mover_skipped_lines(plan) or [get_text("MOVER_NONE_EMPTY")])
+		return "\n".join(lines)
+	if plan.outcome in ("same_disk", "target_full"):
+		# Nothing will be moved: what it would be is told without the room it would leave
+		due = get_text("MOVER_DUE", sizeof_fmt(plan.free), source, mover_count(len(plan.torrents)), sizeof_fmt(plan.size))
+		why = (get_text("MOVER_SAME_DISK") if plan.outcome == "same_disk"
+			else get_text("MOVER_TARGET_FULL", html.escape(rule["target"]), sizeof_fmt(plan.target_free)))
+		return f"{due}\n{mover_listing(plan.torrents, rule)}\n\n{why}"
+	would = get_text("MOVER_WOULD_MOVE", sizeof_fmt(plan.free), source, mover_count(len(plan.torrents)), sizeof_fmt(plan.size), sizeof_fmt(plan.free + plan.size))
+	return "\n\n".join([f"{would}\n{mover_listing(plan.torrents, rule)}"] + mover_short_text(plan))
+
+
+def mover_unknown_text():
+	"""The manager does not tell the free space of the source. qBittorrent only
+	knows the one of its default folder, which is then named"""
+	text = get_text("MOVER_FREE_UNKNOWN")
+	if TORRENT_CLIENT != "qbittorrent":
+		# The others tell it of any folder that is there
+		return f"{text} {get_text('MOVER_FREE_UNKNOWN_MISSING', html.escape(auto_mover_rule()['source']))}"
+	try:
+		default_dir = client.get_default_download_dir()
+	except TorrentClientError:
+		default_dir = ""
+	if default_dir:
+		text += " " + get_text("MOVER_FREE_UNKNOWN_HINT", html.escape(default_dir))
+	return text
+
+
+def mover_dir_line(text_key, directory, free):
+	if not directory:
+		return get_text(text_key, get_text("MOVER_NOT_SET"))
+	line = get_text(text_key, f"<code>{html.escape(directory)}</code>")
+	return f"{line} · {get_text('MOVER_FREE', sizeof_fmt(free))}" if free >= 0 else line
+
+
+def build_settings_mover():
+	rule = auto_mover_rule()
+	configured = auto_mover_configured()
+	with _auto_mover_lock:
+		job = _auto_mover_job[0]
+	# Not asked while the mover moves: Transmission answers nothing meanwhile
+	asked = not job or job.get("settling")
+	free = mover_free(rule["source"]) if rule["source"] and asked else -1
+	target_free, target_there = mover_target_free(rule["target"]) if rule["target"] and asked else (-1, True)
+	enabled = auto_mover_enabled()
+	lines = [get_text("SETTINGS_MOVER_TITLE"), "", get_text("SETTINGS_MOVER_HELP"), "",
+			mover_dir_line("MOVER_SOURCE", rule["source"], free),
+			# Not the room of a folder that is not there: it is the one of another
+			mover_dir_line("MOVER_TARGET", rule["target"], target_free if target_there else -1),
+			get_text("MOVER_MIN_FREE", sizeof_fmt(rule["min_free"])),
+			get_text("MOVER_WANTED_FREE", sizeof_fmt(rule["wanted_free"])),
+			get_text("MOVER_DAYS", mover_days()) if rule["min_seconds"] else get_text("MOVER_DAYS_ANY"), ""]
+	if not configured:
+		lines.append(get_text("MOVER_NEEDS_DIRS"))
+	elif job:
+		lines.append(mover_busy_text(job))
+	elif free < 0:
+		lines.append(mover_unknown_text())
+	elif 0 <= target_free == free:
+		lines.append(get_text("MOVER_SAME_DISK"))
+	else:
+		if not target_there:
+			lines.append(get_text("MOVER_TARGET_MISSING", html.escape(rule["target"])))
+		elif target_free < 0:
+			lines.append(get_text("MOVER_TARGET_UNKNOWN"))
+		# A stop that not even an empty source would reach: everything would go, every time
+		occupied = mover_occupied(rule["source"])
+		if occupied is not None and free + occupied < rule["wanted_free"]:
+			lines.append(get_text("MOVER_WANTED_TOO_HIGH", sizeof_fmt(rule["wanted_free"]), sizeof_fmt(free + occupied)))
+		lines.append(get_text("MOVER_STATUS_OFF" if not enabled else "MOVER_STATUS_DUE" if free < rule["min_free"] else "MOVER_STATUS_OK"))
+	markup = InlineKeyboardMarkup(row_width=1)
+	# No switch to turn on what could not work, but always one to turn it off
+	if enabled or (configured and (free >= 0 or not asked)):
+		markup.add(toggle_button("auto_mover", "BUTTON_SETTING_AUTO_MOVER"))
+
+	def ask(field, text_key):
+		return InlineKeyboardButton(get_text(text_key), callback_data=build_call("moverAsk", field))
+
+	markup.row(ask("source", "BUTTON_MOVER_SOURCE"), ask("target", "BUTTON_MOVER_TARGET"))
+	markup.row(ask("min", "BUTTON_MOVER_MIN_FREE"), ask("wanted", "BUTTON_MOVER_WANTED_FREE"))
+	markup.add(ask("days", "BUTTON_MOVER_DAYS"))
+	if configured:
+		markup.add(InlineKeyboardButton(get_text("BUTTON_MOVER_PREVIEW"), callback_data=build_call("moverPreview")))
+	return "\n".join(lines), settings_nav(markup)
+
+
+def build_mover_preview():
+	"""What the pass asked by hand would move right now, and the button to do it"""
+	plan = auto_mover_plan(force=True)
+	lines = [get_text("MOVER_PREVIEW_TITLE"), "", mover_outcome_text(plan)]
+	if plan.outcome == "move" and plan.free >= plan.rule["min_free"]:
+		lines += ["", get_text("MOVER_NOT_YET", sizeof_fmt(plan.rule["min_free"]))]
+	if plan.outcome == "move" and not mover_target_free(plan.rule["target"])[1]:
+		lines += ["", get_text("MOVER_TARGET_MISSING", html.escape(plan.rule["target"]))]
+	markup = InlineKeyboardMarkup(row_width=1)
+	if plan.outcome == "move":
+		markup.add(InlineKeyboardButton(get_text("BUTTON_MOVER_RUN"), callback_data=build_call("moverRun")))
+	return "\n".join(lines), settings_nav(markup, back=settings_call("mover"))
+
+
+def mover_ask_text(field):
+	"""The question of a typed field"""
+	return get_text(MOVER_FIELDS[field][1])
+
+
+def mover_folder_choices(field):
+	"""[(folder, [subfolders in use])] to offer for the source or the target:
+	the folders that hold the ones in use, without those that cannot go with
+	the other folder of the rule"""
+	try:
+		dirs = client.get_download_dirs()
+	except TorrentClientError:
+		return []
+	other = bot_settings.get("auto_mover_target" if field == "source" else "auto_mover_source") or ""
+	choices = []
+	roots = auto_mover.root_folders(dirs)
+	for root in roots:
+		if auto_mover.paths_error(root, other):
+			continue
+		inside = [auto_mover.normalize_dir(d).strip("/")[len(root.strip("/")):].strip("/") for d in dirs if auto_mover.is_under(d, root)]
+		choices.append((root, [sub for sub in inside if sub]))
+	# A folder the manager names but is not there (its default one, never
+	# used) is not offered, where the manager tells which ones are
+	try:
+		there = {root: mover_free(root) >= 0 for root in roots}
+	except TorrentClientError:
+		there = {}
+	if any(there.values()):
+		choices = [choice for choice in choices if there[choice[0]]]
+	# The folder the manager downloads to, as it is, when the one above it
+	# was left out: qBittorrent only tells the free space of that one
+	try:
+		default_dir = auto_mover.normalize_dir(client.get_default_download_dir() or "")
+		offered = [root for root, _inside in choices]
+		if (default_dir.strip("/") and not any(auto_mover.is_under(default_dir, root) for root in offered)
+				and not auto_mover.paths_error(default_dir, other) and mover_free(default_dir) >= 0):
+			choices.insert(0, (default_dir, []))
+	except TorrentClientError:
+		pass
+	return choices[:MOVER_MAX_CHOICES]
+
+
+def build_mover_folder(field):
+	"""The folders to pick the source or the target from, with what each one
+	holds: the rule is about the folder above, not about one of its
+	subfolders. None when there is none to offer, and the folder is typed"""
+	choices = mover_folder_choices(field)
+	if not choices:
+		return None
+	current = bot_settings.get(MOVER_FIELDS[field][0]) or ""
+	lines = [get_text("MOVER_PICK_SOURCE" if field == "source" else "MOVER_PICK_TARGET"), ""]
+	markup = InlineKeyboardMarkup()
+	for root, inside in choices:
+		line = f"📁 <code>{html.escape(root)}</code>"
+		if inside:
+			shown = ", ".join(html.escape(truncate(sub, 30)) for sub in inside[:3]) + ("…" if len(inside) > 3 else "")
+			line += f"\n   {get_text('MOVER_PICK_INSIDE', shown)}"
+		lines.append(line)
+		label = f"{'✅' if root == current else '📁'} {truncate(root, 40)}"
+		markup.add(InlineKeyboardButton(label, callback_data=build_call("moverSet", field, get_dir_id(root))))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_WRITE_DIR"), callback_data=build_call("moverType", field)))
+	return "\n".join(lines), settings_nav(markup, back=settings_call("mover"))
+
+
+def mover_path(text):
+	"""A typed folder the way the manager writes its own: with the leading
+	slash, or without it where the manager has none (Download Station)"""
+	directory = auto_mover.normalize_dir(text).strip("/")
+	try:
+		default_dir = client.get_default_download_dir() or ""
+	except TorrentClientError:
+		default_dir = ""
+	return directory if default_dir and not default_dir.startswith("/") else f"/{directory}"
+
+
+def set_mover_field(field, text):
+	"""Stores a typed field of the rule. Returns what to tell about it: why
+	it cannot be, or what else changed with it. None once stored as it came"""
+	key = MOVER_FIELDS[field][0]
+	if field in ("source", "target"):
+		directory = mover_path(text)
+		other = bot_settings.get("auto_mover_target" if field == "source" else "auto_mover_source") or ""
+		if auto_mover.paths_error(directory, other):
+			return get_text("MOVER_ERROR_NESTED")
+		bot_settings.set(key, directory)
+		_auto_mover_told[0] = None  # Another rule: what was told of the old one may be so again
+		return None
+	# "50", "50 GB", "0,5", "1 TB": the number, in the unit that comes with it.
+	# Another unit is not guessed: 500 MB taken for 500 GB would move it all
+	match = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*([a-zñáí]*)", text.strip().lower())
+	units = MOVER_DAY_UNITS if field == "days" else MOVER_SIZE_UNITS
+	if not match or match.group(2) not in units:
+		return get_text("MOVER_ERROR_DAYS" if field == "days" else "MOVER_ERROR_NUMBER")
+	number = round(float(match.group(1).replace(",", ".")) * units[match.group(2)], 3)
+	number = int(number) if number == int(number) else number
+	if field != "days" and number <= 0:
+		return get_text("MOVER_ERROR_ZERO")
+	bot_settings.set(key, number)
+	_auto_mover_told[0] = None
+	# The start stays under the stop: the other one follows, and it is told,
+	# instead of refusing a value until the other is changed first
+	if field == "min" and number >= mover_number("auto_mover_wanted_free_gb"):
+		bot_settings.set("auto_mover_wanted_free_gb", number * 2)
+		return get_text("MOVER_ADJUSTED_WANTED", sizeof_fmt(number * 2 * auto_mover.GB))
+	if field == "wanted" and number <= mover_number("auto_mover_min_free_gb"):
+		bot_settings.set("auto_mover_min_free_gb", round(number / 2, 3))
+		return get_text("MOVER_ADJUSTED_MIN", sizeof_fmt(round(number / 2, 3) * auto_mover.GB))
+	return None
+
+
 SETTINGS_SCREENS = {
 	"main": build_settings_main,
 	"limits": build_settings_limits,
@@ -3027,6 +3754,7 @@ SETTINGS_SCREENS = {
 	"add": build_settings_add,
 	"rename": build_settings_rename,
 	"tlimits": build_settings_tracker_limits,
+	"mover": build_settings_mover,
 }
 
 
@@ -3145,6 +3873,7 @@ def collect_telemetry_metrics():
 		"auto_move_series": auto_move_series_enabled(),
 		"auto_move_series_external": auto_move_series_enabled(external=True),
 		"low_space_warning": bool(bot_settings.get("low_space_warning")),
+		"auto_mover": auto_mover_enabled(),
 		"favorite_dirs": len(bot_settings.get("favorite_dirs") or []),
 		"custom_templates": sum(1 for key in ("template_movie", "template_series", "template_season") if bot_settings.get(key)),
 		"tracker_limits": len(tracker_limits.rules()) if tracker_limits_supported() else 0,
@@ -4135,9 +4864,22 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 			page_parts=("mass", "move", filter_key),
 			page=dir_page,
 		)
+	elif action == "cat" and client.supports_categories:
+		# What changing it does depends on each torrent: the manager moves the
+		# ones it manages to the folder of the category, and only labels the rest
+		managed = sum(1 for torrent in torrents if torrent.auto_managed)
+		effect = (get_text("MASS_CATEGORY_STAYS") if not managed else get_text("MASS_CATEGORY_MOVES_ALL") if managed == count
+				else get_text("MASS_CATEGORY_MOVES_SOME", managed))
+		text = f"{get_text('MASS_CATEGORY_ASK', count)}\n\n{effect}"
+		markup = build_category_markup(
+			cat_call=lambda cat_id: build_call("massCat", mass_ctx, cat_id),
+			cancel_call=back_call,
+			page_parts=("mass", "cat", filter_key),
+			page=dir_page,
+		)
 	else:
 		return
-	if action != "move":
+	if action not in ("move", "cat"):
 		markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=back_call))
 	edit_message(chat_id, message_id, text, markup)
 
@@ -4333,7 +5075,14 @@ def handle_pending_input(message, pending):
 	if not text or text.lower() in ("cancel", "cancelar") or re.fullmatch(r'/cancel(?:@\w+)?', text, re.IGNORECASE):
 		if back_to_add_dir(chat_id, pending):
 			return
-		send_message(chat_id, get_text("INPUT_CANCELLED"), reply_markup=back_markup, thread_id=thread_id)
+		# Told in passing, and straight back to the screen the question took
+		# the place of: there is nothing else to do after cancelling
+		send_notice(chat_id, get_text("INPUT_CANCELLED"), thread_id=thread_id)
+		if pending.get("replaced"):
+			screen = send_message(chat_id, "⏳", thread_id=thread_id)
+			if screen:
+				dispatch_callback(chat_id, screen.message_id, message.from_user.id,
+								pending.get("back_call") or build_call("dashboard"), thread_id=thread_id)
 		return
 
 	if action == "search":
@@ -4434,6 +5183,11 @@ def handle_pending_input(message, pending):
 			bot_settings.set("favorite_dirs", favorites)
 		fav_text, fav_markup = build_favorite_dirs_menu()
 		send_message(chat_id, f"{get_text('SETTINGS_UPDATED')}\n\n{fav_text}", reply_markup=fav_markup, thread_id=thread_id)
+	elif action == "moverField":
+		# Back on the rule either way: a refused answer is told on top of it,
+		# with the buttons to try again right there
+		problem = set_mover_field(pending["field"], text)
+		send_settings_menu(chat_id, thread_id=thread_id, prefix=problem or get_text("SETTINGS_UPDATED"), screen="mover")
 	elif action == "template":
 		kind = pending["kind"]
 		try:
@@ -4574,11 +5328,59 @@ def move_order_superseded(ids, order):
 		return any(_move_orders.get(str(torrent_id), order) != order for torrent_id in ids)
 
 
+def run_move_order(deliver, ids, order, target, on_retrying=None, plain=False):
+	"""Delivers a move order, blocking until it is delivered or given up: the
+	RPC blocks until the physical move is finished, and a daemon that does not
+	answer (e.g. busy relocating large amounts of data) is asked again until
+	it does. deliver must be safe to call again. Returns None once delivered,
+	or the text telling why it was not: a whole message, or with plain only
+	what the manager said, for a caller that words its own"""
+	def told(key, reason):
+		return reason if plain else get_text(key, html.escape(reason))
+
+	try:
+		deliver()
+		return None
+	except PermanentTorrentError as e:
+		# The manager will not do it: retrying only delays the bad news
+		warning(f"Move order refused: {e}")
+		return told("MOVE_REFUSED", str(e))
+	except TorrentClientError as e:
+		err = str(e)
+	except Exception as e:
+		error(f"Unexpected error delivering move order: {e}")
+		return told("MOVE_GIVE_UP", str(e))
+	warning(f"Move order not delivered, will retry in background: {err}")
+	if on_retrying:
+		on_retrying()
+	for _ in range(MOVE_RETRY_ATTEMPTS):
+		time.sleep(MOVE_RETRY_DELAY)
+		if move_order_superseded(ids, order):
+			# A newer order for these torrents went out meanwhile: retrying
+			# this one would send them back where they are no longer wanted
+			debug(f"Move order to {target} superseded, not retried")
+			return get_text("MOVE_SUPERSEDED")
+		try:
+			deliver()
+			debug(f"Move order delivered after retrying: {len(ids)} torrents -> {target}")
+			return None
+		except PermanentTorrentError as e:
+			# A retry can learn what the first try could not (Download Station
+			# telling that File Station failed half way): told, not retried
+			warning(f"Move order refused on a retry: {e}")
+			return told("MOVE_REFUSED", str(e))
+		except TorrentClientError as e:
+			err = str(e)
+		except Exception as e:
+			error(f"Unexpected error delivering move order on a retry: {e}")
+			return told("MOVE_GIVE_UP", str(e))
+	error(f"Move order gave up after {MOVE_RETRY_ATTEMPTS} attempts: {err}")
+	return told("MOVE_GIVE_UP", err)
+
+
 def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=None, thread_id=None, reply_markup=None, apply=None, target=None, wrap=None, failure_markup="same"):
 	"""Show a progress message and deliver the move order in a background thread
-	(the RPC blocks until the physical move is finished). The message is updated
-	with the final result. If the daemon does not answer (e.g. busy relocating
-	large amounts of data), keep retrying until it is delivered.
+	(see run_move_order). The message is updated with the final result.
 	apply overrides what is delivered, for the operations that also relocate the
 	data and block the same way (assigning a category to an auto managed
 	torrent); it must be safe to call again on a retry.
@@ -4602,48 +5404,16 @@ def deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, messa
 		else:
 			send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 
-	def worker():
-		try:
-			deliver()
-			finish(success_text)
-			return
-		except PermanentTorrentError as e:
-			# The manager will not do it: retrying only delays the bad news
-			warning(f"Move order refused: {e}")
-			finish(wrap(get_text("MOVE_REFUSED", html.escape(str(e)))), failure_markup)
-			return
-		except TorrentClientError as e:
-			err = str(e)
-		except Exception as e:
-			error(f"Unexpected error delivering move order: {e}")
-			finish(wrap(get_text("MOVE_GIVE_UP", html.escape(str(e)))), failure_markup)
-			return
-		warning(f"Move order not delivered, will retry in background: {err}")
+	def retrying():
 		if message_id is not None:
 			edit_message(chat_id, message_id, wrap(get_text("MOVE_RETRYING")))
-		for _ in range(MOVE_RETRY_ATTEMPTS):
-			time.sleep(MOVE_RETRY_DELAY)
-			if move_order_superseded(ids, order):
-				# A newer order for these torrents went out meanwhile: retrying
-				# this one would send them back where they are no longer wanted
-				debug(f"Move order to {target} superseded, not retried")
-				finish(wrap(get_text("MOVE_SUPERSEDED")), failure_markup)
-				return
-			try:
-				deliver()
-				debug(f"Move order delivered after retrying: {len(ids)} torrents -> {target}")
-				finish(success_text)
-				return
-			except PermanentTorrentError as e:
-				# A retry can learn what the first try could not (Download Station
-				# telling that File Station failed half way): told, not retried
-				warning(f"Move order refused on a retry: {e}")
-				finish(wrap(get_text("MOVE_REFUSED", html.escape(str(e)))), failure_markup)
-				return
-			except TorrentClientError as e:
-				err = str(e)
-		error(f"Move order gave up after {MOVE_RETRY_ATTEMPTS} attempts: {err}")
-		finish(wrap(get_text("MOVE_GIVE_UP", html.escape(err))), failure_markup)
+
+	def worker():
+		failure = run_move_order(deliver, ids, order, target, on_retrying=retrying)
+		if failure is None:
+			finish(success_text)
+		else:
+			finish(wrap(failure), failure_markup)
 
 	threading.Thread(target=worker, daemon=True).start()
 
@@ -4672,6 +5442,33 @@ def do_mass_move_to(chat_id, mass_ctx, new_dir, thread_id=None, message_id=None)
 	progress_text = get_text("MASS_MOVING", len(ids), html.escape(new_dir))
 	success_text = get_text("MASS_DONE_MOVE", len(ids), html.escape(new_dir))
 	deliver_move_order(chat_id, ids, new_dir, progress_text, success_text, message_id=message_id, thread_id=thread_id, reply_markup=back_markup)
+
+
+def do_mass_category(chat_id, mass_ctx, category, thread_id=None, message_id=None):
+	"""Gives a category (none, with "") to the torrents the "category of all"
+	screen counted that are still there. The manager moves the data of the
+	ones it manages, which blocks like a move: delivered and retried as one"""
+	try:
+		targets = mass_targets(mass_ctx)
+	except TorrentClientError as e:
+		edit_message(chat_id, message_id, client_error_text(e), back_close_markup())
+		return
+	if targets is None:
+		edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
+		return
+	filter_key, ids = targets
+	back_markup = back_close_markup(build_call("list", filter_key, 0))
+	if not ids:
+		edit_message(chat_id, message_id, get_text("MASS_GONE"), back_markup)
+		return
+	label = html.escape(category)
+	deliver_move_order(
+		chat_id, ids, "",
+		get_text("MASS_CATEGORY_CHANGING", len(ids), label) if category else get_text("MASS_CATEGORY_CLEARING", len(ids)),
+		get_text("MASS_CATEGORY_DONE", len(ids), label) if category else get_text("MASS_CATEGORY_CLEARED", len(ids)),
+		message_id=message_id, thread_id=thread_id, reply_markup=back_markup,
+		apply=lambda: client.set_category(ids, category),
+		target=f"category '{category}'" if category else "no category")
 
 
 # ---------------------------------------------------------------------------
@@ -4861,7 +5658,9 @@ def ask_for_input(chat_id, user_id, action, prompt, thread_id=None, message_id=N
 	text = f"{prompt}\n\n{get_text('INPUT_CANCEL_HINT')}"
 	sent = send_message(chat_id, text, reply_markup=ForceReply(), thread_id=thread_id)
 	prompt_message_id = sent.message_id if sent else None
-	set_pending_input(chat_id, user_id, action, thread_id=thread_id, prompt_message_id=prompt_message_id, **extra)
+	# replaced: the question took the place of a screen, which comes back if it is cancelled
+	set_pending_input(chat_id, user_id, action, thread_id=thread_id, prompt_message_id=prompt_message_id,
+					replaced=bool(message_id), **extra)
 
 
 def download_telegram_file(file_id):
@@ -5626,6 +6425,14 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			else:
 				do_mass_move_to(chat_id, mass_ctx, new_dir, thread_id=thread_id, message_id=message_id)
 
+		elif command == "massCat":
+			mass_ctx = args[0]
+			category = get_cat_by_id(args[1])
+			if get_action_context(mass_ctx, "m") is None or category is None:
+				edit_message(chat_id, message_id, get_text("MASS_EXPIRED"), back_close_markup())
+			else:
+				do_mass_category(chat_id, mass_ctx, category, thread_id=thread_id, message_id=message_id)
+
 		elif command == "massMoveNew":
 			mass_ctx = args[0]
 			ctx = get_action_context(mass_ctx, "m")
@@ -5823,6 +6630,37 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				bot_settings.set("favorite_dirs", favorites)
 			render_favorite_dirs_menu(chat_id, message_id)
 
+		elif command == "moverAsk" and args and args[0] in ("source", "target") and build_mover_folder(args[0]):
+			text, markup = build_mover_folder(args[0])
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "moverSet":
+			directory = get_dir_by_id(args[1])
+			problem = get_text("SEARCH_EXPIRED") if directory is None else set_mover_field(args[0], directory)
+			text, markup = build_settings("mover")
+			edit_message(chat_id, message_id, f"{problem or get_text('SETTINGS_UPDATED')}\n\n{text}", markup)
+
+		elif command in ("moverAsk", "moverType"):
+			field = args[0] if args and args[0] in MOVER_FIELDS else "source"
+			ask_for_input(chat_id, user_id, "moverField", mover_ask_text(field), thread_id=thread_id,
+						message_id=message_id, field=field, back_call=settings_call("mover"))
+
+		elif command == "moverPreview":
+			text, markup = build_mover_preview()
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command == "moverRun":
+			# The notice of the move is a message of its own, which the move
+			# updates when it is over: this screen has nothing left to offer,
+			# and painting another one would mean asking a manager that may
+			# not answer while it moves
+			plan = run_auto_mover(force=True, chat_id=chat_id, thread_id=thread_id)
+			if plan.outcome == "move":
+				if not delete_message(chat_id, message_id):
+					remove_markup(chat_id, message_id)
+			else:
+				edit_message(chat_id, message_id, mover_outcome_text(plan), back_close_markup(settings_call("mover")))
+
 		elif command == "tplMenu":
 			render_templates_menu(chat_id, message_id)
 
@@ -5858,7 +6696,8 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			if back_to_add_dir(chat_id, pending_input, message_id=message_id):
 				pass
 			elif back_call:
-				edit_message(chat_id, message_id, get_text("INPUT_CANCELLED"), back_close_markup(back_call))
+				# The tap already told it was cancelled
+				dispatch_callback(chat_id, message_id, user_id, back_call, thread_id=thread_id)
 			else:
 				show_dashboard(chat_id, thread_id=thread_id, message_id=message_id)
 
@@ -6030,7 +6869,8 @@ def poll_torrents(states):
 					handle_seeding_stopped(torrent.id)
 				except Exception as e:
 					warning(f"Cannot handle {torrent.name} stopping seeding: {e}")
-			if state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors"):
+			if (state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors")
+					and not mover_tells(torrent_id)):
 				count_usage("auto_notify_error")
 				notify(get_text("NOTIFY_TORRENT_ERROR", html.escape(torrent.name), html.escape(state["error"])))
 		states[torrent_id] = state
@@ -6047,11 +6887,20 @@ def torrent_monitor():
 	and notifies. The first poll only builds the baseline, so restarting the
 	bot never re-notifies torrents that were already there"""
 	states = None
+	# The first check of the mover comes one interval after the start, once
+	# the manager had time to be up and listing all its torrents
+	last_mover = time.monotonic()
 	while True:
 		try:
 			states = poll_torrents(states)
 		except Exception as e:
 			warning(f"Torrent monitor: {e}")
+		if time.monotonic() - last_mover >= AUTO_MOVER_INTERVAL_SECONDS:
+			last_mover = time.monotonic()
+			try:
+				auto_mover_tick()
+			except Exception as e:
+				warning(f"Automatic mover: {e}")
 		time.sleep(MONITOR_INTERVAL_SECONDS)
 
 
@@ -6075,6 +6924,7 @@ def track_polling_heartbeat():
 if __name__ == "__main__":
 	debug(f"torrent-controller-bot {VERSION} started. Connected to {client_version}")
 	send_startup_message()
+	mover_close_lost_notice()
 	threading.Thread(target=torrent_monitor, daemon=True).start()
 	if TELEMETRY_DEBUG:
 		warning(f"TELEMETRY_DEBUG is on: statistics go to {TELEMETRY_ENDPOINT} a minute after every start")

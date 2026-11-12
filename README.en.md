@@ -39,6 +39,7 @@ Control your torrent client from a single place.
 - ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains and the torrents added outside the bot (can be toggled from the settings)
 - ✅ Replace a previous copy: when the name a download should take already belongs to another torrent, on completion it offers to delete the old one (with its data) and keep the new one, or does it without asking if you turn that on
 - ✅ Series folder: a new episode is offered (or sent straight, if you turn it on) to the folder where the previous ones already are
+- ✅ Automatic mover: when the download folder runs out of space, it moves the oldest torrents to another folder with the same layout (for example from an SSD to the disks)
 - ✅ Warning if the torrent you add may not fit on the disk
 - ✅ Bot settings persist across restarts (`/config` volume)
 - ✅ Notification to the administrator when the bot starts
@@ -154,6 +155,29 @@ When an episode or a season pack arrives, the bot looks among the torrents in th
 
 If you keep seasons in subfolders (`Mad Men/Season 01`), an episode of the next season is offered `Mad Men/Season 02` with the same format, even if that folder does not exist yet. The default download folder and the automatic download one are never offered unless they are named after the series. An auto managed qBittorrent torrent is left alone: its category decides the folder.
 
+## Automatic mover
+
+Meant for those who download to a small, fast disk (an SSD, a cache) and keep things in the long run on a big one with the same folders, like the UnRAID *mover* does. It is set up in `/settings` → 🚚 Automatic mover and is off by default:
+
+- **Source** and **target**: two folders as the torrent manager sees them, on different disks. Each torrent goes to the same subfolder it had: with source `/ssd` and target `/media`, what is in `/ssd/MOVIES` goes to `/media/MOVIES`.
+- **Start with less than**: while the source has more free space than this, nothing is moved.
+- **Stop on reaching**: when it is time to move, torrents are moved until the source has this much free space, and not one more.
+- **Days finished**: only the torrents that finished downloading at least this many days ago are moved, the oldest first. They keep seeding from the target.
+
+The bot checks every five minutes. When it moves something it sends a notice with the list, and that same message changes once the torrents really are in the target. 👀 **See what would be moved** shows which torrents would go right now and to which folder, and from there it can be run by hand without waiting for the minimum.
+
+It is built not to surprise:
+
+- If nothing can be moved, it says so once and explains why (torrents too recent, unfinished...).
+- If what has to be moved does not fit in the target, or the source and the target are on the same disk, it moves nothing and tells you.
+- If the manager fails to move something (permissions, space), it tells you with the reason and **turns itself off**, instead of repeating the error every five minutes. The same if the source gained no space after a move.
+- Torrents that share the same data (the same name in the same folder, as cross-seeding leaves them) are always moved together.
+- Torrents that are unfinished, being checked or with an error in their data are left alone (a tracker that does not answer does not count), and so are the qBittorrent ones under automatic management, whose folder is decided by their category.
+
+Transmission answers nothing while it moves data between disks: during a big move the bot will show connection errors until it is done, and the notice of the mover is updated then.
+
+The free space is asked to the manager, so the bot does not need the disks mounted. qBittorrent only knows it for its default download folder: the source has to be that folder or be inside it, and the screen warns when it is not.
+
 ## What the bot can do with each client
 
 The architecture of the bot is client-agnostic, but their APIs do not offer the same operations. The bot **hides the buttons** for whatever the configured client cannot do, so you never see options that would fail.
@@ -187,7 +211,7 @@ The architecture of the bot is client-agnostic, but their APIs do not offer the 
 
 ² Download Station exposes no way to re-check the data of a task.
 
-⁴ Categories are a qBittorrent concept: each one carries a folder, and a torrent under **Automatic Torrent Management** takes its folder from its category, so changing the category moves the files. That is why the bot never offers both at once: on an auto managed torrent the move button is replaced by the category one, and moving by hand stays available inside that screen, stating that the torrent switches to manual mode. Transmission and Deluge have labels, but they are plain labels with no folder attached (and Deluge needs the Label plugin on top), so the bot does not use them.
+⁴ Categories are a qBittorrent concept: each one carries a folder, and a torrent under **Automatic Torrent Management** takes its folder from its category, so changing the category moves the files. That is why the bot never offers both at once: on an auto managed torrent the move button is replaced by the category one, and moving by hand stays available inside that screen, stating that the torrent switches to manual mode. The actions on all the torrents of a list have both, "Move all" and "Category of all", and the screen tells how many torrents the manager will move when their category changes. Transmission and Deluge have labels, but they are plain labels with no folder attached (and Deluge needs the Label plugin on top), so the bot does not use them.
 
 ³ The Download Station API has no field for the name of a task or of the files it contains: the only editable thing about a task is its destination. The content can be renamed on disk with File Station, but then the task no longer finds its files and breaks on the next check DSM makes (a reboot of the NAS, of the package, or a pause and resume), so the bot does not do it. It is the same limitation the DSM interface itself has, where a download cannot be renamed either.
 
@@ -314,7 +338,6 @@ torrent-controller-bot/
     ├── config.py
     ├── logger.py
     ├── message_queue.py
-    ├── name_parser.py
     ├── torrent-controller-bot.py
     ├── Dockerfile_local
     ├── docker-compose.yaml

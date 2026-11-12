@@ -621,7 +621,10 @@ class QBittorrentClient(TorrentClient):
 			self._post("torrents/setLocation", data={
 				"hashes": "|".join(torrent_ids), "location": new_dir}, timeout=MOVE_RPC_TIMEOUT)
 		except TorrentClientError as e:
-			raise TorrentClientError(f"Error moving torrents: {e}")
+			# 400, 403 and 409 are qBittorrent refusing the folder (empty, not
+			# writable, cannot be created): asking again gets the same answer
+			kind = PermanentTorrentError if getattr(e, "status_code", None) in (400, 403, 409) else TorrentClientError
+			raise kind(f"Error moving torrents: {e}")
 
 	def get_categories(self):
 		try:

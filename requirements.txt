@@ -2,3 +2,7 @@ requests==2.34.2
 pyTelegramBotAPI==4.37.1
 transmission-rpc==7.0.12
 dgongut-telemetry @ https://github.com/dgongut/telemetry/archive/refs/tags/client-v1.0.0.zip#subdirectory=clients/python
+# The name parser and the rename templates, from dgongut/name-parser (no PyPI),
+# shared with DropBot. Pinned to the commit of the tag v1.0.1, not to the tag,
+# which can be moved
+dgongut-name-parser @ https://github.com/dgongut/name-parser/archive/78145cb97f97a777ddbe08c72ebcff1405b33369.zip

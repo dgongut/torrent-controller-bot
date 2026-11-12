@@ -39,6 +39,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene y de los torrents añadidos fuera del bot (activable desde los ajustes)
 - ✅ Sustituir una versión anterior: si el nombre que le toca a una descarga ya lo tiene otro torrent, al terminar te ofrece borrar el anterior (con sus datos) y quedarte con el nuevo, o lo hace sin preguntar si lo activas
 - ✅ Carpeta de la serie: un episodio nuevo se ofrece (o va directo, si lo activas) a la carpeta donde ya tienes los anteriores
+- ✅ Mover automático: cuando la carpeta de descargas se queda sin espacio, mueve los torrents más antiguos a otra carpeta con la misma estructura (por ejemplo de un SSD a los discos)
 - ✅ Aviso si el torrent que añades puede no caber en el disco
 - ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
 - ✅ Notificación al administrador al arrancar el bot
@@ -155,6 +156,29 @@ Cuando llega un episodio o un pack de temporada, el bot busca entre los torrents
 
 Si guardas las temporadas en subcarpetas (`Mad Men/Season 01`), un episodio de la temporada siguiente se propone en `Mad Men/Season 02` con el mismo formato, aunque esa carpeta aún no exista. La carpeta de descargas por defecto y la de la descarga automática nunca se proponen, salvo que lleven el nombre de la serie. Un torrent de qBittorrent en gestión automática no se toca: la carpeta la decide su categoría.
 
+## Mover automático
+
+Pensado para quien descarga en un disco rápido y pequeño (un SSD, una caché) y guarda a la larga en otro grande con las mismas carpetas, como hace el *mover* de UnRAID. Se configura en `/settings` → 🚚 Mover automático y está desactivado por defecto:
+
+- **Origen** y **destino**: dos carpetas tal como las ve el gestor de torrents, en discos distintos. Cada torrent va a la misma subcarpeta que tenía: con origen `/ssd` y destino `/media`, lo que está en `/ssd/PELICULAS` va a `/media/PELICULAS`.
+- **Empezar con menos de**: mientras al origen le quede más espacio libre que este, no se mueve nada.
+- **Parar al llegar a**: cuando toca mover, se mueven torrents hasta que el origen tenga este espacio libre, y ni uno más.
+- **Días terminados**: solo se mueven los torrents que terminaron de descargarse hace al menos estos días, empezando por los más antiguos. Siguen compartiendo desde el destino.
+
+El bot lo comprueba cada cinco minutos. Cuando mueve algo manda un aviso con la lista, y ese mismo mensaje cambia cuando los torrents están de verdad en el destino. 👀 **Ver qué se movería** enseña qué torrents irían ahora mismo y a qué carpeta, y desde ahí se puede lanzar a mano sin esperar al mínimo.
+
+Está hecho para no sorprender:
+
+- Si no hay nada que se pueda mover, lo dice una vez y explica por qué (torrents demasiado recientes, sin terminar...).
+- Si lo que hay que mover no cabe en el destino, o el origen y el destino están en el mismo disco, no mueve nada y avisa.
+- Si el gestor no consigue mover algo (permisos, espacio), lo cuenta con el motivo y **se desactiva solo**, en vez de repetir el error cada cinco minutos. Lo mismo si después de mover el origen no ha ganado espacio.
+- Los torrents que comparten los mismos datos (el mismo nombre en la misma carpeta, como deja el *cross-seeding*) se mueven siempre juntos.
+- No se tocan los torrents sin terminar, en comprobación o con error en sus datos (un tracker que no responde no cuenta), ni los de qBittorrent en gestión automática, cuya carpeta la decide su categoría.
+
+Transmission no responde a nada mientras mueve datos entre discos: durante un movimiento grande el bot dará error de conexión hasta que termine, y el aviso del mover se actualiza entonces.
+
+El espacio libre se le pregunta al gestor, así que el bot no necesita tener montados los discos. qBittorrent solo lo sabe de su carpeta de descargas por defecto: el origen tiene que ser esa carpeta o estar dentro de ella, y la pantalla lo avisa si no es así.
+
 ## Qué puede hacer el bot con cada gestor
 
 La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mismas operaciones. El bot **oculta los botones** de lo que el gestor configurado no sabe hacer, así que no verás opciones que fueran a fallar.
@@ -188,7 +212,7 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 
 ² Download Station no expone ninguna forma de volver a verificar los datos de una tarea.
 
-⁴ Las categorías son un concepto de qBittorrent: cada una lleva asociada una carpeta, y un torrent en **gestión automática** (*Automatic Torrent Management*) saca su carpeta de su categoría, de modo que cambiársela mueve los ficheros. Por eso el bot no ofrece las dos cosas a la vez: en un torrent auto-gestionado el botón de mover se sustituye por el de categoría, y mover a mano queda disponible dentro de esa pantalla avisando de que el torrent pasa a modo manual. Transmission y Deluge tienen etiquetas, pero son etiquetas sueltas sin carpeta asociada (en Deluge hace falta además el plugin Label), así que el bot no las usa.
+⁴ Las categorías son un concepto de qBittorrent: cada una lleva asociada una carpeta, y un torrent en **gestión automática** (*Automatic Torrent Management*) saca su carpeta de su categoría, de modo que cambiársela mueve los ficheros. Por eso el bot no ofrece las dos cosas a la vez: en un torrent auto-gestionado el botón de mover se sustituye por el de categoría, y mover a mano queda disponible dentro de esa pantalla avisando de que el torrent pasa a modo manual. En las acciones con todos de un listado están las dos, «Mover todos» y «Categoría de todos», y la pantalla dice cuántos torrents moverá el gestor al cambiarles la categoría. Transmission y Deluge tienen etiquetas, pero son etiquetas sueltas sin carpeta asociada (en Deluge hace falta además el plugin Label), así que el bot no las usa.
 
 ³ La API de Download Station no tiene ningún campo para el nombre de una tarea ni de los ficheros que contiene: lo único editable de una tarea es su destino. Se puede renombrar en disco con File Station, pero entonces la tarea deja de encontrar sus ficheros y se rompe en la siguiente verificación de DSM (un reinicio del NAS, del paquete, o una pausa y reanudación), así que el bot no lo hace. Es la misma limitación que tiene la propia interfaz de DSM, donde tampoco se puede renombrar una descarga.
 
@@ -315,7 +339,6 @@ torrent-controller-bot/
     ├── config.py
     ├── logger.py
     ├── message_queue.py
-    ├── name_parser.py
     ├── torrent-controller-bot.py
     ├── Dockerfile_local
     ├── docker-compose.yaml

@@ -1074,7 +1074,8 @@ text, calls = screen(bot.build_call("settings"))
 check("the bare settings call is the main screen", title_of(text), bot.get_text("SETTINGS_TITLE", "Fake 1.0"))
 check("the main screen has one row per section", calls[:-2], [
 	bot.build_call("settings", "limits"), bot.build_call("settings", "notify"), bot.build_call("settings", "add"),
-	bot.build_call("settings", "rename"), bot.build_call("favDirsMenu"), bot.build_call("telemetryMenu")])
+	bot.build_call("settings", "rename"), bot.build_call("favDirsMenu"), bot.build_call("settings", "mover"),
+	bot.build_call("telemetryMenu")])
 check("and goes back to the dashboard", calls[-2:], [bot.build_call("dashboard"), bot.build_call("cerrar")])
 check("no toggle on the main screen", [c for c in calls if c.startswith("toggleSetting")], [])
 labels = button_texts(last()[2])

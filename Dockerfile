@@ -3,7 +3,7 @@ ARG BASE_IMAGE=alpine:3.24.2
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
 
-ARG VERSION=1.14.0
+ARG VERSION=1.15.0
 
 # Standard OCI labels. The version comes from the same VERSION that picks the
 # source tag below, so it cannot say one thing and contain another; it is
@@ -34,8 +34,8 @@ RUN apk add --no-cache python3 py3-pip tzdata curl unzip && \
     mv /tmp/torrent-controller-bot-${VERSION}/config.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/logger.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/message_queue.py /app && \
-    mv /tmp/torrent-controller-bot-${VERSION}/name_parser.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/tracker_limits.py /app && \
+    mv /tmp/torrent-controller-bot-${VERSION}/auto_mover.py /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/torrent_clients /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/locale /app && \
     mv /tmp/torrent-controller-bot-${VERSION}/requirements.txt /app && \

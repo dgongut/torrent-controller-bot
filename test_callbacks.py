@@ -1249,7 +1249,7 @@ check("the metrics are exactly the declared ones", sorted(metrics), sorted([
 	"client", "language", "admins", "telegram_group", "torrents_per_page", "notify_completed",
 	"notify_errors", "notify_external_added", "notify_ratio_reached", "auto_remove_ratio", "notify_auto_removed", "auto_download", "auto_download_dir", "auto_category",
 	"auto_rename", "auto_rename_files", "auto_rename_external", "auto_replace", "auto_move_series", "auto_move_series_external",
-	"low_space_warning", "favorite_dirs", "tracker_limits",
+	"low_space_warning", "auto_mover", "favorite_dirs", "tracker_limits",
 	"custom_templates", "torrents", "transmission_major"]))
 bot_module.bot_settings.set("tracker_limits", {"tracker.example.org": {"ratio": 0.5, "down": 0, "up": 0}})
 check("the trackers with limits go as a count, never which ones", bot_module.collect_telemetry_metrics()["tracker_limits"], 1)
@@ -1649,7 +1649,7 @@ calls = callbacks_of(screen[1])
 check("the actions on all say how many torrents they cover",
 	screen[0].startswith(get_text("MASS_MENU_TITLE", bot_module.get_filter_label(config.FILTER_ALL), len(TORRENT_IDS))), True)
 check("the actions on all are all there", [c for c in calls if c.startswith("mass|")],
-	[bot_module.build_call("mass", a, config.FILTER_ALL) for a in ("resume", "pause", "move", "ratio", "delete")])
+	[bot_module.build_call("mass", a, config.FILTER_ALL) for a in ("resume", "pause", "move", "cat", "ratio", "delete")])
 check("their back goes to the page they were opened from", calls[-2], bot_module.build_call("list", config.FILTER_ALL, 1))
 tf = tracker_filter()
 calls = callbacks_of(press(bot_module.build_call("massMenu", tf, 0))[1])
@@ -1770,6 +1770,41 @@ press(next(c for c in callbacks_of(move_screen[1]) if c.startswith("massMoveDir|
 real_sleep(0.3)  # The move goes out on a worker thread
 check("moving all moves only the torrents counted", [c[1] for c in CALLS if c[0] == "move_torrents"], [TORRENT_IDS[:2]])
 bot_module.client.get_torrents = _real_get_torrents
+
+# The category of all: where the folders go by category, that is what is
+# changed. The manager moves the torrents it manages and only labels the rest
+cat_screen = press(bot_module.build_call("mass", "cat", config.FILTER_ALL))
+check("the category of all asks which one, for how many", cat_screen[0].startswith(get_text("MASS_CATEGORY_ASK", len(TORRENT_IDS))), True)
+check("and says that torrents in manual mode stay where they are", get_text("MASS_CATEGORY_STAYS") in cat_screen[0], True)
+cat_calls = [c for c in callbacks_of(cat_screen[1]) if c.startswith("massCat|")]
+check("with every category and none", [bot_module.get_cat_by_id(c.split("|")[2]) for c in cat_calls], [name for name, _path in CATEGORIES] + [""])
+bot_module.client.get_torrents = lambda status=None, query=None: [fake_torrent(t) for t in TORRENT_IDS[:2]] + [newcomer]
+CALLS.clear()
+changed = press(cat_calls[1])
+real_sleep(0.3)  # It may move data: delivered on a worker thread, like a move
+check("a category is given only to the torrents counted", [c for c in CALLS if c[0] == "set_category"], [("set_category", TORRENT_IDS[:2], CATEGORIES[1][0])])
+check("and it is told", EDITS[-1][0], get_text("MASS_CATEGORY_DONE", 2, CATEGORIES[1][0]))
+CALLS.clear()
+press(cat_calls[-1])
+real_sleep(0.3)
+check("none takes the category away, and says so in its own words", ([c for c in CALLS if c[0] == "set_category"], EDITS[-1][0]),
+	([("set_category", TORRENT_IDS[:2], "")], get_text("MASS_CATEGORY_CLEARED", 2)))
+bot_module.client.get_torrents = lambda status=None, query=None: [newcomer]
+CALLS.clear()
+check("with none of them left nothing is changed", (press(cat_calls[0])[0], CALLS), (get_text("MASS_GONE"), []))
+_managed = fake_torrent(TORRENT_IDS[0])
+_managed.auto_managed = True
+bot_module.client.get_torrents = lambda status=None, query=None: [_managed, fake_torrent(TORRENT_IDS[1])]
+check("torrents under automatic management are warned to be moved, telling how many",
+	get_text("MASS_CATEGORY_MOVES_SOME", 1) in press(bot_module.build_call("mass", "cat", config.FILTER_ALL))[0], True)
+bot_module.client.get_torrents = lambda status=None, query=None: [_managed]
+check("or all of them", get_text("MASS_CATEGORY_MOVES_ALL") in press(bot_module.build_call("mass", "cat", config.FILTER_ALL))[0], True)
+bot_module.client.get_torrents = _real_get_torrents
+check("an expired category of all changes nothing", press(bot_module.build_call("massCat", "m000000", bot_module.get_cat_id("Series")))[0], get_text("MASS_EXPIRED"))
+FakeClient.supports_categories = False
+check("a manager without categories has no category of all",
+	bot_module.build_call("mass", "cat", config.FILTER_ALL) in callbacks_of(bot_module.build_mass_menu(config.FILTER_ALL, 0)[1]), False)
+FakeClient.supports_categories = True
 CALLS.clear()
 old_button = press(bot_module.build_call("confirmMass", "delete", config.FILTER_ALL, "1"))
 check("a confirm button from before deletes nothing and asks again", (CALLS, old_button[0]),
@@ -2205,15 +2240,44 @@ def typed_torrent_rename(answer):
 	bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, bot_module.build_call("rename", TORRENT_ID, "a", 0))
 	manual = [c for c in callbacks_of(EDITS[-1][1]) if c.startswith("renameManual")][0]
 	bot_module.dispatch_callback(CHAT_ID, MESSAGE_ID, 1, manual)
+	before = len(EDITS)
 	bot_module.handle_text(tg_message(answer, chat_type="private"))
+	TYPED_AFTER[:] = EDITS[before:]
 	return [c for c in CALLS if "rename" in str(c)], EDITS[-1][0]
 
 
+TYPED_AFTER = []  # What the last typed answer sent
+TIMERS = []  # (seconds, function) of what the bot left for later
+
+
+class FakeTimer:
+	def __init__(self, seconds, function, args=()):
+		TIMERS.append((seconds, function))
+
+	def start(self):
+		pass
+
+
+bot_module.threading.Timer = FakeTimer
+
+
 renamed, text = typed_torrent_rename("/cancel@OwnBot")
-check("'/cancel@Bot' cancels a typed rename", (renamed, text), ([], bot_module.get_text("INPUT_CANCELLED")))
+# Cancelled is told in a message with no buttons, and the screen the question
+# took the place of comes back by itself
+def cancelled(result):
+	renamed, last = result
+	notice = [markup for text, markup in TYPED_AFTER if text == bot_module.get_text("INPUT_CANCELLED")]
+	return renamed, notice, "Some.Movie.2024.1080p" in last
+
+
+check("'/cancel@Bot' cancels a typed rename", cancelled((renamed, text)), ([], [None], True))
 # The prompt offers /cancel to tap: it cancels like the words always did
 for answer in ("/cancel", "/CANCEL", "/cancel@OwnBot", "cancelar", "cancel"):
-	check(f"{answer!r} cancels a question", typed_torrent_rename(answer), ([], bot_module.get_text("INPUT_CANCELLED")))
+	check(f"{answer!r} cancels a question", cancelled(typed_torrent_rename(answer)), ([], [None], True))
+TIMERS.clear()
+typed_torrent_rename("cancelar")
+check("the cancelled notice is deleted by itself after a while", [(seconds, function.__name__) for seconds, function in TIMERS],
+	[(bot_module.NOTICE_SECONDS, "delete_message")])
 check("the question offers /cancel to tap", "/cancel" in bot_module.get_text("INPUT_CANCEL_HINT"), True)
 renamed, text = typed_torrent_rename("Some/Name")
 check("a typed torrent name with a slash is refused", (renamed, "/" in text and "<code>" in text), ([], True))

@@ -32,13 +32,15 @@ LIGHT_FIELDS = [
 	"id", "name", "status", "error", "errorString", "percentDone",
 	"sizeWhenDone", "rateDownload", "rateUpload", "downloadDir", "addedDate",
 	"trackers", "hashString", "uploadRatio", "activityDate", "leftUntilDone",
+	# How long ago it finished, which the automatic mover goes by
+	"doneDate", "secondsSeeding",
 ]
 
 FULL_FIELDS = LIGHT_FIELDS + [
 	"totalSize", "downloadedEver", "uploadedEver", "eta",
 	"peersConnected", "peersSendingToUs", "peersGettingFromUs",
 	"files", "isFinished",
-	"secondsSeeding", "doneDate", "seedRatioLimit", "seedRatioMode",
+	"seedRatioLimit", "seedRatioMode",
 	"downloadLimit", "downloadLimited", "uploadLimit", "uploadLimited",
 	"isPrivate", "trackerStats",
 	# get_files() combines these three: without them it raises KeyError
@@ -182,6 +184,7 @@ class TransmissionClient(TorrentClient):
 			id=self._raw(torrent, "hashString", "") or "",
 			name=torrent.name,
 			status=self._normalize_status(torrent),
+			error_is_tracker=self._raw(torrent, "error", 0) in (1, 2),  # 1 and 2: a warning or an error of the tracker; 3: a local one
 			progress=self._progress(torrent),
 			total_size=self._raw(torrent, "sizeWhenDone", 0) or self._raw(torrent, "totalSize", 0),
 			downloaded=self._raw(torrent, "downloadedEver", 0),

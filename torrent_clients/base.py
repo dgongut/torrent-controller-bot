@@ -292,6 +292,7 @@ class TorrentInfo:
 	category: str = ""  # Managers without categories leave it empty
 	auto_managed: bool = False  # The manager decides the location (qBittorrent auto_tmm)
 	error_message: str = ""
+	error_is_tracker: bool = False  # The error is the tracker's (Transmission tells it like one of the data): the torrent itself is fine
 	tracker_error: str = ""  # Message of the tracker when none of them answers right (e.g. Unregistered torrent)
 	private: bool = False
 	added_date: object = None  # unix timestamp

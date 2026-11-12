@@ -118,6 +118,8 @@ LIGHT_KEYS = [
 	"name", "state", "progress", "total_wanted", "total_remaining", "download_payload_rate",
 	"upload_payload_rate", "save_path", "time_added", "tracker_host", "message",
 	"ratio", "time_since_transfer",
+	# How long ago it finished, which the automatic mover goes by
+	"completed_time", "seeding_time",
 ]
 
 # Normalized file priority -> Deluge's, the values its own interface uses
@@ -141,8 +143,8 @@ def _file_priority(value):
 FULL_KEYS = LIGHT_KEYS + [
 	"total_done", "total_uploaded", "eta", "num_peers", "num_seeds",
 	"files", "file_progress", "file_priorities", "trackers",
-	"seeding_time", "stop_ratio", "stop_at_ratio", "total_seeds", "total_peers",
-	"distributed_copies", "tracker_status", "private", "completed_time",
+	"stop_ratio", "stop_at_ratio", "total_seeds", "total_peers",
+	"distributed_copies", "tracker_status", "private",
 	"max_download_speed", "max_upload_speed",
 ]
 

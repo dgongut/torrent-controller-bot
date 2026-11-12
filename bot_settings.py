@@ -30,6 +30,16 @@ DEFAULTS = {
 	"auto_move_series": False,  # Episodes added without asking go straight to the folder of their series
 	"auto_move_series_external": False,  # Only used when auto_move_series is enabled
 	"low_space_warning": True,
+	# The automatic mover, see auto_mover.py: when the source folder runs low
+	# on space, the torrents finished longest ago go to the same place under
+	# the target folder. Only does anything with both folders set
+	"auto_mover": False,
+	"auto_mover_source": "",
+	"auto_mover_target": "",
+	"auto_mover_min_free_gb": 50,  # Under this much free space in the source, it moves
+	"auto_mover_wanted_free_gb": 150,  # ...until the source has this much free
+	"auto_mover_notice": None,  # [chat, message, topic] of the notice of the move going on, to close it after a restart
+	"auto_mover_min_days": 7,  # Only torrents finished at least this many days ago
 	"favorite_dirs": [],  # Extra dirs offered as buttons when adding/moving torrents
 	"template_movie": "",  # "" = built-in default template
 	"template_series": "",
