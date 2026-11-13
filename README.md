@@ -159,14 +159,27 @@ Con **«Sustituir sin preguntar si el nombre ya existe»** (dentro del renombrad
 
 ## Carpeta de la serie
 
-Cuando llega un episodio o un pack de temporada, el bot busca entre los torrents del gestor otros de la misma serie y te propone su carpeta. Para decidir que son la misma serie compara el título sin tener en cuenta mayúsculas, tildes ni puntuación (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` y `chicago fire s14e02` son la misma serie), y si los dos nombres llevan año, tiene que coincidir. Nunca hace coincidencias parciales: `Chicago Fire` y `Chicago Med` son series distintas, y una película como *El Camino: una película de Breaking Bad* no es un episodio de nada, así que no se le busca carpeta.
+Cuando llega un episodio o un pack de temporada, el bot busca entre los torrents del gestor otros de la misma serie y te propone su carpeta.
+
+<!-- dockerhub:skip -->
+Para decidir que son la misma serie compara el título sin tener en cuenta mayúsculas, tildes ni puntuación (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` y `chicago fire s14e02` son la misma serie), y si los dos nombres llevan año, tiene que coincidir. Nunca hace coincidencias parciales: `Chicago Fire` y `Chicago Med` son series distintas, y una película como *El Camino: una película de Breaking Bad* no es un episodio de nada, así que no se le busca carpeta.
+<!-- /dockerhub:skip -->
 
 - **Al elegir la carpeta** (al añadir o al mover un torrent), la carpeta de la serie aparece la primera, marcada con ✨, aunque tengas muchas favoritas.
 - **Con la descarga automática**, el mensaje de torrent añadido termina con un 💡 que propone la carpeta y los botones para moverlo o descartarlo. Al moverlo, el bot edita ese mismo mensaje para que muestre la carpeta nueva.
-- **Con «Episodios a la carpeta de su serie»** (dentro de la descarga automática, desactivado por defecto), el bot busca en el gestor otros episodios de la misma serie y, si no hay ninguna duda el torrent se añade directamente en la carpeta de la serie en vez de en la automática, y el mensaje lleva un botón ↩️ Deshacer. Solo ocurre cuando hay una única carpeta con el nombre de la serie; si hay dudas (dos carpetas posibles, o una carpeta común como `/media/series`), te la propone en lugar de decidir por ti. Opcionalmente se aplica también a los torrents añadidos fuera del bot, que en ese caso sí se mueven, porque ya están en el gestor.
-- **Con «Carpeta de series nuevas»** (debajo de la anterior, sin fijar por defecto), una serie de la que no hay ningún otro episodio en el gestor va a una carpeta con su nombre dentro de la que elijas: con `/ssd/SERIES`, el primer episodio de *The Bear* se descarga en `/ssd/SERIES/The Bear` (o `Doctor Who (2005)` si el nombre lleva año), y los siguientes ya la encuentran como la carpeta de la serie. Solo se aplica cuando el torrent iba a quedarse en la carpeta de descargas por defecto o en la automática; si hay alguna duda sobre dónde está la serie, o el gestor no responde al buscarla, se pregunta como siempre. Si borras del gestor los torrents de una serie que ya tienes en disco, el bot no puede saber que existe: la carpeta que crea lleva el nombre que saca del torrent (con el año, si lo trae), así que conviene que coincida con el de la tuya. Si eliges como carpeta de series nuevas la de una serie concreta (`/ssd/SERIES/Chicago Fire`), el bot te avisa antes de guardarla. También avisa si eliges la carpeta donde se descarga todo, y te propone (✨) las carpetas donde ya tienes tus series. Si el gestor no puede crear la carpeta nueva (en Download Station hace falta permiso de File Station), el torrent se descarga donde iba a ir y el mensaje lo explica. Un torrent con nombre de serie pero sin ningún vídeo dentro, como una banda sonora, no crea carpeta.
+- **Con «Episodios a la carpeta de su serie»** (dentro de la descarga automática, desactivado por defecto), el bot busca en el gestor otros episodios de la misma serie y, si no hay ninguna duda, el torrent se añade directamente en la carpeta de la serie en vez de en la automática, y el mensaje lleva un botón ↩️ Deshacer. Solo ocurre cuando hay una única carpeta con el nombre de la serie; si hay dudas (dos carpetas posibles, o una carpeta común como `/media/series`), te la propone en lugar de decidir por ti. Opcionalmente se aplica también a los torrents añadidos fuera del bot, que en ese caso sí se mueven, porque ya están en el gestor.
+- **Con «Carpeta de series nuevas»** (debajo de la anterior, sin fijar por defecto), una serie de la que no hay ningún episodio en el gestor va a una carpeta con su nombre dentro de la que elijas: con `/ssd/SERIES`, el primer episodio de *The Bear* va a `/ssd/SERIES/The Bear` (o `Doctor Who (2005)` si lleva año), y los siguientes ya la encuentran ahí.
+  <!-- dockerhub:skip -->
+  - Solo saca series de la carpeta de descargas por defecto o de la automática. Si hay dudas sobre dónde está la serie, o el gestor no responde al buscarla, se pregunta como siempre.
+  - Un torrent con nombre de serie pero sin vídeo dentro, como una banda sonora, no crea carpeta.
+  - Si el gestor no puede crear la carpeta (en Download Station hace falta permiso de File Station), el torrent se descarga donde iba a ir y el mensaje lo explica.
+  - Al elegirla, el bot marca con ✨ las carpetas donde ya tienes tus series, y avisa si eliges la de una serie concreta o la carpeta donde se descarga todo.
+  - Si borras del gestor los torrents de una serie que ya tienes en disco, el bot no puede saber que existe: la carpeta que crea lleva el nombre que saca del torrent, así que conviene que coincida con el de la tuya.
+  <!-- /dockerhub:skip -->
 
+<!-- dockerhub:skip -->
 Si guardas las temporadas en subcarpetas (`Mad Men/Season 01`), un episodio de la temporada siguiente se propone en `Mad Men/Season 02` con el mismo formato, aunque esa carpeta aún no exista. La carpeta de descargas por defecto y la de la descarga automática nunca se proponen, salvo que lleven el nombre de la serie. Un torrent de qBittorrent en gestión automática no se toca: la carpeta la decide su categoría.
+<!-- /dockerhub:skip -->
 
 ## Mover automático
 

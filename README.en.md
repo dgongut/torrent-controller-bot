@@ -148,14 +148,27 @@ With **"Replace without asking when the name exists"** (under the automatic rena
 
 ## Series folder
 
-When an episode or a season pack arrives, the bot looks among the torrents in the manager for others of the same series and offers their folder. Two names are the same series when their titles match ignoring case, accents and punctuation (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` and `chicago fire s14e02` are the same series), and when both carry a year it has to be the same one. It never matches partially: `Chicago Fire` and `Chicago Med` are different series, and a movie such as *El Camino: A Breaking Bad Movie* is not an episode of anything, so no folder is looked for.
+When an episode or a season pack arrives, the bot looks among the torrents in the manager for others of the same series and offers their folder.
+
+<!-- dockerhub:skip -->
+Two names are the same series when their titles match ignoring case, accents and punctuation (`Chicago.Fire.S14E04`, `14x03 - Chicago Fire.mkv` and `chicago fire s14e02` are the same series), and when both carry a year it has to be the same one. It never matches partially: `Chicago Fire` and `Chicago Med` are different series, and a movie such as *El Camino: A Breaking Bad Movie* is not an episode of anything, so no folder is looked for.
+<!-- /dockerhub:skip -->
 
 - **When picking the folder** (adding or moving a torrent), the series folder comes first, marked with ✨, however many favorites you have.
 - **With automatic download**, the torrent added message ends with a 💡 that offers the folder, with buttons to move it or dismiss it. Moving it edits that same message so it shows the new folder.
-- **With "Episodes to their series folder"** (under automatic download, off by default), the bot looks in the manager for other episodes of the same series and, when there is no doubt the torrent is added straight into the series folder instead of the automatic one, and the message carries an ↩️ Undo button. It only happens when there is a single folder named after the series; in doubt (two possible folders, or a shared one such as `/media/series`) it is offered instead of decided for you. It can also apply to torrents added outside the bot, which are then really moved, since they are already in the manager.
-- **With "Folder for new series"** (right under it, unset by default), a series with no other episode of it in the manager goes to a folder named after it inside the one you pick: with `/ssd/SERIES`, the first episode of *The Bear* is downloaded into `/ssd/SERIES/The Bear` (or `Doctor Who (2005)` when the name carries a year), and the next ones find it as the series folder. It only applies when the torrent was going to stay in the default download folder or the automatic one; when there is any doubt about where the series is, or the manager does not answer while looking, you are asked as always. If you remove from the manager the torrents of a series you already have on disk, the bot cannot know it exists: the folder it creates takes the name it reads from the torrent (with the year, when there is one), so it is worth matching yours. If you pick the folder of one series (`/ssd/SERIES/Chicago Fire`) as the folder for new series, the bot warns you before saving it. It also warns when you pick the folder everything is downloaded to, and it offers (✨) the folders where you already keep your series. If the manager cannot create the new folder (Download Station needs File Station permission), the torrent is downloaded where it was going to go and the message says why. A torrent named like a series but with no video inside, such as a soundtrack, gets no folder.
+- **With "Episodes to their series folder"** (under automatic download, off by default), the bot looks in the manager for other episodes of the same series and, when there is no doubt, the torrent is added straight into the series folder instead of the automatic one, and the message carries an ↩️ Undo button. It only happens when there is a single folder named after the series; in doubt (two possible folders, or a shared one such as `/media/series`) it is offered instead of decided for you. It can also apply to torrents added outside the bot, which are then really moved, since they are already in the manager.
+- **With "Folder for new series"** (right under it, unset by default), a series with no episode in the manager goes to a folder named after it inside the one you pick: with `/ssd/SERIES`, the first episode of *The Bear* goes to `/ssd/SERIES/The Bear` (or `Doctor Who (2005)` when it carries a year), and the next ones find it there.
+  <!-- dockerhub:skip -->
+  - It only takes series out of the default download folder or the automatic one. When there is any doubt about where the series is, or the manager does not answer while looking, you are asked as always.
+  - A torrent named like a series but with no video inside, such as a soundtrack, gets no folder.
+  - If the manager cannot create the folder (Download Station needs File Station permission), the torrent is downloaded where it was going to go and the message says why.
+  - When picking it, the bot marks with ✨ the folders where you already keep your series, and warns if you pick the folder of one series or the folder everything is downloaded to.
+  - If you remove from the manager the torrents of a series you already have on disk, the bot cannot know it exists: the folder it creates takes the name it reads from the torrent, so it is worth matching yours.
+  <!-- /dockerhub:skip -->
 
+<!-- dockerhub:skip -->
 If you keep seasons in subfolders (`Mad Men/Season 01`), an episode of the next season is offered `Mad Men/Season 02` with the same format, even if that folder does not exist yet. The default download folder and the automatic download one are never offered unless they are named after the series. An auto managed qBittorrent torrent is left alone: its category decides the folder.
+<!-- /dockerhub:skip -->
 
 ## Automatic mover
 
