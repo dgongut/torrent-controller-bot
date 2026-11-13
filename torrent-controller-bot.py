@@ -9,6 +9,7 @@ import requests
 import socket
 import sys
 import telebot
+import functools
 import threading
 import time
 import uuid
@@ -30,7 +31,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -2645,6 +2646,108 @@ SERIES_SUGGESTIONS_MAX = 2  # Folders offered at most: more would only be noise
 SERIES_BLOCK_KEYS = ("SERIES_SUGGEST_ONE", "SERIES_SUGGEST_MANY", "SERIES_PLACED", "SERIES_PLACED_NEW", "SERIES_MOVING")
 
 
+# What makes a video an episode when the torrent name does not say it: an
+# S01E02 or 1x02 marker. 'T1', 'Cap.101' or 'Parte 1' alone are as often
+# the parts of a movie saga or a documentary
+_EPISODE_MARKER = re.compile(r"(?i)(?:^|[^a-z0-9])(?:s\d{1,2}\s*e\d{1,3}|\d{1,2}x\d{2,3})(?:[^a-z0-9]|$)")
+# Folders whose videos are extras of the torrent, never its episodes
+_EXTRAS_FOLDER = re.compile(r"(?i)(?:^|/)(?:extras?|bonus|featurettes?|specials?|behind the scenes|deleted scenes|trailers?|samples?)/")
+
+
+# Words a torrent name may carry after the show without being another show
+# ('Twin Peaks Complete 1080p'). Anything else ('World Beyond', 'Series
+# Pack') leaves the doubt, and a doubt keeps the torrent where it was
+_NAME_LEFTOVERS = {"complete", "completa", "completo", "integral", "uhd", "4k", "hdr", "x264", "x265", "h264", "h265",
+	"hevc", "bluray", "bdrip", "brrip", "webrip", "webdl", "web", "dl", "hdtv", "remux", "480p", "576p", "720p",
+	"1080p", "2160p"}
+# Tags a whole pack may carry in every file name ('S01E01 - Castellano.mkv'):
+# never the name of a show
+_TAG_TITLES = {"castellano", "espanol", "spanish", "latino", "vose", "vos", "vo", "dual", "english", "ingles", "multi",
+	"subs", "subtitulado", "subtitulos", "final", "capitulo", "episodio", "episode", "part", "parte", "pilot",
+	"proper", "repack"}
+
+
+def series_name(name, files=None):
+	"""The name that tells which series a torrent is: its own when it says
+	(Show.S01E02, Show - Temporada 1), otherwise one made from the videos
+	inside, when every one of them is an episode of the show the torrent is
+	named after: 'Twin Peaks' holding 1x01 - Twin Peaks.mkv... is that series,
+	seasons included ('Twin Peaks S01-S03'). Any doubt (a movie with extras, a
+	mixed pack, a tag for a title, no files known yet) keeps its name, and so
+	the torrent goes where it was going"""
+	name = name or ""
+	if series_identity(name) is not None or not files:
+		return name
+	try:
+		return _series_name_from_files(name, tuple(files))
+	except Exception as e:
+		# A file name the parser chokes on must not take the add down
+		warning(f"Cannot tell the series of {name} from its files: {e}")
+		return name
+
+
+@functools.lru_cache(maxsize=64)
+def _series_name_from_files(name, files):
+	"""series_name for a torrent whose name does not say it. Cached: a pack
+	of thousands of files is asked about more than once per add"""
+	videos = [file_basename(path) for path in files
+			if is_video_file(path) and not is_sample_file(path) and not _EXTRAS_FOLDER.search(path)]
+	# Every video an episode (S01E02 or 1x02, not of season 0, which is where
+	# the extras of a movie get numbered), at least two of them
+	identities = []
+	for video in videos:
+		identity = series_identity(video) if _EPISODE_MARKER.search(video) else None
+		if identity is None or not identity["season"]:
+			return name
+		identities.append(identity)
+	if len(identities) < 2 or len({identity["key"] for identity in identities}) != 1:
+		return name
+	key = identities[0]["key"]
+	# The torrent name has to be that show: what the videos say alone may be
+	# a tag every file carries, and a name that is the show and more may be
+	# another one ('The Walking Dead World Beyond')
+	if key in _TAG_TITLES:
+		return name
+	from_name = _as_show(name)
+	if not from_name or not _same_show(from_name["key"], key):
+		return name
+	title = from_name["title"] if from_name["key"] == key else identities[0]["title"]
+	years = {identity["year"] for identity in identities if identity["year"]} or ({from_name["year"]} if from_name["year"] else set())
+	if len(years) > 1:
+		return name
+	if years:
+		title = f"{title} ({years.pop()})"
+	seasons = sorted({identity["season"] for identity in identities})
+	if len(seasons) == 1:
+		return f"{title} S{seasons[0]:02d}"
+	return f"{title} S{seasons[0]:02d}-S{seasons[-1]:02d}"
+
+
+def _as_show(text):
+	"""What series_identity makes of text taken as the name of a show, or None"""
+	text = " ".join(re.sub(r"[._]+", " ", text or "").split())
+	return series_identity(f"{text} S01E01") if text else None
+
+
+def _same_show(found_key, key):
+	"""Whether a torrent name, as a show key, is the show of key: the same,
+	or the same followed only by words of _NAME_LEFTOVERS or a year ('twin
+	peaks complete 1080p' is Twin Peaks; 'the walking dead world beyond' is
+	not The Walking Dead)"""
+	if found_key == key:
+		return True
+	if not found_key.startswith(key + " "):
+		return False
+	rest = found_key[len(key) + 1:].split()
+	return all(word in _NAME_LEFTOVERS or re.fullmatch(r"(19|20)\d\d", word) for word in rest)
+
+
+def torrent_series_name(torrent):
+	"""series_name of a torrent in the manager, with the files it reports"""
+	files = [path for path, _size, _done in torrent.files] if torrent.files else None
+	return series_name(torrent.name, files)
+
+
 def series_candidates(name, exclude_id=None, current_dir=None):
 	"""Folders the series of name already lives in, best first, as (dir, named).
 	Empty when name is not a series, the manager has nothing of it, or they
@@ -2676,6 +2779,18 @@ def series_lookup(name, exclude_id=None, current_dir=None):
 		# series screens down with it: nothing is suggested instead
 		warning(f"Cannot work out the series folder of {name}: {e}")
 		return None
+
+
+def _series_root(name, directory):
+	"""The folder holding the folder of the series of name, when directory is
+	that series folder (or a season folder inside it). None otherwise"""
+	directory = _dir_key(directory)
+	if not _named_after(name, directory):
+		return None
+	parent = _parent_dir(directory)
+	if parent and _named_after(name, parent):
+		parent = _parent_dir(parent)
+	return parent or None
 
 
 def generic_dirs(strict=False):
@@ -2787,16 +2902,20 @@ NEW_SERIES_MEMORY = 600  # Seconds a new series folder counts as given out
 
 
 def claim_new_series_folder(target):
-	"""True the first time target is given out as the folder of a new series,
-	False when it already was a moment ago"""
+	"""(folder, new): target and True the first time it is given out as the
+	folder of a new series; the folder given out a moment ago and False when
+	it already was, written as it was then (Friends, not friends)"""
 	now = time.time()
 	with _new_series_lock:
 		for folder in [f for f, ts in _new_series_given.items() if now - ts > NEW_SERIES_MEMORY]:
 			del _new_series_given[folder]
-		if target in _new_series_given:
-			return False
+		# Friends and friends are one folder: two episodes of it sent at once
+		# must not get one each
+		for given in _new_series_given:
+			if _dir_key(given).lstrip("/").casefold() == _dir_key(target).lstrip("/").casefold():
+				return given, False
 		_new_series_given[target] = now
-		return True
+		return target, True
 
 
 def release_new_series_folder(folder):
@@ -2844,15 +2963,73 @@ def series_target(name, exclude_id=None, current_dir=None, files=None):
 		return None, None
 	if current and not any(same_dir(current, d) for d in generic):
 		return None, False
-	return target, claim_new_series_folder(target)
+	taken = new_series_folder_taken(name, exclude_id)
+	if taken is None:
+		return None, None
+	if len(taken) > 1:
+		# Two packs it may be part of: asked, never guessed
+		return None, False
+	if taken:
+		# A pack of it is there already, named so that it was not found as
+		# the series: the episode joins it, not new
+		return taken[0], False
+	return claim_new_series_folder(target)
 
 
-def series_auto_target(pending, current_dir=None):
+def new_series_folder_taken(name, exclude_id=None):
+	"""The folder inside the folder for new series that already holds this
+	series, or None. A pack named just 'Twin Peaks' says nothing by its name,
+	and a listing of the manager carries no files, so it is not found as the
+	series it is: its folder is looked for by name ('Twin Peaks (1990)' for a
+	Twin Peaks episode, any case), and only counts when the files of a
+	torrent in it say it is that series. A movie named like the show in there
+	is not it.
+	Returns a list of the folders found: more than one is a doubt (the show
+	of 1978 and the one of 2004, for an episode without a year). None when
+	the manager could not be read"""
+	base = (bot_settings.get("new_series_dir") or "").strip()
+	identity = series_identity(name)
+	if not base or identity is None:
+		return []
+	try:
+		torrents = client.get_torrents()
+	except TorrentClientError:
+		return None
+	found = []
+	for torrent in torrents:
+		if str(torrent.id) == str(exclude_id) or not torrent.download_dir:
+			continue
+		folder = _dir_key(torrent.download_dir)
+		if not same_dir(_parent_dir(folder), base):
+			# A season folder inside the folder of the series
+			folder = _parent_dir(folder)
+			if not folder or not same_dir(_parent_dir(folder), base):
+				continue
+		if any(same_dir(folder, known) for known in found) or not _named_after(name, folder):
+			continue
+		try:
+			full = client.get_torrent(torrent.id)
+		except TorrentClientError:
+			return None
+		if full is not None and not full.files:
+			# The manager did not tell its files: not knowing decides nothing
+			return None
+		other = series_identity(torrent_series_name(full)) if full else None
+		if other is not None and other["key"] == identity["key"] and not (
+				identity["year"] and other["year"] and identity["year"] != other["year"]):
+			found.append(folder)
+	return found
+
+
+def series_auto_target(pending, current_dir=None, name=None):
 	"""Where a torrent about to be added goes without asking, as (folder,
-	new), see series_target: only with the automatic move on"""
+	new), see series_target: only with the automatic move on. name is its
+	pending_series_name, when already worked out"""
 	if not auto_move_series_enabled():
 		return None, False
-	return series_target(pending_series_name(pending), current_dir=current_dir, files=torrent_data_files(pending.get("data")))
+	if name is None:
+		name = pending_series_name(pending)
+	return series_target(name, current_dir=current_dir, files=torrent_data_files(pending.get("data")))
 
 
 def series_suggestion(torrent, current_dir):
@@ -2862,10 +3039,11 @@ def series_suggestion(torrent, current_dir):
 	its category, and moving it by hand would drop it out of that"""
 	if torrent.auto_managed:
 		return None, None
-	identity = series_identity(torrent.name)
+	name = torrent_series_name(torrent)
+	identity = series_identity(name)
 	if identity is None:
 		return None, None
-	dirs = series_dirs(torrent.name, exclude_id=torrent.id, current_dir=current_dir)
+	dirs = series_dirs(name, exclude_id=torrent.id, current_dir=current_dir)
 	if not dirs:
 		return None, None
 	title = html.escape(identity["title"])
@@ -3031,13 +3209,9 @@ def series_parent_dirs():
 		return []
 	counts = {}
 	for torrent in torrents:
-		directory = _dir_key(torrent.download_dir)
-		if not directory or series_identity(torrent.name) is None or not _named_after(torrent.name, directory):
+		if not torrent.download_dir or series_identity(torrent.name) is None:
 			continue
-		parent = _parent_dir(directory)
-		# A season folder: the series folder is the one above it
-		if parent and _named_after(torrent.name, parent):
-			parent = _parent_dir(parent)
+		parent = _series_root(torrent.name, torrent.download_dir)
 		if parent:
 			counts[parent] = counts.get(parent, 0) + 1
 	return sorted(counts, key=lambda d: (-counts[d], d))[:SERIES_SUGGESTIONS_MAX]
@@ -4260,8 +4434,10 @@ def render_templates_menu(chat_id, message_id):
 
 def pending_series_name(pending):
 	"""The name that tells which series a pending torrent belongs to: the one
-	inside a .torrent file, since the file itself is often just a number"""
-	return torrent_data_name(pending.get("data")) or pending.get("name") or ""
+	inside a .torrent file, since the file itself is often just a number, or
+	the one its videos tell (see series_name)"""
+	data = pending.get("data")
+	return series_name(torrent_data_name(data) or pending.get("name") or "", torrent_data_files(data))
 
 
 def ask_download_dir(chat_id, pending_id, name, thread_id=None, message_id=None, dir_page=0):
@@ -4728,13 +4904,15 @@ def add_context(pending, download_dir, chat_id=None, thread_id=None, category=No
 	series_new = False
 	series_unknown = False
 	if automatic and not category:
-		series_dir, series_new = series_auto_target(pending, current_dir=download_dir)
+		# Worked out once: a pack of thousands of files takes its time
+		name = pending_series_name(pending)
+		series_dir, series_new = series_auto_target(pending, current_dir=download_dir, name=name)
 		# None: the manager did not tell where the series is. An add retried
 		# later works it out again then, instead of going without it
 		series_unknown = series_new is None
 		series_new = bool(series_new)
 		if series_dir:
-			series_title = series_identity(pending_series_name(pending))["title"]
+			series_title = series_identity(name)["title"]
 			previous_dir = download_dir
 			download_dir = series_dir
 	return {"chat_id": chat_id, "thread_id": thread_id, "download_dir": download_dir, "category": category,
@@ -6704,7 +6882,8 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				edit_message(chat_id, message_id, get_text("TORRENT_NOT_FOUND"), back_close_markup(build_call("list", filter_key, page)))
 			else:
 				nav_ctx = new_nav_context(torrent_id, filter_key, page)
-				suggested = series_dirs(torrent.name, exclude_id=torrent.id, current_dir=torrent.download_dir)
+				series = torrent_series_name(torrent)
+				suggested = series_dirs(series, exclude_id=torrent.id, current_dir=torrent.download_dir)
 				markup = build_dir_markup(
 					dir_call=lambda dir_id: build_call("moveToDir", nav_ctx, dir_id),
 					write_call=build_call("moveNewDir", nav_ctx),
@@ -6714,7 +6893,7 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 					suggested=suggested,
 				)
 				text = get_text("MOVE_ASK_DIR", html.escape(torrent.name))
-				hint = series_hint(torrent.name, suggested)
+				hint = series_hint(series, suggested)
 				if hint:
 					text = f"{text}\n\n{hint}"
 				edit_message(chat_id, message_id, text, markup)
@@ -7363,7 +7542,7 @@ def external_series_target(torrent):
 	if not (auto_move_series_enabled(external=True) and current_dir):
 		return None, False
 	files = [path for path, _size, _done in torrent.files] if torrent.files else None
-	return series_target(torrent.name, exclude_id=torrent.id, current_dir=current_dir, files=files)
+	return series_target(torrent_series_name(torrent), exclude_id=torrent.id, current_dir=current_dir, files=files)
 
 
 def move_external_to_series(torrent, text, target, new=False):
@@ -7378,7 +7557,7 @@ def move_external_to_series(torrent, text, target, new=False):
 	chat_id = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
 	progress_text = f"{text}\n\n{get_text('SERIES_MOVING', html.escape(target))}"
 	sent = notify(progress_text)
-	placed_block, placed_markup = series_placed(torrent.id, series_identity(torrent.name)["title"], torrent.download_dir or "", new)
+	placed_block, placed_markup = series_placed(torrent.id, series_identity(torrent_series_name(torrent))["title"], torrent.download_dir or "", new)
 	deliver_move_order(chat_id, [torrent.id], target, progress_text, f"{with_dir_line(text, target)}\n\n{placed_block}",
 					message_id=sent.message_id if sent else None, thread_id=TELEGRAM_THREAD, reply_markup=placed_markup,
 					wrap=lambda failure: f"{text}\n\n{failure}", failure_markup=None)

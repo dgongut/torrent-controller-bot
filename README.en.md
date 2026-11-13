@@ -161,6 +161,7 @@ Two names are the same series when their titles match ignoring case, accents and
   <!-- dockerhub:skip -->
   - It only takes series out of the default download folder or the automatic one. When there is any doubt about where the series is, or the manager does not answer while looking, you are asked as always.
   - A torrent named like a series but with no video inside, such as a soundtrack, gets no folder.
+  - A torrent named just after the show (`Twin Peaks`) counts as that series when every video in it is one of its episodes (`1x01 - Twin Peaks.mkv`). Any doubt (a movie inside, extras numbered as episodes, another name) keeps it where it was going.
   - If the manager cannot create the folder (Download Station needs File Station permission), the torrent is downloaded where it was going to go and the message says why.
   - When picking it, the bot marks with ✨ the folders where you already keep your series, and warns if you pick the folder of one series or the folder everything is downloaded to.
   - If you remove from the manager the torrents of a series you already have on disk, the bot cannot know it exists: the folder it creates takes the name it reads from the torrent, so it is worth matching yours.

@@ -13,6 +13,7 @@ loads the bot against a mutable fake torrent client and drives the screens,
 the automatic add, the buttons under the add message and the monitor."""
 
 import copy
+import dataclasses
 import importlib.util
 import itertools
 import os
@@ -357,7 +358,9 @@ class FakeClient:
 		self.calls.append(("get_torrents",))
 		if self.fail_list:
 			raise self.fail_list
-		return [copy.copy(t) for t in self.torrents.values()]
+		# Like every real manager: a listing carries no file list, only
+		# get_torrent of one torrent does
+		return [dataclasses.replace(t, files=[]) for t in self.torrents.values()]
 
 	def get_torrent(self, torrent_id):
 		torrent = self.torrents.get(torrent_id)
@@ -1263,6 +1266,202 @@ fresh(notify_external_added=True, auto_download=True, auto_move_series=True, aut
 	new_series_dir="/ssd/SERIES", auto_download_dir="/ssd/PELICULAS")
 external("Need.for.Speed.S01.Soundtrack", directory="/ssd/PELICULAS")
 check("nor an external one whose files are known to have no video", [c for c in CLIENT.calls if c[0] == "move"], [])
+
+# A torrent whose name says nothing ('Twin Peaks') is the series its videos are
+def with_files(name, directory, *paths):
+	torrent = CLIENT.put(name, directory)
+	CLIENT.torrents[torrent.id].files = [(path, 1000, True) for path in paths]
+	return CLIENT.get_torrent(torrent.id)
+
+
+TWIN = [f"S0{season}/{season}x0{episode} - Twin Peaks [x265].mkv" for season in (1, 2, 3) for episode in (1, 2)] + ["S01/info.nfo"]
+check("a pack named just after the show is told by its videos", bot.series_name("Twin Peaks", TWIN), "Twin Peaks S01-S03")
+check("one season of it", bot.series_name("Twin Peaks", TWIN[:2]), "Twin Peaks S01")
+check("episodes named only by number say no series: the torrent name may be anything",
+	bot.series_name("Twin Peaks", ["S01/S01E01.mkv", "S01/S01E02.mkv"]), "Twin Peaks")
+for generic in ("Coleccion", "Complete Series 1080p", "[DonTorrent] Serie", "Temporada 1"):
+	check(f"so a generic pack name ({generic}) never becomes a series", bot.series_name(generic, ["Season 1/S01E01.mkv", "Season 1/S01E02.mkv"]), generic)
+check("the casing of the torrent name wins when it is the show", bot.series_name("Friends", ["friends.s01e01.mkv", "friends.s01e02.mkv"]), "Friends S01")
+check("a name that is something else does not confirm the videos", bot.series_name("Pack 1080p", ["friends.s01e01.mkv", "friends.s01e02.mkv"]), "Pack 1080p")
+check("nor does a folder inside it: in doubt it stays", bot.series_name("Pack 1080p", ["Friends/friends.s01e01.mkv", "Friends/friends.s01e02.mkv"]), "Pack 1080p")
+check("a spin-off named the show and more is not the show", bot.series_name("The Walking Dead World Beyond",
+	["The.Walking.Dead.S01E01.mkv", "The.Walking.Dead.S01E02.mkv"]), "The Walking Dead World Beyond")
+check("a tag is never a show, even as the torrent name", bot.series_name("Castellano", ["S01E01 - Castellano.mkv", "S01E02 - Castellano.mkv"]), "Castellano")
+check("nor the show and more", bot.series_name("Castellano Series Pack", ["S01E01 - Castellano.mkv", "S01E02 - Castellano.mkv"]), "Castellano Series Pack")
+check("extras numbered in season 0 are no episodes", bot.series_name("Avatar (2009) Extended",
+	["Avatar.2009.Extended.mkv", "Avatar.2009.S00E01.Featurette.mkv", "Avatar.2009.S00E02.Featurette.mkv"]), "Avatar (2009) Extended")
+check("a movie next to episodes is a doubt", bot.series_name("Gladiator", ["Gladiator.mkv", "Gladiator 1x01 Making Of.mkv", "Gladiator 1x02 Making Of.mkv"]), "Gladiator")
+check("so is the movie of the show in its pack", bot.series_name("Twin Peaks", TWIN + ["Twin Peaks Fire Walk With Me (1992).mkv"]), "Twin Peaks")
+_real_identity = bot.series_identity
+bot._series_name_from_files.cache_clear()
+bot.series_identity = lambda text: (_ for _ in ()).throw(ValueError("parser")) if text.endswith(".mkv") else _real_identity(text)
+check("a file name the parser chokes on keeps the name", bot.series_name("Twin Peaks", ["1x01 - Twin Peaks.mkv", "1x02 - Twin Peaks.mkv"]), "Twin Peaks")
+bot.series_identity = _real_identity
+bot._series_name_from_files.cache_clear()
+check("and so does a name that is the show and more", bot.series_name("Twin Peaks Complete 1080p", TWIN), "Twin Peaks S01-S03")
+for tag in ("Castellano", "Spanish 1080p", "VOSE", "Dual"):
+	check(f"a tag every file carries ({tag}) is no show", bot.series_name("La Casa de Papel", [f"S01E01 - {tag}.mkv", f"S01E02 - {tag}.mkv"]), "La Casa de Papel")
+check("a sample is known by its folder too", bot.series_name("Twin Peaks", ["Samples/clip.mkv", "1x01 - Twin Peaks.mkv", "1x02 - Twin Peaks.mkv"]), "Twin Peaks S01")
+check("samples do not count", bot.series_name("Twin Peaks", ["Twin.Peaks.Sample.mkv", "1x01 - Twin Peaks.mkv", "1x02 - Twin Peaks.mkv"]), "Twin Peaks S01")
+check("one episode alone is not enough: it may be read wrong", bot.series_name("The Office", ["S01E01 - Pilot.mkv"]), "The Office")
+check("a featurette or the movie of the show in a big pack does not stop it",
+	bot.series_name("Twin Peaks", TWIN + ["Extras/Making of Twin Peaks.mkv"]), "Twin Peaks S01-S03")
+check("but many videos that are not episodes do", bot.series_name("Mixed", ["1x01 - Lost.mkv", "1x02 - Lost.mkv", "Movie A.mkv", "Movie B.mkv"]), "Mixed")
+check("the year of the videos wins over the one in the torrent name",
+	bot.series_name("Twin Peaks (1990)", ["Twin.Peaks.2017.S03E01.mkv", "Twin.Peaks.2017.S03E02.mkv"]), "Twin Peaks (2017) S03")
+check("the year of the videos is kept", bot.series_name("Doctor Who", ["Doctor.Who.2005.S01E01.mkv", "Doctor.Who.2005.S01E02.mkv"]), "Doctor Who (2005) S01")
+check("a movie collection keeps its name", bot.series_name("Alien Collection", ["Alien (1979).mkv", "Aliens (1986).mkv"]), "Alien Collection")
+check("a movie with extras too", bot.series_name("Some Movie 2024", ["Some.Movie.2024.mkv", "Extras/Making of.mkv"]), "Some Movie 2024")
+check("and a pack of two shows", bot.series_name("Mixed", ["1x01 - Lost.mkv", "1x01 - Fringe.mkv"]), "Mixed")
+check("without files known it keeps its name", bot.series_name("Twin Peaks", None), "Twin Peaks")
+check("a name that already says it is kept as it is", bot.series_name("Chicago.Fire.S14E01", ["x.mkv"]), "Chicago.Fire.S14E01")
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+twin = torrent_file("Twin Peaks", TWIN)
+CLIENT.added = "Twin Peaks"
+CLIENT.calls.clear()
+bot.start_add_flow(1, "twin.torrent", data=twin)
+check("a 'Twin Peaks' pack is a new series", [c for c in CLIENT.calls if c[0] == "add_torrent"], [("add_torrent", "/ssd/SERIES/Twin Peaks", None)])
+check("told by its title", last()[1].endswith(bot.get_text("SERIES_PLACED_NEW", "Twin Peaks")), True)
+movies = torrent_file("Alien Collection", ["Alien (1979).mkv", "Aliens (1986).mkv"])
+CLIENT.added = "Alien Collection"
+CLIENT.calls.clear()
+bot.start_add_flow(1, "alien.torrent", data=movies)
+check("a movie collection is left alone", [c for c in CLIENT.calls if c[0] == "add_torrent"], [("add_torrent", "/ssd/PELICULAS", None)])
+
+# The next episode of a pack named just after the show: a listing of the
+# manager carries no files, so the pack is not recognised there, but it sits
+# in the folder a new series gets, which the episode goes to and joins
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("Twin Peaks", "/ssd/SERIES/Twin Peaks", *TWIN)
+check("the next episode of a pack goes to the folder the pack got", add_auto("Twin.Peaks.S03E18.1080p"), [("add_torrent", "/ssd/SERIES/Twin Peaks", None)])
+check("told as joining it, not as a new series", last()[1].endswith(bot.get_text("SERIES_PLACED", "Twin Peaks")), True)
+CLIENT.calls.clear()
+CLIENT.added = "Twin Peaks Missing Pieces"
+bot.start_add_flow(1, "twin2.torrent", data=torrent_file("Twin Peaks Missing Pieces", ["S03/3x17 - Twin Peaks.mkv", "S03/3x18 - Twin Peaks.mkv"]))
+check("a pack named the show and more words is a doubt: it stays", [c for c in CLIENT.calls if c[0] == "add_torrent"], [("add_torrent", "/ssd/PELICULAS", None)])
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("Twin Peaks", "/ssd/SERIES/Twin Peaks/Season 03", *TWIN)
+check("also with the pack in a season folder of it", bot.series_target("Twin.Peaks.S03E18", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/Twin Peaks", False))
+
+fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=True,
+	new_series_dir="/ssd/SERIES", auto_download_dir="/ssd/PELICULAS")
+states = bot.poll_torrents(None)
+torrent = with_files("Twin Peaks", "/ssd/PELICULAS", *TWIN)
+bot.poll_torrents(states)
+check("an external 'Twin Peaks' pack is moved to its new folder", [c for c in CLIENT.calls if c[0] == "move"],
+	[("move", [torrent.id], "/ssd/SERIES/Twin Peaks")])
+check("told by its title", last()[1].endswith(bot.get_text("SERIES_PLACED_NEW", "Twin Peaks")), True)
+
+# Folders are never matched by their name alone outside the series found:
+# a game, a movie or a pack kept elsewhere is no series folder
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/downloads", new_series_dir="/media/SERIES")
+CLIENT.put("Chicago.Fire.S14E01", "/media/Chicago Fire")
+CLIENT.put("Fallout.4.GOTY", "/media/JUEGOS/Fallout")
+CLIENT.put("Fargo.1996.1080p", "/media/PELICULAS/Fargo (1996)")
+CLIENT.put("Some.Album.FLAC", "/downloads/Fargo (1996)")
+check("a game folder named like a show is no series folder", add_auto("Fallout.S01E01.1080p"), [("add_torrent", "/media/SERIES/Fallout", None)])
+check("nor a movie folder, wherever it is", add_auto("Fargo.S05E01.1080p"), [("add_torrent", "/media/SERIES/Fargo", None)])
+CLIENT.put("Fallout.S01E01.1080p", "/media/SERIES/Fallout")
+check("and they do not get in the way of the real one", add_auto("Fallout.S01E02.1080p"), [("add_torrent", "/media/SERIES/Fallout", None)])
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/downloads", new_series_dir="video")
+CLIENT.put("Chicago.Fire.S14E01", "video/Chicago Fire")
+CLIENT.put("Fargo.1996.1080p", "video/Fargo (1996)")
+check("a movie next to the series is not taken for one", add_auto("Fargo.S05E01.1080p"), [("add_torrent", "video/Fargo", None)])
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/downloads", new_series_dir="/ssd/SERIES")
+CLIENT.put("Chicago.Fire.S14E01", "/media/SERIES/Chicago Fire")
+CLIENT.put("Chicago Fire Soundtrack", "/media/SERIES/Chicago Fire (2012)")
+check("a torrent whose name already says the series moves as before", add_auto("Chicago.Fire.S14E04.1080p"), [("add_torrent", "/media/SERIES/Chicago Fire", None)])
+
+# Years and cases
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.put("Battlestar.Galactica.1978.S01E01", "/ssd/SERIES/Battlestar Galactica (1978)")
+bsg = torrent_file("Battlestar Galactica (2004)", ["1x01 - Battlestar Galactica.mkv", "1x02 - Battlestar Galactica.mkv"])
+check("the year of the torrent name is kept when the videos have none", bot.series_name("Battlestar Galactica (2004)",
+	["1x01 - Battlestar Galactica.mkv", "1x02 - Battlestar Galactica.mkv"]), "Battlestar Galactica (2004) S01")
+CLIENT.added = "Battlestar Galactica (2004)"
+CLIENT.calls.clear()
+bot.start_add_flow(1, "bsg.torrent", data=bsg)
+check("so the show of 2004 does not go into the one of 1978", [c for c in CLIENT.calls if c[0] == "add_torrent"],
+	[("add_torrent", "/ssd/SERIES/Battlestar Galactica (2004)", None)])
+check("a pack with its special is still the show", bot.series_name("Sherlock S04", ["Sherlock.S04E01.mkv", "Sherlock.S04E02.mkv", "Sherlock.The.Abominable.Bride.mkv"]),
+	"Sherlock S04")
+check("folders told apart only by case are not the same one", bot.same_dir("/media/series/X", "/media/SERIES/X"), False)
+
+# Movie sagas and documentaries numbered like seasons are no series
+for pack, files in (("Saga Crepusculo", ["Saga Crepusculo T1.mkv", "Saga Crepusculo T2.mkv", "Saga Crepusculo T3.mkv"]),
+		("Saga El Senor de los Anillos", ["El Senor de los Anillos T1 La Comunidad del Anillo.mkv", "El Senor de los Anillos T2 Las Dos Torres.mkv"]),
+		("Documental 1080p", ["Documental.Cap.101.mkv", "Documental.Cap.102.mkv"]),
+		("Movie with bonus", ["Movie.2019.mkv", "Bonus/S1E1 Bonus.mkv", "Bonus/S1E2 Bonus.mkv"])):
+	check(f"{pack} is no series", bot.series_name(pack, files), pack)
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.added = "Saga Crepusculo"
+CLIENT.calls.clear()
+bot.start_add_flow(1, "saga.torrent", data=torrent_file("Saga Crepusculo", ["Saga Crepusculo T1.mkv", "Saga Crepusculo T2.mkv"]))
+check("so a saga stays with the movies", [c for c in CLIENT.calls if c[0] == "add_torrent"], [("add_torrent", "/ssd/PELICULAS", None)])
+check("a series pack with Extras is still the show", bot.series_name("Twin Peaks", TWIN + ["Extras/Making of.mkv", "Extras/Interview.mkv", "Extras/Trailer.mkv"]), "Twin Peaks S01-S03")
+
+# The pack in the folder for new series is joined even when its folder has a
+# year or another case; a movie named like the show in there is not it
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("Twin Peaks (1990)", "/ssd/SERIES/Twin Peaks (1990)", *TWIN)
+check("an episode joins the pack whose folder has the year", add_auto("Twin.Peaks.S03E18.1080p"), [("add_torrent", "/ssd/SERIES/Twin Peaks (1990)", None)])
+check("told as joining it", last()[1].endswith(bot.get_text("SERIES_PLACED", "Twin Peaks")), True)
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("friends", "/ssd/SERIES/friends", "friends.s01e01.mkv", "friends.s01e02.mkv")
+check("and the pack whose folder is in another case", add_auto("Friends.S01E03.1080p"), [("add_torrent", "/ssd/SERIES/friends", None)])
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("Fargo.1996.1080p", "/ssd/SERIES/Fargo", "Fargo.1996.1080p.mkv")
+check("a movie named like the show in there does not make it joined", add_auto("Fargo.S05E01.1080p"), [("add_torrent", "/ssd/SERIES/Fargo", None)])
+check("it is told as the new series it is", last()[1].endswith(bot.get_text("SERIES_PLACED_NEW", "Fargo")), True)
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("Twin Peaks", "/archivo/Twin Peaks", *TWIN)
+check("a pack outside the folder for new series is not looked for", add_auto("Twin.Peaks.S03E18.1080p"), [("add_torrent", "/ssd/SERIES/Twin Peaks", None)])
+
+# Tagged packs of different shows never end up together
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+for show in ("La Casa de Papel", "Elite", "Vis a Vis"):
+	CLIENT.added = show
+	CLIENT.calls.clear()
+	bot.start_add_flow(1, "pack.torrent", data=torrent_file(show, ["S01E01 - Castellano.mkv", "S01E02 - Castellano.mkv"]))
+	check(f"{show}, tagged Castellano, stays where it was going", [c for c in CLIENT.calls if c[0] == "add_torrent"], [("add_torrent", "/ssd/PELICULAS", None)])
+
+# Two packs of a title of two years: an episode without a year is asked
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("Battlestar Galactica (1978)", "/ssd/SERIES/Battlestar Galactica (1978)", "1x01 - Battlestar Galactica.mkv", "1x02 - Battlestar Galactica.mkv")
+with_files("Battlestar Galactica (2004)", "/ssd/SERIES/Battlestar Galactica (2004)", "1x01 - Battlestar Galactica.mkv", "1x02 - Battlestar Galactica.mkv")
+check("an episode that may be of either is not guessed", add_auto("Battlestar.Galactica.S02E05.1080p"), [("add_torrent", "/ssd/PELICULAS", None)])
+check("one with its year joins its own", add_auto("Battlestar.Galactica.2004.S02E05.1080p"), [("add_torrent", "/ssd/SERIES/Battlestar Galactica (2004)", None)])
+
+# Not knowing never makes it new, in the pack lookup either
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+with_files("Twin Peaks", "/ssd/SERIES/Twin Peaks", *TWIN)
+_real_get_torrent = CLIENT.get_torrent
+CLIENT.get_torrent = lambda torrent_id: (_ for _ in ()).throw(TorrentClientError("timed out"))
+check("a manager that does not answer while looking at a pack: nothing is decided", bot.series_target("Twin.Peaks.S03E18", current_dir="/ssd/PELICULAS"), (None, None))
+CLIENT.get_torrent = _real_get_torrent
+_real_get_torrent = CLIENT.get_torrent
+CLIENT.get_torrent = lambda torrent_id: dataclasses.replace(_real_get_torrent(torrent_id), files=[])
+check("nor when it does not tell the files of the pack", bot.series_target("Twin.Peaks.S03E18", current_dir="/ssd/PELICULAS"), (None, None))
+CLIENT.get_torrent = _real_get_torrent
+
+# A pack of thousands of files is read once per add
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+_real_files = bot.torrent_data_files
+_reads = []
+bot.torrent_data_files = lambda data: _reads.append(1) or _real_files(data)
+CLIENT.added = "Twin Peaks"
+bot.start_add_flow(1, "twin.torrent", data=torrent_file("Twin Peaks", TWIN))
+bot.torrent_data_files = _real_files
+check("the files of a .torrent are read at most twice per add (name and placement)", len(_reads) <= 2, True)
+
+# Friends and friends are one series and one folder
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+check("the first of two at once names the folder", bot.series_target("1x01 - Friends.mkv", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/Friends", True))
+check("the second, written in lower case, goes to that same folder", bot.series_target("1x02 - friends.mkv", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/Friends", False))
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.put("1x01 - Friends.mkv", "/ssd/SERIES/Friends")
+check("one in lower case finds the folder of the one in the manager", add_auto("1x02 - friends.mkv"), [("add_torrent", "/ssd/SERIES/Friends", None)])
 
 fresh(auto_download=True, auto_move_series=False, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
 check("with the automatic move off the folder does nothing", add_auto("The.Bear.S03E01.1080p"), [("add_torrent", "/ssd/PELICULAS", None)])

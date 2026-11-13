@@ -172,6 +172,7 @@ Para decidir que son la misma serie compara el título sin tener en cuenta mayú
   <!-- dockerhub:skip -->
   - Solo saca series de la carpeta de descargas por defecto o de la automática. Si hay dudas sobre dónde está la serie, o el gestor no responde al buscarla, se pregunta como siempre.
   - Un torrent con nombre de serie pero sin vídeo dentro, como una banda sonora, no crea carpeta.
+  - Un torrent que se llama solo como la serie (`Twin Peaks`) cuenta como serie si todos sus vídeos son episodios suyos (`1x01 - Twin Peaks.mkv`). Ante cualquier duda (una película dentro, extras numerados como episodios, otro nombre) se queda donde iba a ir.
   - Si el gestor no puede crear la carpeta (en Download Station hace falta permiso de File Station), el torrent se descarga donde iba a ir y el mensaje lo explica.
   - Al elegirla, el bot marca con ✨ las carpetas donde ya tienes tus series, y avisa si eliges la de una serie concreta o la carpeta donde se descarga todo.
   - Si borras del gestor los torrents de una serie que ya tienes en disco, el bot no puede saber que existe: la carpeta que crea lleva el nombre que saca del torrent, así que conviene que coincida con el de la tuya.
