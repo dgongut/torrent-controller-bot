@@ -1,29 +1,14 @@
 name: Docker Hub description
 
-# Publishes README.md, adapted by .github/scripts/dockerhub_readme.py, as the
-# description of the image on Docker Hub.
+# Publishes README.md as the Docker Hub description. The logic lives in
+# https://github.com/dgongut/.github
 on:
   push:
     branches: [main]
-    paths:
-      - README.md
-      - .github/scripts/dockerhub_readme.py
-      - .github/workflows/dockerhub-description.yml
+    paths: [README.md, .github/workflows/dockerhub-description.yml]
   workflow_dispatch:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Build Docker Hub description
-        run: python3 .github/scripts/dockerhub_readme.py README.md DOCKERHUB.md
-
-      - uses: peter-evans/dockerhub-description@v5
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: dgongut/torrent-controller-bot
-          readme-filepath: ./DOCKERHUB.md
-          enable-url-completion: true
+    uses: dgongut/.github/.github/workflows/dockerhub-description.yml@main
+    secrets: inherit
