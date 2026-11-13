@@ -449,10 +449,11 @@ bot.notify = lambda text, chat_id=None, thread_id=None, reply_markup=None: NOTIF
 
 def fresh(**settings):
 	CLIENT.reset()
+	bot._new_series_given.clear()
 	SCREENS.clear()
 	NOTIFIED.clear()
 	defaults = {"auto_download": False, "auto_download_dir": "", "auto_category": "", "auto_rename": False,
-				"auto_move_series": False, "auto_move_series_external": False, "notify_external_added": False,
+				"auto_move_series": False, "auto_move_series_external": False, "new_series_dir": "", "notify_external_added": False,
 				"favorite_dirs": [], "low_space_warning": True, "notify_completed": False}
 	defaults.update(settings)
 	for name, value in defaults.items():
@@ -1018,6 +1019,398 @@ chicago()
 torrent = external("Chicago.Fire.S14E04.1080p", directory="/media/SERIES/Chicago Fire")
 check("an external torrent already in place is left alone", [c for c in CLIENT.calls if c[0] == "move"], [])
 check("and told as always", (len(NOTIFIED), "💡" in NOTIFIED[0][0], NOTIFIED[0][1]), (1, False, None))
+
+# --- A series nobody has yet, with a folder for new series -------------------
+def add_auto(name):
+	CLIENT.calls.clear()
+	CLIENT.added = name
+	bot.start_add_flow(1, name, magnet="m")
+	return [c for c in CLIENT.calls if c[0] in ("add_torrent", "move")]
+
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS")
+chicago()
+check("without a folder for new series, a new series stays in the automatic folder",
+	add_auto("The.Bear.S03E01.1080p"), [("add_torrent", "/ssd/PELICULAS", None)])
+check("with nothing about a series folder", ("✨" in last()[1], last()[2]), (False, None))
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES/")
+chicago()
+check("with one, a new series goes to a folder named after it in there",
+	add_auto("The.Bear.S03E01.1080p.WEB"), [("add_torrent", "/ssd/SERIES/The Bear", None)])
+kind, text, markup = last()
+check("the add message tells that folder", "📂 <code>/ssd/SERIES/The Bear</code>" in text, True)
+check("and that it is a new series", text.endswith(bot.get_text("SERIES_PLACED_NEW", "The Bear")), True)
+bear_id = [t for t in CLIENT.torrents.values() if t.name == CLIENT.added][0].id
+check("with undo back to the automatic folder, and OK", buttons(markup), [
+	(bot.get_text("BUTTON_SERIES_UNDO"), bot.build_call("serUndo", bear_id, bot.get_dir_id("/ssd/PELICULAS"))),
+	(bot.get_text("BUTTON_SERIES_KEEP"), bot.build_call("serKeep"))])
+press(buttons(markup)[0][1], message_html=roundtrip(text))
+check("Undo sends it where it was going", [c for c in CLIENT.calls if c[0] == "move"], [("move", [bear_id], "/ssd/PELICULAS")])
+check("and drops the new series line", bot.get_text("SERIES_PLACED_NEW", "The Bear") in last()[1], False)
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.put("The.Bear.S03E01.1080p.WEB", "/ssd/SERIES/The Bear")
+check("the next episode finds that folder as the folder of its series",
+	add_auto("The.Bear.S03E02.1080p.WEB"), [("add_torrent", "/ssd/SERIES/The Bear", None)])
+check("told as usual, not as new", last()[1].endswith(bot.get_text("SERIES_PLACED", "The Bear")), True)
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+chicago()
+check("a series that has a folder still goes to it",
+	add_auto("Chicago.Fire.S14E04.1080p"), [("add_torrent", "/media/SERIES/Chicago Fire", None)])
+check("a movie is untouched", add_auto("Some.Other.Movie.2025.1080p"), [("add_torrent", "/ssd/PELICULAS", None)])
+check("and so is El Camino", add_auto("El.Camino.A.Breaking.Bad.Movie.2019.1080p"), [("add_torrent", "/ssd/PELICULAS", None)])
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.put("Doctor.Who.1963.S01E01", "/tv/Doctor Who (1963)")
+CLIENT.put("Doctor.Who.2005.S01E01", "/tv/Doctor Who (2005)")
+check("a doubt is still asked, never taken for a new series",
+	add_auto("Doctor.Who.S02E01"), [("add_torrent", "/ssd/PELICULAS", None)])
+check("offering both", len([b for b in button_texts(last()[2]) if b.startswith("📦")]), 2)
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.put("Chicago.Fire.S13E01", "/data/series")
+check("a series with episodes in a folder not named after it is not new either: only offered",
+	add_auto("Chicago.Fire.S14E04"), [("add_torrent", "/ssd/PELICULAS", None)])
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.put("The.Bear.S02E10.1080p", "/ssd/PELICULAS")
+check("an earlier episode left in the automatic folder does not stop it: that folder is no series folder",
+	add_auto("The.Bear.S03E01.1080p"), [("add_torrent", "/ssd/SERIES/The Bear", None)])
+
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+check("the year goes in the folder name, as series folders are told apart",
+	add_auto("Doctor.Who.2005.S01E01.1080p"), [("add_torrent", "/ssd/SERIES/Doctor Who (2005)", None)])
+check("a season pack is a new series too", add_auto("The Penguin - Temporada 1 [HDTV 1080p]"),
+	[("add_torrent", "/ssd/SERIES/The Penguin", None)])
+check("characters a folder cannot carry are dropped", bot.new_series_folder("CSI: NY S01E01"), "/ssd/SERIES/CSI NY")
+check("not a series: no folder", bot.new_series_folder("Some.Movie.2024.1080p"), None)
+for not_series in ("Saw.X.2023.1080p", "Rocky.IV.1985.1080p", "Kill.Bill.Vol.1.2003", "Cyberpunk.2077-GOG",
+				"Pink Floyd - The Wall (1979) [FLAC]", "Sapiens (2014) [EPUB]", "Dune.Part.Two.2024.2160p"):
+	check(f"{not_series} gets no series folder", bot.new_series_folder(not_series), None)
+bot_settings.set("new_series_dir", "/")
+check("the root folder works as the folder for new series", bot.new_series_folder("The.Bear.S01E01"), "/The Bear")
+bot_settings.set("new_series_dir", "ssd/SERIES/")
+check("a folder without its leading slash (Download Station) is kept as written", bot.new_series_folder("The.Bear.S01E01"), "ssd/SERIES/The Bear")
+bot_settings.set("new_series_dir", "D:\\Series\\")
+check("a Windows folder loses its trailing backslash and keeps its separator", bot.new_series_folder("The.Bear.S01E01"), "D:\\Series\\The Bear")
+
+# Not knowing where the series is never makes it a new one
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+chicago()
+_real_get_torrents = CLIENT.get_torrents
+CLIENT.get_torrents = lambda status=None, query=None: (_ for _ in ()).throw(TorrentClientError("timed out"))
+check("a manager that cannot list: an existing series is not taken for new", bot.series_target("Chicago.Fire.S14E04", current_dir="/ssd/PELICULAS"), (None, None))
+check("and the add stays where it was going", add_auto("Chicago.Fire.S14E04.1080p"), [("add_torrent", "/ssd/PELICULAS", None)])
+check("without telling it is new", bot.get_text("SERIES_PLACED_NEW", "Chicago Fire") in last()[1], False)
+CLIENT.get_torrents = _real_get_torrents
+_real_parser = bot.series_dir_candidates
+bot.series_dir_candidates = lambda *a, **k: next(iter([]))
+check("nor when the parser fails", bot.series_target("The.Bear.S03E01", current_dir="/ssd/PELICULAS"), (None, None))
+bot.series_dir_candidates = _real_parser
+_real_default = CLIENT.get_default_download_dir
+CLIENT.get_default_download_dir = lambda: (_ for _ in ()).throw(TorrentClientError("timed out"))
+check("nor when the manager does not tell its default folder", bot.series_target("The.Bear.S03E01", current_dir="/downloads"), (None, None))
+CLIENT.get_default_download_dir = _real_default
+check("with everything answering it is new", bot.series_target("The.Bear.S03E01", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/The Bear", True))
+bot._new_series_given.clear()
+check("also from the default folder of the manager", bot.series_target("The.Bear.S03E01", current_dir="/downloads/"), ("/ssd/SERIES/The Bear", True))
+
+# Two episodes of a new series sent at once: the second does not see the first
+# in the manager yet, but goes to the same folder and is not told as new again
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+check("the first of two at once is new", bot.series_target("The.Bear.S03E01", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/The Bear", True))
+check("the second goes to the same folder, not as new", bot.series_target("The.Bear.S03E02", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/The Bear", False))
+check("another series is still new", bot.series_target("Andor.S02E01", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/Andor", True))
+bot._new_series_given["/ssd/SERIES/The Bear"] -= bot.NEW_SERIES_MEMORY + 1
+check("after a while it counts as new again (its torrents may have been removed)", bot.series_target("The.Bear.S03E03", current_dir="/ssd/PELICULAS"), ("/ssd/SERIES/The Bear", True))
+results = []
+threads = [threading.Thread(target=lambda: results.append(bot.series_target("Severance.S02E01", current_dir="/ssd/PELICULAS"))) for _ in range(8)]
+for t in threads: t.start()
+for t in threads: t.join()
+check("eight at the same time: one new, all to the same folder", sorted(results),
+	[("/ssd/SERIES/Severance", False)] * 7 + [("/ssd/SERIES/Severance", True)])
+
+# Windows paths: a trailing backslash is the same folder
+fresh(auto_download=True, auto_move_series=True, auto_move_series_external=True, new_series_dir="D:\\Series")
+CLIENT.put("Chicago.Fire.S14E01", "D:\\Series\\Chicago Fire")
+check("a torrent already in its series folder, written with a trailing backslash, stays",
+	bot.series_target("Chicago.Fire.S14E02", current_dir="D:\\Series\\Chicago Fire\\"), (None, False))
+_real_default = CLIENT.get_default_download_dir
+CLIENT.get_default_download_dir = lambda: "D:\\Downloads\\"
+check("and one in the default folder written that way is a new series",
+	bot.series_target("The.Bear.S03E01", current_dir="D:\\Downloads"), ("D:\\Series\\The Bear", True))
+CLIENT.get_default_download_dir = _real_default
+
+# Download Station tells its folders without the leading slash, and the
+# settings may have been typed with it: the same folder either way
+fresh(auto_download=True, auto_move_series=True, auto_move_series_external=True, notify_external_added=True,
+	auto_download_dir="/DESCARGAS/PELICULAS", new_series_dir="/DESCARGAS/SERIES")
+check("the same folder with and without its leading slash", (bot.same_dir("/DESCARGAS/SERIES/", "DESCARGAS/SERIES"),
+	bot.same_dir("DESCARGAS/SERIES", "DESCARGAS/SERIES/The Bear")), (True, False))
+torrent = external("Severance.S02E01.1080p.mkv", directory="DESCARGAS/PELICULAS")
+check("an external new series in the automatic folder told without slash is moved",
+	[c for c in CLIENT.calls if c[0] == "move"], [("move", [torrent.id], "/DESCARGAS/SERIES/Severance")])
+fresh(auto_download=True, auto_move_series=True, auto_move_series_external=True, notify_external_added=True,
+	auto_download_dir="/DESCARGAS/PELICULAS", new_series_dir="/DESCARGAS/SERIES")
+CLIENT.put("Chicago.Fire.S14E01", "DESCARGAS/SERIES/Chicago Fire")
+external("Chicago.Fire.S14E02", directory="DESCARGAS/SERIES/Chicago Fire")
+check("one already in its series folder, told without slash, stays", [c for c in CLIENT.calls if c[0] == "move"], [])
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/DESCARGAS/PELICULAS", new_series_dir="/DESCARGAS/SERIES")
+CLIENT.put("The.Bear.S02E10", "DESCARGAS/PELICULAS")
+check("an earlier episode left in the automatic folder told without slash does not count as its folder",
+	bot.series_target("The.Bear.S03E01", current_dir="/DESCARGAS/PELICULAS"), ("/DESCARGAS/SERIES/The Bear", True))
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="DESCARGAS/PELICULAS", new_series_dir="DESCARGAS/SERIES")
+_real_default = CLIENT.get_default_download_dir
+CLIENT.get_default_download_dir = lambda: "DESCARGAS"
+check("written without slash everywhere, as in Download Station", bot.series_target("The.Bear.S03E01", current_dir="DESCARGAS"),
+	("DESCARGAS/SERIES/The Bear", True))
+CLIENT.get_default_download_dir = _real_default
+
+# A queued add keeps what was worked out, and tells it as new
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+pending = {"magnet": "m", "data": None, "name": "The.Bear.S03E01.1080p"}
+context = bot.add_context(pending, "/ssd/PELICULAS", chat_id=1, automatic=True)
+check("the context of an add carries the new folder", (context["download_dir"], context["series_new"]), ("/ssd/SERIES/The Bear", True))
+CLIENT.added = "The.Bear.S03E01.1080p"
+text, markup = bot.add_with_context(pending, context)
+check("added from it, it is told as new", text.endswith(bot.get_text("SERIES_PLACED_NEW", "The Bear")), True)
+old_context = {k: v for k, v in context.items() if k != "series_new"}
+text, markup = bot.added_message(CLIENT.get_torrent([t for t in CLIENT.torrents.values() if t.name == CLIENT.added][0].id), **old_context)
+check("a context queued before this setting existed still reads", text.endswith(bot.get_text("SERIES_PLACED", "The Bear")), True)
+
+# A manager that refuses the new folder (Download Station without File
+# Station permission) does not lose the add: it goes where it was going
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="DESCARGAS/PELICULAS", new_series_dir="DESCARGAS/SERIES")
+_real_add = CLIENT.add_torrent
+def _refuses_new_folder(magnet=None, torrent_data=None, download_dir=None, category=None):
+	if download_dir == "DESCARGAS/SERIES/The Bear":
+		CLIENT.calls.append(("add_torrent", download_dir, category))
+		raise TorrentClientError("Error adding torrent: Destination does not exist")
+	return _real_add(magnet=magnet, torrent_data=torrent_data, download_dir=download_dir, category=category)
+CLIENT.add_torrent = _refuses_new_folder
+calls = add_auto("The.Bear.S03E01.1080p")
+check("a refused new folder falls back to the automatic folder", calls,
+	[("add_torrent", "DESCARGAS/SERIES/The Bear", None), ("add_torrent", "DESCARGAS/PELICULAS", None)])
+kind, text, markup = last()
+check("the message tells why it is there", bot.get_text("SERIES_NEW_DIR_FAILED", "DESCARGAS/SERIES/The Bear",
+	"Error adding torrent: Destination does not exist") in text, True)
+check("and not that it is a new series", (bot.get_text("SERIES_PLACED_NEW", "The Bear") in text, markup), (False, None))
+check("the folder is not taken as given out", bot.series_target("The.Bear.S03E02", current_dir="DESCARGAS/PELICULAS"),
+	("DESCARGAS/SERIES/The Bear", True))
+CLIENT.add_torrent = _real_add
+bot._new_series_given.clear()
+
+# Several at once whose add is refused as a duplicate: the folder is free again
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+CLIENT.add_torrent = lambda **kw: (_ for _ in ()).throw(bot.DuplicateTorrentError("already there"))
+add_auto("The.Bear.S03E01.1080p")
+CLIENT.add_torrent = _real_add
+check("a duplicate does not keep the folder given out", bot.series_target("The.Bear.S03E02", current_dir="/ssd/PELICULAS"),
+	("/ssd/SERIES/The Bear", True))
+
+# Undo: the next episode finds that folder empty, so it is new again
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+add_auto("The.Bear.S03E01.1080p")
+press(buttons(last()[2])[0][1], message_html=roundtrip(last()[1]))
+CLIENT.torrents.clear()
+add_auto("The.Bear.S03E02.1080p")
+check("after an undo the next one is told as new, not as joining others", last()[1].endswith(bot.get_text("SERIES_PLACED_NEW", "The Bear")), True)
+
+# The series could not be looked for: a queued add looks again when it is sent
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+chicago()
+CLIENT.fail_list = TorrentClientError("timed out")
+CLIENT.add_torrent = lambda **kw: (_ for _ in ()).throw(TorrentClientError("Error adding torrent: timed out"))
+pending = {"magnet": "magnet:?xt=urn:btih:" + "cd" * 20, "data": None, "name": "Chicago.Fire.S14E04.1080p"}
+text, markup, item = bot.add_or_queue(pending, "/ssd/PELICULAS", chat_id=1, automatic=True)
+check("an add that could not look for its series is queued to look again", (item is not None, item and item.get("resolve")), (True, True))
+CLIENT.fail_list = None
+CLIENT.add_torrent = _real_add
+CLIENT.added = "Chicago.Fire.S14E04.1080p"
+context = bot.add_context(pending, item["context"]["download_dir"], 1, None, None, True)
+check("and when it is sent, it finds the series folder", context["download_dir"], "/media/SERIES/Chicago Fire")
+bot.queued_adds.take(item["id"])
+bot.queued_adds.succeeded()  # The queue no longer waits for a manager that failed
+
+# A soundtrack or a game named like an episode is not a new series
+def bencode(value):
+	if isinstance(value, int): return b"i%de" % value
+	if isinstance(value, bytes): return b"%d:%s" % (len(value), value)
+	if isinstance(value, str): return bencode(value.encode())
+	if isinstance(value, list): return b"l" + b"".join(bencode(v) for v in value) + b"e"
+	return b"d" + b"".join(bencode(k) + bencode(value[k]) for k in sorted(value)) + b"e"
+def torrent_file(name, paths):
+	files = [{"path": path.split("/"), "length": 10} for path in paths]
+	return bencode({"info": {"name": name, "piece length": 16, "pieces": b"x" * 20, "files": files}})
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+soundtrack = torrent_file("Andor S01 Soundtrack", ["01 - Main Title.flac", "02 - Ferrix.flac", "cover.jpg"])
+check("the files inside a .torrent are read", bot.torrent_data_files(soundtrack), ["01 - Main Title.flac", "02 - Ferrix.flac", "cover.jpg"])
+check("so is a single file one", bot.torrent_data_files(bencode({"info": {"name": "Show.S01E01.mkv", "length": 5}})), ["Show.S01E01.mkv"])
+check("a broken one reads as unknown", (bot.torrent_data_files(b"d4:infod4:name"), bot.torrent_data_files(None)), (None, None))
+CLIENT.added = "Andor S01 Soundtrack"
+CLIENT.calls.clear()
+bot.start_add_flow(1, "andor.torrent", data=soundtrack)
+check("a series named torrent without a video gets no new folder", [c for c in CLIENT.calls if c[0] == "add_torrent"],
+	[("add_torrent", "/ssd/PELICULAS", None)])
+pack = torrent_file("The Bear S01 1080p", ["The.Bear.S01E01.1080p.mkv", "The.Bear.S01E01.srt"])
+CLIENT.added = "The Bear S01 1080p"
+CLIENT.calls.clear()
+bot.start_add_flow(1, "bear.torrent", data=pack)
+check("one with a video does", [c for c in CLIENT.calls if c[0] == "add_torrent"], [("add_torrent", "/ssd/SERIES/The Bear", None)])
+fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=True,
+	new_series_dir="/ssd/SERIES", auto_download_dir="/ssd/PELICULAS")
+external("Need.for.Speed.S01.Soundtrack", directory="/ssd/PELICULAS")
+check("nor an external one whose files are known to have no video", [c for c in CLIENT.calls if c[0] == "move"], [])
+
+fresh(auto_download=True, auto_move_series=False, auto_download_dir="/ssd/PELICULAS", new_series_dir="/ssd/SERIES")
+check("with the automatic move off the folder does nothing", add_auto("The.Bear.S03E01.1080p"), [("add_torrent", "/ssd/PELICULAS", None)])
+
+fresh(auto_download=False, auto_move_series=True, new_series_dir="/ssd/SERIES")
+pending_id = bot.new_pending_torrent("The.Bear.S03E01.1080p", magnet="m")
+CLIENT.added = "The.Bear.S03E01.1080p"
+bot.do_add_torrent(1, 100, pending_id, "/ssd/PELICULAS")
+check("asking for the folder, the answer is the folder", [c for c in CLIENT.calls if c[0] in ("add_torrent", "move")],
+	[("add_torrent", "/ssd/PELICULAS", None)])
+
+fresh(auto_download=True, auto_move_series=True, auto_category="Pelis", new_series_dir="/ssd/SERIES")
+bot.client.supports_categories = True
+CLIENT.categories = [("Pelis", "/ssd/PELICULAS")]
+check("with an automatic category the category decides", add_auto("The.Bear.S03E01.1080p"), [("add_torrent", "", "Pelis")])
+bot.client.supports_categories = False
+
+# Torrents added outside the bot
+fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=True,
+	new_series_dir="/ssd/SERIES", auto_download_dir="/ssd/PELICULAS")
+torrent = external("The.Bear.S03E01.1080p.mkv", directory="/ssd/PELICULAS")
+check("an external new series is moved to its new folder", [c for c in CLIENT.calls if c[0] == "move"],
+	[("move", [torrent.id], "/ssd/SERIES/The Bear")])
+check("told as a new series, with undo back", (last()[1].endswith(bot.get_text("SERIES_PLACED_NEW", "The Bear")),
+	buttons(last()[2])[0][1]), (True, bot.build_call("serUndo", torrent.id, bot.get_dir_id("/ssd/PELICULAS"))))
+
+fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=True,
+	new_series_dir="/ssd/SERIES", auto_download_dir="/ssd/PELICULAS")
+external("The.Bear.S03E01.1080p", directory="/ssd/SERIES/The Bear")
+check("one already in its folder is left alone", [c for c in CLIENT.calls if c[0] == "move"], [])
+fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=True,
+	new_series_dir="/ssd/SERIES", auto_download_dir="/ssd/PELICULAS")
+external("Severance.S02E01.1080p", directory="/tv/Severance/Season 02")
+check("also in a season folder inside its own", [c for c in CLIENT.calls if c[0] == "move"], [])
+external("Andor.S02E01.1080p", directory="/tv/Andor")
+check("or in a folder named after it anywhere else", [c for c in CLIENT.calls if c[0] == "move"], [])
+external("Slow.Horses.S04E01.1080p", directory="/sonarr/tv")
+check("or in a folder another app keeps: only the generic folders are left", [c for c in CLIENT.calls if c[0] == "move"], [])
+
+fresh(notify_external_added=True, auto_download=True, auto_move_series=True, auto_move_series_external=False,
+	new_series_dir="/ssd/SERIES", auto_download_dir="/ssd/PELICULAS")
+external("The.Bear.S03E01.1080p.mkv", directory="/ssd/PELICULAS")
+check("external ones are only moved with the external toggle", [c for c in CLIENT.calls if c[0] == "move"], [])
+
+# Its setting
+fresh(auto_download=True, auto_move_series=False)
+text, markup = bot.build_settings("add")
+check("hidden while the automatic move is off", bot.build_call("newSerMenu", 0) in [c for _, c in buttons(markup)], False)
+bot_settings.set("auto_move_series", True)
+text, markup = bot.build_settings("add")
+calls = [c for _, c in buttons(markup)]
+check("shown under it", calls.index(bot.build_call("newSerMenu", 0)),
+	calls.index(bot.build_call("toggleSetting", "auto_move_series_external")) + 1)
+check("telling it is not set", bot.get_text("SETTINGS_NEW_SERIES_DIR", bot.get_text("NEW_SERIES_DIR_NONE")) in text, True)
+press(bot.build_call("newSerMenu", 0))
+kind, text, markup = last()
+check("its screen explains it", text.startswith(bot.get_text("NEW_SERIES_DIR_ASK")), True)
+check("with a first button to not use it", buttons(markup)[0], (bot.get_text("BUTTON_NEW_SERIES_DIR_NONE"), bot.build_call("newSerNone")))
+bot_settings.set("favorite_dirs", ["/ssd/SERIES"])
+press(bot.build_call("newSerMenu", 0))
+press(bot.build_call("newSerSet", bot.get_dir_id("/ssd/SERIES")))
+check("a folder is picked", bot_settings.get("new_series_dir"), "/ssd/SERIES")
+check("back on the add screen telling it", bot.get_text("SETTINGS_NEW_SERIES_DIR", bot.get_text("NEW_SERIES_DIR_SET", "/ssd/SERIES")) in last()[1], True)
+press(bot.build_call("newSerNone"))
+check("and dropped", bot_settings.get("new_series_dir"), "")
+check("the telemetry says it is not used", bot.collect_telemetry_metrics()["new_series_dir"], False)
+bot_settings.set("new_series_dir", "/ssd/SERIES")
+check("and that it is", bot.collect_telemetry_metrics()["new_series_dir"], True)
+bot_settings.set("auto_move_series", False)
+check("only while the series move is on", bot.collect_telemetry_metrics()["new_series_dir"], False)
+bot_settings.set("auto_move_series", True)
+bot_settings.set("new_series_dir", "")
+SCREENS.clear()
+bot.pending_inputs.clear()
+press(bot.build_call("newSerNew"))
+pending = bot.pop_pending_input(1, 1)
+check("typing it can be cancelled back to the add screen", pending["back_call"], bot.settings_call("add"))
+message = type("M", (), {"chat": type("C", (), {"id": 1})(), "message_thread_id": None, "text": "/ssd/SERIES/", "message_id": 9,
+						"from_user": type("U", (), {"id": 1})()})()
+bot.handle_pending_input(message, pending)
+check("a typed folder is saved without its trailing slash", bot_settings.get("new_series_dir"), "/ssd/SERIES")
+check("and the add screen comes back telling it", bot.get_text("NEW_SERIES_DIR_SET", "/ssd/SERIES") in SCREENS[-1][1], True)
+
+# Found while the series move is off
+fresh(auto_download=True, auto_move_series=False)
+text, markup = bot.build_settings("add")
+check("with the series move off, the screen says what turning it on brings", bot.get_text("SETTINGS_AUTO_MOVE_SERIES_HINT") in text, True)
+bot_settings.set("auto_move_series", True)
+text, markup = bot.build_settings("add")
+check("and stops saying it once it is on", bot.get_text("SETTINGS_AUTO_MOVE_SERIES_HINT") in text, False)
+bot_settings.set("auto_download", False)
+text, markup = bot.build_settings("add")
+check("nor while the bot asks for the folder", bot.get_text("SETTINGS_AUTO_MOVE_SERIES_HINT") in text, False)
+
+# The folder of one series is not the folder of every new series
+fresh(auto_download=True, auto_move_series=True, favorite_dirs=["/media/SERIES", "/media/SERIES/Chicago Fire"])
+chicago()
+check("a general folder is no series folder", bot.series_of_folder("/media/SERIES"), None)
+check("the folder of a series is told", bot.series_of_folder("/media/SERIES/Chicago Fire/"), "Chicago Fire")
+check("and so is a season folder inside it", bot.series_of_folder("/media/SERIES/Chicago Fire/Temporada 14"), "Chicago Fire")
+check("a movie folder is no series folder", bot.series_of_folder("/media/PELIS"), None)
+press(bot.build_call("newSerSet", bot.get_dir_id("/media/SERIES/Chicago Fire")))
+kind, text, markup = last()
+check("picking a series folder warns instead of saving", (bot_settings.get("new_series_dir"),
+	text), ("", "⚠️ " + bot.get_text("NEW_SERIES_DIR_LOOKS_SERIES", "/media/SERIES/Chicago Fire", "Chicago Fire", "/media/SERIES/Chicago Fire/The Bear")))
+check("offering another folder first, then using it anyway, then cancel", buttons(markup), [
+	(bot.get_text("BUTTON_NEW_SERIES_DIR_OTHER"), bot.build_call("newSerMenu", 0)),
+	(bot.get_text("BUTTON_NEW_SERIES_DIR_FORCE"), bot.build_call("newSerForce", bot.get_dir_id("/media/SERIES/Chicago Fire"))),
+	(bot.get_text("BUTTON_CANCEL"), bot.settings_call("add"))])
+press(buttons(markup)[1][1])
+check("using it anyway saves it", bot_settings.get("new_series_dir"), "/media/SERIES/Chicago Fire")
+press(bot.build_call("newSerSet", bot.get_dir_id("/media/SERIES")))
+check("a general folder is saved straight away", (bot_settings.get("new_series_dir"), last()[1].startswith(bot.get_text("SETTINGS_ADD_TITLE"))), ("/media/SERIES", True))
+SCREENS.clear()
+bot.pending_inputs.clear()
+press(bot.build_call("newSerNew"))
+pending = bot.pop_pending_input(1, 1)
+message.text = "/media/SERIES/Chicago Med"
+bot.handle_pending_input(message, pending)
+check("a typed series folder warns too", (bot_settings.get("new_series_dir"), SCREENS[-1][1].startswith("⚠️")), ("/media/SERIES", True))
+_real_get_torrents = CLIENT.get_torrents
+CLIENT.get_torrents = lambda status=None, query=None: (_ for _ in ()).throw(TorrentClientError("busy"))
+press(bot.build_call("newSerSet", bot.get_dir_id("/media/SERIES/Chicago Fire")))
+check("a manager that cannot list does not block choosing", bot_settings.get("new_series_dir"), "/media/SERIES/Chicago Fire")
+CLIENT.get_torrents = _real_get_torrents
+
+# The download folder is not the folder for new series either
+fresh(auto_download=True, auto_move_series=True, auto_download_dir="/media/PELIS", favorite_dirs=["/media/PELIS"])
+press(bot.build_call("newSerSet", bot.get_dir_id("/media/PELIS")))
+check("picking the download folder warns", (bot_settings.get("new_series_dir"), last()[1]),
+	("", "⚠️ " + bot.get_text("NEW_SERIES_DIR_LOOKS_GENERIC", "/media/PELIS", "/media/PELIS/The Bear")))
+press(bot.build_call("newSerSet", bot.get_dir_id("/downloads")))
+check("and the default one of the manager", last()[1].startswith("⚠️"), True)
+
+# The folders that hold the series are offered first
+fresh(auto_download=True, auto_move_series=True)
+chicago()
+CLIENT.put("Mad.Men.S01E01", "/tv/Mad Men/Season 01")
+check("the folders holding the series folders, most used first", bot.series_parent_dirs(), ["/media/SERIES", "/tv"])
+press(bot.build_call("newSerMenu", 0))
+kind, text, markup = last()
+check("are the first buttons, marked", button_texts(markup)[1:3], ["✨ /media/SERIES", "✨ /tv"])
+check("with the line that says what they are", bot.get_text("NEW_SERIES_DIR_SUGGESTED") in text, True)
+fresh(auto_download=True, auto_move_series=True)
+press(bot.build_call("newSerMenu", 0))
+check("without series in the manager there is nothing marked", (bot.get_text("NEW_SERIES_DIR_SUGGESTED") in last()[1],
+	any(t.startswith("✨") for t in button_texts(last()[2]))), (False, False))
+CLIENT.get_torrents = _real_get_torrents
 
 # --- Settings ----------------------------------------------------------------
 fresh()

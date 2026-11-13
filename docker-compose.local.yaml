@@ -18,5 +18,6 @@ services:
             - ./logger.py:/app/logger.py
             - ./message_queue.py:/app/message_queue.py
             - ./auto_mover.py:/app/auto_mover.py
+            - ./add_queue.py:/app/add_queue.py
             - ./torrent_clients:/app/torrent_clients
             - ./locale:/app/locale

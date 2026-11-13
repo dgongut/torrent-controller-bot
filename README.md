@@ -21,6 +21,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Listado de torrents con filtros (descargando, compartiendo, pausados, completados, con error...) y paginación, ordenable por fecha, nombre, tamaño, progreso, ratio, velocidad o última actividad
 - ✅ Búsqueda de torrents por nombre o por ruta
 - ✅ Añadir torrents enviando un fichero `.torrent`, un enlace magnet o una URL a un fichero `.torrent`, eligiendo el directorio de descarga
+- ✅ Cola de añadidos: si el gestor no responde (está ocupado moviendo datos, reiniciándose...), lo que envías queda en cola, sobrevive a un reinicio del bot y se añade solo en cuanto el gestor responde
 - ✅ Pausar, reanudar, verificar, reanunciar al tracker y borrar torrents (con o sin sus datos)
 - ✅ Mover torrents de directorio con aviso al terminar el movimiento
 - ✅ Límites por torrent: hasta qué ratio compartir cada uno (el del gestor, sin límite, 0.5, 1, 2 u otro valor) y su velocidad de bajada y subida, y el ratio del propio gestor desde los ajustes
@@ -38,7 +39,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Descarga automática sin preguntar la ruta, con directorio configurable
 - ✅ Renombrado automático al añadir un torrent, opcionalmente también de las subcarpetas y archivos que contiene y de los torrents añadidos fuera del bot (activable desde los ajustes)
 - ✅ Sustituir una versión anterior: si el nombre que le toca a una descarga ya lo tiene otro torrent, al terminar te ofrece borrar el anterior (con sus datos) y quedarte con el nuevo, o lo hace sin preguntar si lo activas
-- ✅ Carpeta de la serie: un episodio nuevo se ofrece (o va directo, si lo activas) a la carpeta donde ya tienes los anteriores
+- ✅ Carpeta de la serie: un episodio nuevo se ofrece (o va directo, si lo activas) a la carpeta donde ya tienes los anteriores, y una serie nueva puede ir a su propia carpeta
 - ✅ Mover automático: cuando la carpeta de descargas se queda sin espacio, mueve los torrents más antiguos a otra carpeta con la misma estructura (por ejemplo de un SSD a los discos)
 - ✅ Aviso si el torrent que añades puede no caber en el disco
 - ✅ Ajustes del bot persistentes entre reinicios (volumen `/config`)
@@ -162,7 +163,8 @@ Cuando llega un episodio o un pack de temporada, el bot busca entre los torrents
 
 - **Al elegir la carpeta** (al añadir o al mover un torrent), la carpeta de la serie aparece la primera, marcada con ✨, aunque tengas muchas favoritas.
 - **Con la descarga automática**, el mensaje de torrent añadido termina con un 💡 que propone la carpeta y los botones para moverlo o descartarlo. Al moverlo, el bot edita ese mismo mensaje para que muestre la carpeta nueva.
-- **Con «Series directas a su carpeta»** (dentro de la descarga automática, desactivado por defecto), si no hay ninguna duda el torrent se añade directamente en la carpeta de la serie en vez de en la automática, y el mensaje lleva un botón ↩️ Deshacer. Solo ocurre cuando hay una única carpeta con el nombre de la serie; si hay dudas (dos carpetas posibles, o una carpeta común como `/media/series`), te la propone en lugar de decidir por ti. Opcionalmente se aplica también a los torrents añadidos fuera del bot, que en ese caso sí se mueven, porque ya están en el gestor.
+- **Con «Episodios a la carpeta de su serie»** (dentro de la descarga automática, desactivado por defecto), el bot busca en el gestor otros episodios de la misma serie y, si no hay ninguna duda el torrent se añade directamente en la carpeta de la serie en vez de en la automática, y el mensaje lleva un botón ↩️ Deshacer. Solo ocurre cuando hay una única carpeta con el nombre de la serie; si hay dudas (dos carpetas posibles, o una carpeta común como `/media/series`), te la propone en lugar de decidir por ti. Opcionalmente se aplica también a los torrents añadidos fuera del bot, que en ese caso sí se mueven, porque ya están en el gestor.
+- **Con «Carpeta de series nuevas»** (debajo de la anterior, sin fijar por defecto), una serie de la que no hay ningún otro episodio en el gestor va a una carpeta con su nombre dentro de la que elijas: con `/ssd/SERIES`, el primer episodio de *The Bear* se descarga en `/ssd/SERIES/The Bear` (o `Doctor Who (2005)` si el nombre lleva año), y los siguientes ya la encuentran como la carpeta de la serie. Solo se aplica cuando el torrent iba a quedarse en la carpeta de descargas por defecto o en la automática; si hay alguna duda sobre dónde está la serie, o el gestor no responde al buscarla, se pregunta como siempre. Si borras del gestor los torrents de una serie que ya tienes en disco, el bot no puede saber que existe: la carpeta que crea lleva el nombre que saca del torrent (con el año, si lo trae), así que conviene que coincida con el de la tuya. Si eliges como carpeta de series nuevas la de una serie concreta (`/ssd/SERIES/Chicago Fire`), el bot te avisa antes de guardarla. También avisa si eliges la carpeta donde se descarga todo, y te propone (✨) las carpetas donde ya tienes tus series. Si el gestor no puede crear la carpeta nueva (en Download Station hace falta permiso de File Station), el torrent se descarga donde iba a ir y el mensaje lo explica. Un torrent con nombre de serie pero sin ningún vídeo dentro, como una banda sonora, no crea carpeta.
 
 Si guardas las temporadas en subcarpetas (`Mad Men/Season 01`), un episodio de la temporada siguiente se propone en `Mad Men/Season 02` con el mismo formato, aunque esa carpeta aún no exista. La carpeta de descargas por defecto y la de la descarga automática nunca se proponen, salvo que lleven el nombre de la serie. Un torrent de qBittorrent en gestión automática no se toca: la carpeta la decide su categoría.
 
@@ -190,7 +192,7 @@ Está hecho para no sorprender:
 - No se tocan los torrents sin terminar, en comprobación o con error en sus datos (un tracker que no responde no cuenta), ni los de qBittorrent en gestión automática, cuya carpeta la decide su categoría.
 <!-- /dockerhub:skip -->
 
-Transmission no responde a nada mientras mueve datos entre discos: durante un movimiento grande el bot dará error de conexión hasta que termine, y el aviso del mover se actualiza entonces.
+Transmission no responde a nada mientras mueve datos entre discos: durante un movimiento grande el bot dará error de conexión hasta que termine, y el aviso del mover se actualiza entonces. Lo que envíes mientras tanto queda en cola y se añade cuando termine.
 
 El espacio libre se le pregunta al gestor, así que el bot no necesita tener montados los discos. qBittorrent solo lo sabe de su carpeta de descargas por defecto: el origen tiene que ser esa carpeta o estar dentro de ella, y la pantalla lo avisa si no es así.
 

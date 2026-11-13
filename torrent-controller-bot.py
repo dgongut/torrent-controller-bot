@@ -24,12 +24,13 @@ from message_queue import MessageQueue, describe_error
 from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, is_sample_file, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
 from torrent_clients import DuplicateTorrentError, RestartRequiredError, expected_torrent_ids, FILE_HIGH, FILE_LOW, FILE_NORMAL, FILE_SKIP, PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, content_root, create_client
 import auto_mover
+from add_queue import AddQueue, MAX_AGE as ADD_QUEUE_MAX_AGE
 import bot_settings
 import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -2641,37 +2642,79 @@ SERIES_SUGGESTIONS_MAX = 2  # Folders offered at most: more would only be noise
 
 # Texts that open the block about the series folder at the end of an add
 # message: the buttons under it rebuild the message without that block
-SERIES_BLOCK_KEYS = ("SERIES_SUGGEST_ONE", "SERIES_SUGGEST_MANY", "SERIES_PLACED", "SERIES_MOVING")
+SERIES_BLOCK_KEYS = ("SERIES_SUGGEST_ONE", "SERIES_SUGGEST_MANY", "SERIES_PLACED", "SERIES_PLACED_NEW", "SERIES_MOVING")
 
 
 def series_candidates(name, exclude_id=None, current_dir=None):
 	"""Folders the series of name already lives in, best first, as (dir, named).
-	Empty when name is not a series or the manager has nothing of it"""
+	Empty when name is not a series, the manager has nothing of it, or they
+	could not be looked for (see series_lookup to tell that apart)"""
+	return series_lookup(name, exclude_id, current_dir) or []
+
+
+def series_lookup(name, exclude_id=None, current_dir=None):
+	"""series_candidates, but None when the folders could not be looked for
+	(the manager did not answer, the parser failed): "nowhere" and "could
+	not tell" are not the same for a series about to get a new folder"""
 	if series_identity(name) is None:
 		return []
 	try:
 		torrents = client.get_torrents()
 	except TorrentClientError as e:
 		warning(f"Cannot look for the series folder of {name}: {e}")
-		return []
+		return None
 	others = []
 	for torrent in torrents:
 		if str(torrent.id) == str(exclude_id) or not torrent.download_dir:
 			continue
 		others.append((torrent.name, torrent.download_dir, added_timestamp(torrent.added_date)))
-	generic = [bot_settings.get("auto_download_dir")]
-	try:
-		generic.append(client.get_default_download_dir())
-	except TorrentClientError:
-		pass
 	try:
 		return series_dir_candidates(name, others, known_dirs=bot_settings.get("favorite_dirs") or [],
-									current_dir=current_dir, generic_dirs=generic)
+									current_dir=current_dir, generic_dirs=with_and_without_slash(generic_dirs()))
 	except Exception as e:
 		# A folder name the parser chokes on must not take the add, move or
 		# series screens down with it: nothing is suggested instead
 		warning(f"Cannot work out the series folder of {name}: {e}")
-		return []
+		return None
+
+
+def generic_dirs(strict=False):
+	"""Where anything lands before being sorted: the automatic download folder
+	and the default one of the manager. strict: None when the manager does not
+	tell its default one, instead of leaving it out"""
+	generic = [bot_settings.get("auto_download_dir")]
+	try:
+		generic.append(client.get_default_download_dir())
+	except TorrentClientError:
+		if strict:
+			return None
+	return [_dir_key(d) for d in generic if d]
+
+
+def _dir_key(path):
+	"""A folder as it is compared: without its trailing separator, which a
+	Windows Deluge writes as a backslash. "/" stays "/" """
+	path = (path or "").strip()
+	return path.rstrip("/\\") or path[:1]
+
+
+def same_dir(a, b):
+	"""Whether two folders are the same one. Download Station tells its
+	folders without the leading slash (DESCARGAS/SERIES) and takes them
+	either way, so a folder typed as /DESCARGAS/SERIES is that one too"""
+	return _dir_key(a).lstrip("/") == _dir_key(b).lstrip("/")
+
+
+def with_and_without_slash(dirs):
+	"""Each folder of dirs both with and without its leading slash, for the
+	comparisons done in name_parser, which take a folder as written"""
+	variants = []
+	for directory in dirs:
+		bare = _dir_key(directory).lstrip("/")
+		for variant in (bare, "/" + bare):
+			if bare and variant not in variants:
+				variants.append(variant)
+	return variants
 
 
 def added_timestamp(added_date):
@@ -2706,12 +2749,110 @@ def auto_move_series_enabled(external=False):
 	return bool(bot_settings.get("auto_move_series_external")) if external else True
 
 
-def series_auto_target(pending, current_dir=None):
-	"""The folder a torrent about to be added goes to without asking: the one
-	of its series, when the automatic move is on and there is no doubt"""
-	if not auto_move_series_enabled():
+# Characters no folder name can carry on some of the systems behind a manager
+# (Windows Deluge, SMB shares of a NAS), dropped from the name of a new one
+_FOLDER_UNSAFE = re.compile(r'[\\/:*?"<>|]+')
+_SEPARATORS = "/\\"  # Of a path, a Windows Deluge using backslashes
+
+
+def new_series_folder(name):
+	"""The folder a series nobody has yet would get: one named after it
+	("Title (Year)", the way the series folders are recognised) inside the
+	folder for new series. None without that folder or a usable title"""
+	identity = series_identity(name)
+	if not (bot_settings.get("new_series_dir") or "").strip() or identity is None:
 		return None
-	return series_auto_dir(series_candidates(pending_series_name(pending), current_dir=current_dir))
+	title = " ".join(_FOLDER_UNSAFE.sub(" ", identity["title"] or "").split()).strip(". ")
+	if not title:
+		return None
+	if identity["year"]:
+		title = f"{title} ({identity['year']})"
+	return new_series_folder_in(bot_settings.get("new_series_dir"), title)
+
+
+def new_series_folder_in(base, title):
+	"""base/title, whatever separator base ends with ("/" stays the root)"""
+	base = _dir_key(base).rstrip(_SEPARATORS)
+	# A Windows folder (D:\\Series) gets its own separator
+	separator = "\\" if "\\" in base and "/" not in base else "/"
+	return base + separator + title
+
+
+# New series folders given out lately, {folder: when}: an episode of the same
+# series added right after (two sent at once) does not see the first one in
+# the manager yet, and would be told as a new series too
+_new_series_given = {}
+_new_series_lock = threading.Lock()
+NEW_SERIES_MEMORY = 600  # Seconds a new series folder counts as given out
+
+
+def claim_new_series_folder(target):
+	"""True the first time target is given out as the folder of a new series,
+	False when it already was a moment ago"""
+	now = time.time()
+	with _new_series_lock:
+		for folder in [f for f, ts in _new_series_given.items() if now - ts > NEW_SERIES_MEMORY]:
+			del _new_series_given[folder]
+		if target in _new_series_given:
+			return False
+		_new_series_given[target] = now
+		return True
+
+
+def release_new_series_folder(folder):
+	"""A new series folder given out that ended up with nothing in it (the
+	add failed, or was undone): the next episode is new again"""
+	with _new_series_lock:
+		for given in [f for f in _new_series_given if same_dir(f, folder)]:
+			del _new_series_given[given]
+
+
+def has_video(files):
+	"""Whether a list of file paths holds a video. None (not known yet, a
+	magnet without its metadata) counts as yes: the name is all there is"""
+	return files is None or any(is_video_file(path) for path in files)
+
+
+def series_target(name, exclude_id=None, current_dir=None, files=None):
+	"""Where a series goes without asking, as (folder, new): the only folder
+	named after it, or, when it is nowhere at all, a new one in the folder for
+	new series (new=True) when it is in one of the generic_dirs and has a
+	video (a soundtrack named 'Show S01' is no episode). (None, False) when it
+	stays where it is: not a series, already there, or a doubt the user is
+	asked about instead. (None, None) when it could not be told: the manager
+	or the parser failed while looking for the series"""
+	# Looked for without current_dir: with it, a torrent already in the folder
+	# of its series finds no folder either, and would look like a new series
+	candidates = series_lookup(name, exclude_id=exclude_id)
+	if candidates is None:
+		# Not knowing where the series is never makes it a new one
+		return None, None
+	current = _dir_key(current_dir)
+	if candidates:
+		# What series_candidates does with current_dir
+		if same_dir(candidates[0][0], current):
+			return None, False
+		return series_auto_dir([c for c in candidates if not same_dir(c[0], current)]), False
+	# A new series only leaves the folders where everything lands before being
+	# sorted: anywhere else (its own folder, one another app keeps...) someone
+	# chose to put it there
+	target = new_series_folder(name)
+	if target is None or not has_video(files):
+		return None, False
+	generic = generic_dirs(strict=True)
+	if generic is None:
+		return None, None
+	if current and not any(same_dir(current, d) for d in generic):
+		return None, False
+	return target, claim_new_series_folder(target)
+
+
+def series_auto_target(pending, current_dir=None):
+	"""Where a torrent about to be added goes without asking, as (folder,
+	new), see series_target: only with the automatic move on"""
+	if not auto_move_series_enabled():
+		return None, False
+	return series_target(pending_series_name(pending), current_dir=current_dir, files=torrent_data_files(pending.get("data")))
 
 
 def series_suggestion(torrent, current_dir):
@@ -2741,11 +2882,12 @@ def series_suggestion(torrent, current_dir):
 	return text, markup
 
 
-def series_placed(torrent_id, title, previous_dir):
+def series_placed(torrent_id, title, previous_dir, new=False):
 	"""The block that tells a torrent went straight to the folder of its
-	series, with the button that sends it where it would have gone instead
-	and the one that leaves it there and takes both buttons away"""
-	text = get_text("SERIES_PLACED", html.escape(title))
+	series (a new one for a series that had none), with the button that sends
+	it where it would have gone instead and the one that leaves it there and
+	takes both buttons away"""
+	text = get_text("SERIES_PLACED_NEW" if new else "SERIES_PLACED", html.escape(title))
 	markup = None
 	if previous_dir:
 		markup = InlineKeyboardMarkup()
@@ -2787,9 +2929,13 @@ def place_series_from_message(chat_id, message_id, message_html, torrent_id, dir
 	if new_dir is None:
 		edit_message(chat_id, message_id, wrap(get_text("SERIES_EXPIRED")))
 		return
-	if client.get_torrent(torrent_id) is None:
+	torrent = client.get_torrent(torrent_id)
+	if torrent is None:
 		edit_message(chat_id, message_id, wrap(get_text("TORRENT_NOT_FOUND")))
 		return
+	if torrent.download_dir:
+		# Undone: the next episode finds that folder empty, a new series again
+		release_new_series_folder(torrent.download_dir)
 	progress_text = wrap(get_text("SERIES_MOVING", html.escape(new_dir)))
 	success_text = with_dir_line(base, new_dir) if base else get_text("SERIES_MOVED", html.escape(new_dir))
 	deliver_move_order(chat_id, [torrent_id], new_dir, progress_text, success_text, message_id=message_id, wrap=wrap)
@@ -2841,6 +2987,92 @@ def auto_move_series_label():
 		return get_text("DISABLED")
 	source = get_text("AUTO_RENAME_SOURCE_ALL" if auto_move_series_enabled(external=True) else "AUTO_RENAME_SOURCE_BOT")
 	return get_text("SETTINGS_AUTO_MOVE_SERIES_ON", source)
+
+
+def _named_after(torrent_name, directory):
+	"""Whether directory is named after the series of torrent_name (or is a
+	season folder inside one)"""
+	try:
+		found = series_dir_candidates(torrent_name, [(torrent_name, directory, 0)])
+	except Exception:
+		return False
+	return bool(found and found[0][1])
+
+
+def _parent_dir(path):
+	path = _dir_key(path)
+	cut = max(path.rfind("/"), path.rfind("\\"))
+	return path[:cut] if cut > 0 else ""
+
+
+def series_of_folder(directory):
+	"""The title of the series directory is the folder of (named after it, or
+	a season folder inside one), going by the series in the manager. None for
+	a folder of no series, or when the manager cannot be read"""
+	try:
+		torrents = client.get_torrents()
+	except TorrentClientError:
+		return None
+	directory = _dir_key(directory)
+	for torrent in torrents:
+		identity = series_identity(torrent.name)
+		if identity is not None and _named_after(torrent.name, directory):
+			return identity["title"]
+	return None
+
+
+def series_parent_dirs():
+	"""The folders that hold the folders of the series in the manager (where
+	the user keeps their series), the most used first: what the folder for new
+	series most likely is"""
+	try:
+		torrents = client.get_torrents()
+	except TorrentClientError:
+		return []
+	counts = {}
+	for torrent in torrents:
+		directory = _dir_key(torrent.download_dir)
+		if not directory or series_identity(torrent.name) is None or not _named_after(torrent.name, directory):
+			continue
+		parent = _parent_dir(directory)
+		# A season folder: the series folder is the one above it
+		if parent and _named_after(torrent.name, parent):
+			parent = _parent_dir(parent)
+		if parent:
+			counts[parent] = counts.get(parent, 0) + 1
+	return sorted(counts, key=lambda d: (-counts[d], d))[:SERIES_SUGGESTIONS_MAX]
+
+
+def new_series_dir_problem(directory):
+	"""Why directory looks like a wrong folder for new series, as the text
+	that warns about it, or None. The folder of one series would get every new
+	series inside it; the download folder is where they are now"""
+	example = html.escape(new_series_folder_in(directory, "The Bear"))
+	title = series_of_folder(directory)
+	if title:
+		return get_text("NEW_SERIES_DIR_LOOKS_SERIES", html.escape(directory), html.escape(title), example)
+	if any(same_dir(directory, d) for d in generic_dirs()):
+		return get_text("NEW_SERIES_DIR_LOOKS_GENERIC", html.escape(directory), example)
+	return None
+
+
+def new_series_dir_warning(directory, problem):
+	"""The screen that stops a doubtful folder for new series from being
+	saved, with the way to pick another one or to use it anyway"""
+	dir_id = get_dir_id(directory)
+	markup = InlineKeyboardMarkup(row_width=1)
+	markup.add(InlineKeyboardButton(get_text("BUTTON_NEW_SERIES_DIR_OTHER"), callback_data=build_call("newSerMenu", 0)))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_NEW_SERIES_DIR_FORCE"), callback_data=build_call("newSerForce", dir_id)))
+	markup.add(InlineKeyboardButton(get_text("BUTTON_CANCEL"), callback_data=settings_call("add")))
+	return f"⚠️ {problem}", markup
+
+
+def new_series_dir_label():
+	"""Where a series with no folder yet goes"""
+	base = bot_settings.get("new_series_dir")
+	if not base:
+		return get_text("NEW_SERIES_DIR_NONE")
+	return get_text("NEW_SERIES_DIR_SET", html.escape(base))
 
 
 # The settings are a main screen with one row per section and a screen per
@@ -3013,9 +3245,16 @@ def build_settings_add():
 			lines.append(get_text("SETTINGS_AUTO_CATEGORY", auto_category_label()))
 			markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_AUTO_CATEGORY')}", callback_data=build_call("autoCatMenu")))
 		lines.append(get_text("SETTINGS_AUTO_MOVE_SERIES", auto_move_series_label()))
+		lines.append(get_text("SETTINGS_AUTO_MOVE_SERIES_HELP"))
 		markup.add(toggle_button("auto_move_series", "BUTTON_SETTING_AUTO_MOVE_SERIES", prefix="↳ "))
 		if bot_settings.get("auto_move_series"):
 			markup.add(toggle_button("auto_move_series_external", "BUTTON_SETTING_AUTO_MOVE_SERIES_EXTERNAL", prefix="↳ "))
+			lines.append(get_text("SETTINGS_NEW_SERIES_DIR", new_series_dir_label()))
+			markup.add(InlineKeyboardButton(f"↳ {get_text('BUTTON_SETTING_NEW_SERIES_DIR')}", callback_data=build_call("newSerMenu", 0)))
+		else:
+			# What turning it on brings, the folder for new series included,
+			# which is only shown once it is on
+			lines.append(get_text("SETTINGS_AUTO_MOVE_SERIES_HINT"))
 	else:
 		lines.append(get_text("SETTINGS_ADD_ASKING"))
 	return "\n".join(lines), settings_nav(markup)
@@ -3872,6 +4111,7 @@ def collect_telemetry_metrics():
 		"auto_replace": auto_replace_enabled(),
 		"auto_move_series": auto_move_series_enabled(),
 		"auto_move_series_external": auto_move_series_enabled(external=True),
+		"new_series_dir": auto_move_series_enabled() and bool(bot_settings.get("new_series_dir")),
 		"low_space_warning": bool(bot_settings.get("low_space_warning")),
 		"auto_mover": auto_mover_enabled(),
 		"favorite_dirs": len(bot_settings.get("favorite_dirs") or []),
@@ -4477,30 +4717,72 @@ def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, cat
 	asking (automatic), the folder of its series. With the automatic move on
 	and no doubt about that folder, the torrent goes straight there instead of
 	to download_dir; otherwise it is offered under the message"""
+	return add_with_context(pending, add_context(pending, download_dir, chat_id, thread_id, category, automatic))
+
+
+def add_context(pending, download_dir, chat_id=None, thread_id=None, category=None, automatic=False):
+	"""What an add is for: where it goes and where it is told. It is worked
+	out once, so an add that is retried later goes where it was going to go"""
 	series_title = None
 	previous_dir = None
+	series_new = False
+	series_unknown = False
 	if automatic and not category:
-		series_dir = series_auto_target(pending, current_dir=download_dir)
+		series_dir, series_new = series_auto_target(pending, current_dir=download_dir)
+		# None: the manager did not tell where the series is. An add retried
+		# later works it out again then, instead of going without it
+		series_unknown = series_new is None
+		series_new = bool(series_new)
 		if series_dir:
 			series_title = series_identity(pending_series_name(pending))["title"]
 			previous_dir = download_dir
 			download_dir = series_dir
-	late_add = {"chat_id": chat_id, "thread_id": thread_id, "download_dir": download_dir, "category": category,
-				"automatic": automatic, "series_title": series_title, "previous_dir": previous_dir}
-	torrent = add_torrent_from_bot(late_add=late_add, magnet=pending["magnet"], torrent_data=pending["data"],
-							download_dir=download_dir, category=category or None)
-	return added_message(torrent, **late_add)
+	return {"chat_id": chat_id, "thread_id": thread_id, "download_dir": download_dir, "category": category,
+			"automatic": automatic, "series_title": series_title, "previous_dir": previous_dir, "series_new": series_new,
+			"series_unknown": series_unknown}
+
+
+def add_with_context(pending, context):
+	"""Adds the torrent for what add_context worked out: (text, markup). A
+	new series folder the manager refuses (Download Station cannot create it:
+	no File Station permission, a share that does not exist...) does not lose
+	the add: it goes where it was going to go, telling why"""
+	try:
+		torrent = add_torrent_from_bot(late_add=context, magnet=pending["magnet"], torrent_data=pending["data"],
+								download_dir=context["download_dir"], category=context["category"] or None)
+	except DuplicateTorrentError:
+		if context.get("series_new"):
+			release_new_series_folder(context["download_dir"])
+		raise
+	except TorrentClientError as e:
+		if not (context.get("series_new") and context.get("previous_dir")) or add_failure_is_temporary(e):
+			raise
+		folder = context["download_dir"]
+		release_new_series_folder(folder)
+		warning(f"Cannot add {pending.get('name')} to the new series folder {folder}, adding it to {context['previous_dir']}: {e}")
+		with _bot_adds_lock:
+			# It failed for good: nothing of that add can land late
+			for info_hash in expected_torrent_ids(pending["magnet"], pending["data"]):
+				_late_adds.pop(info_hash, None)
+		context = dict(context, download_dir=context["previous_dir"], series_title=None, previous_dir=None, series_new=False)
+		torrent = add_torrent_from_bot(late_add=context, magnet=pending["magnet"], torrent_data=pending["data"],
+								download_dir=context["download_dir"], category=context["category"] or None)
+		return added_message(torrent, **context, note=get_text("SERIES_NEW_DIR_FAILED", html.escape(folder), html.escape(str(e))))
+	return added_message(torrent, **context)
 
 
 def added_message(torrent, chat_id=None, thread_id=None, download_dir=None, category=None, automatic=False,
-				series_title=None, previous_dir=None):
-	"""The message that tells a torrent the bot added: (text, markup)"""
+				series_title=None, previous_dir=None, series_new=False, series_unknown=False, note=None):
+	"""The message that tells a torrent the bot added: (text, markup). note is
+	a line told right under the first one"""
 	if series_title:
-		count_usage("auto_move_series")
+		count_usage("auto_new_series" if series_new else "auto_move_series")
 	# With a category the directory is not known until the manager has resolved
 	# it, so the one it reports back is the only accurate one
 	download_dir = torrent.download_dir or download_dir or ""
 	lines = [get_text("ADD_OK", html.escape(torrent.name), html.escape(download_dir))]
+	if note:
+		lines.append(note)
 	# A magnet has no size until its metadata arrives
 	if torrent.total_size and torrent.total_size > 0:
 		lines.append(get_text("ADD_OK_SIZE", sizeof_fmt(torrent.total_size)))
@@ -4518,7 +4800,7 @@ def added_message(torrent, chat_id=None, thread_id=None, download_dir=None, cate
 			lines.append(space_warning)
 	block, markup = None, None
 	if series_title:
-		block, markup = series_placed(torrent.id, series_title, previous_dir)
+		block, markup = series_placed(torrent.id, series_title, previous_dir, series_new)
 	elif automatic:
 		block, markup = series_suggestion(torrent, download_dir)
 	text = "\n".join(lines)
@@ -4542,13 +4824,26 @@ def build_low_space_warning(total_size, download_dir):
 
 def handle_late_add(torrent_id, late_add):
 	"""A torrent whose add failed showed up in the manager after all: it is
-	told as the bot's add it was, with its rename and its series folder"""
+	told as the bot's add it was, with its rename and its series folder. When
+	it was waiting in the queue, it leaves it, and the message that said it
+	was queued is the one that tells it was added"""
 	try:
 		torrent = client.get_torrent(torrent_id)
 	except TorrentClientError as e:
 		warning(f"Cannot read the late added torrent {torrent_id}: {e}")
 		return
 	if torrent is None:
+		return
+	queued = queued_adds.find(torrent_id)
+	if queued is not None:
+		# None: the queue worker got to it first and tells it itself
+		item = queued_adds.take(queued["id"])
+		if item is not None:
+			count_usage("late_add")
+			text, markup = added_message(torrent, **item["context"])
+			finish_queued_add(item, text, markup)
+		return
+	if not late_add:
 		return
 	context = {key: value for key, value in late_add.items() if key != "ts"}
 	text, markup = added_message(torrent, **context)
@@ -4572,6 +4867,206 @@ def add_error_text(error):
 	return get_text("ADD_ERROR", html.escape(str(error)))
 
 
+# ---------------------------------------------------------------------------
+# ADD QUEUE
+# ---------------------------------------------------------------------------
+# An add the manager did not answer (it is busy moving terabytes, restarting,
+# down...) is not lost: it waits in CONFIG_PATH/add_queue, which survives a
+# restart, and is sent again, oldest first, until the manager takes it. The
+# message that says it is queued becomes the one that tells how it ended.
+# What the manager refused is not queued: sending it again would not help.
+
+queued_adds = AddQueue(os.path.join(_config_module.CONFIG_PATH, "add_queue"))
+ADD_QUEUE_IDLE_SECONDS = 60  # Seconds between looks at the queue when nothing woke the worker
+
+# What a manager that is not answering looks like in the error of an add
+TEMPORARY_ADD_ERROR = re.compile(
+	r"time ?out|timed out|connect|refused|unreachable|reset by peer|broken pipe|aborted|temporar"
+	r"|unavailable|max retries|name resolution|bad gateway|\b50[234]\b", re.IGNORECASE)
+
+
+def add_failure_is_temporary(error):
+	"""Whether an add failed because the manager did not answer, so trying
+	again later can work. Anything else (a broken file, a refusal...) is
+	final. When the error does not say, the manager is asked something
+	simple: if that fails too, it is the manager that is not answering"""
+	if isinstance(error, PermanentTorrentError):
+		return False
+	if TEMPORARY_ADD_ERROR.search(str(error)):
+		return True
+	try:
+		client.test_connection()
+	except TorrentClientError:
+		return True
+	except Exception:
+		return True
+	return False
+
+
+def add_queued_text(item):
+	text = get_text("ADD_QUEUED", html.escape(item["name"] or "?"), ADD_QUEUE_MAX_AGE // 3600)
+	waiting = len(queued_adds)
+	if waiting > 1:
+		text = f"{text}\n\n{get_text('ADD_QUEUE_COUNT', waiting)}"
+	return text
+
+
+def add_queued_markup(item):
+	markup = InlineKeyboardMarkup()
+	markup.add(InlineKeyboardButton(get_text("BUTTON_ADD_QUEUE_CANCEL"), callback_data=build_call("addQCancel", item["id"])))
+	return markup
+
+
+def add_or_queue(pending, download_dir, chat_id=None, thread_id=None, category=None, automatic=False,
+				message_id=None, manager_down=False):
+	"""Adds the torrent, or queues it when the manager is not answering.
+	Returns (text, markup, item): item is the queued add, None when it was
+	added or failed for good. The message that shows the text is the one
+	that tells how a queued add ends: message_id when it is already known,
+	otherwise the caller gives it with queued_adds.set_message.
+	When the manager has just failed to answer (manager_down, or the queue is
+	waiting after a failure) the add is queued without trying: a try would
+	only keep the conversation waiting for another timeout, and add to the
+	load of the manager. What needs the manager to be worked out (the folder
+	of its series) is then worked out when it is sent"""
+	if manager_down or queued_adds.wait_time() > 0:
+		context = {"chat_id": chat_id, "thread_id": thread_id, "download_dir": download_dir, "category": category,
+				"automatic": automatic, "series_title": None, "previous_dir": None}
+		return queue_add(pending, context, time.time(), message_id, "the manager has just failed to answer", resolve=True)
+	context = add_context(pending, download_dir, chat_id, thread_id, category, automatic)
+	started = time.time()
+	try:
+		text, markup = add_with_context(pending, context)
+	except TorrentClientError as e:
+		if not add_failure_is_temporary(e):
+			return add_error_text(e), None, None
+		# Where its series is could not be told either: it is looked for again
+		# when the add is sent, instead of going without it
+		return queue_add(pending, context, started, message_id, e, failure=e, resolve=bool(context.get("series_unknown")))
+	if len(queued_adds):
+		queued_adds.succeeded()  # The manager answers again: the queue goes now
+	return text, markup, None
+
+
+def queue_add(pending, context, started, message_id, reason, failure=None, resolve=False):
+	"""Puts an add in the queue: (text, markup, item) for add_or_queue"""
+	try:
+		item = queued_adds.put(pending.get("name"), pending.get("magnet"), pending.get("data"),
+							expected_torrent_ids(pending.get("magnet"), pending.get("data")),
+							context, started=started, resolve=resolve)
+	except OSError as write_error:
+		error(f"Cannot queue {pending.get('name')}: {write_error}")
+		if failure is not None:
+			return add_error_text(failure), None, None
+		return get_text("ADD_ERROR", html.escape(str(write_error))), None, None
+	warning(f"{pending.get('name')} waits in the add queue: {reason}")
+	count_usage("add_queued")
+	if message_id is not None:
+		queued_adds.set_message(item["id"], message_id)
+	return add_queued_text(item), add_queued_markup(item), item
+
+
+def finish_queued_add(item, text, markup=None):
+	"""Tells how a queued add ended, on the message that said it was queued
+	when it can still be changed, in a new one otherwise"""
+	context = item["context"]
+	if item.get("message_id") and context.get("chat_id") is not None:
+		if edit_message(context["chat_id"], item["message_id"], text, markup) is not None:
+			return
+	notify(text, context.get("chat_id"), context.get("thread_id"), reply_markup=markup)
+
+
+def queued_duplicate(item, duplicate):
+	"""What a retry the manager answers with "already there" means. Often the
+	try that did not get an answer had in fact added it: it is the add, told
+	as such. A torrent that was there before the first try is a duplicate"""
+	torrent = None
+	if duplicate.torrent_id:
+		try:
+			torrent = client.get_torrent(duplicate.torrent_id)
+		except TorrentClientError:
+			pass
+	with _bot_adds_lock:
+		ours = False
+		for torrent_id in set(item["ids"]) | ({str(duplicate.torrent_id).lower()} if duplicate.torrent_id else set()):
+			ours = pop_late_add(torrent_id) is not None or ours
+	started = item.get("started") or item["created"]
+	if torrent is not None and (ours or added_timestamp(torrent.added_date) >= started - 5):
+		# The bot's own add: the monitor must not tell it again as external
+		with _bot_adds_lock:
+			_bot_added_ids[str(torrent.id)] = time.time()
+		return added_message(torrent, **item["context"])
+	return add_error_text(duplicate), None
+
+
+def run_queued_add(item):
+	"""One try at a queued add. False when the manager still does not answer"""
+	name = html.escape(item["name"] or "?")
+	# From here on it cannot be cancelled: what the user is told has to be true
+	if not queued_adds.begin(item["id"]):
+		return True
+	try:
+		context = item["context"]
+		data = queued_adds.data(item["id"]) if item["has_data"] else None
+		if item["has_data"] and data is None:
+			queued_adds.end(item["id"])
+			if queued_adds.take(item["id"]) is not None:
+				error(f"The queued .torrent of {item['name']} is gone")
+				finish_queued_add(item, get_text("ADD_QUEUE_FILE_GONE", name))
+			return True
+		pending = {"name": item["name"], "magnet": item["magnet"], "data": data}
+		if item.get("resolve"):
+			# Queued without trying: what needed the manager is worked out now
+			context = add_context(pending, context["download_dir"], context["chat_id"], context["thread_id"],
+								context["category"], context["automatic"])
+			item = dict(item, context=context)
+		try:
+			text, markup = add_with_context(pending, context)
+		except DuplicateTorrentError as e:
+			if queued_adds.get(item["id"]) is None:
+				return True  # Seen landing by the monitor, which told it
+			text, markup = queued_duplicate(item, e)
+		except TorrentClientError as e:
+			if add_failure_is_temporary(e):
+				delay = queued_adds.failed()
+				warning(f"The manager still does not answer, next try of the add queue in {delay} s: {e}")
+				return False
+			# The message said which torrent was waiting: so does its error
+			text, markup = get_text("ADD_QUEUE_FAILED", name, html.escape(str(e))), None
+	finally:
+		queued_adds.end(item["id"])
+	queued_adds.succeeded()
+	if queued_adds.take(item["id"]) is not None:
+		count_usage("add_queue_done")
+		finish_queued_add(item, text, markup)
+	return True
+
+
+def process_add_queue():
+	"""Sends what is queued, oldest first, while the manager takes it. An add
+	that has waited too long is given up and told"""
+	for item in queued_adds.items():
+		if time.time() - item["created"] > ADD_QUEUE_MAX_AGE:
+			if queued_adds.take(item["id"]) is not None:
+				warning(f"Giving up on the queued add of {item['name']}: the manager did not take it in time")
+				count_usage("add_queue_gave_up")
+				finish_queued_add(item, get_text("ADD_QUEUE_GAVE_UP", html.escape(item["name"] or "?"), ADD_QUEUE_MAX_AGE // 3600))
+			continue
+		if queued_adds.wait_time() > 0:
+			return
+		if not run_queued_add(item):
+			return
+
+
+def add_queue_worker():
+	while True:
+		try:
+			process_add_queue()
+		except Exception as e:
+			warning(f"Add queue: {e}")
+		queued_adds.wait(queued_adds.wait_time() or ADD_QUEUE_IDLE_SECONDS)
+
+
 def do_add_torrent(chat_id, message_id, pending_id, download_dir, thread_id=None, category=None):
 	pending = pop_pending_torrent(pending_id)
 	if pending is None:
@@ -4582,11 +5077,8 @@ def do_add_torrent(chat_id, message_id, pending_id, download_dir, thread_id=None
 	try:
 		# The folder buttons (and cancel) go away while the manager takes it
 		edit_message(chat_id, message_id, "⏳")
-		try:
-			text, _markup = perform_add_torrent(pending, download_dir, chat_id, thread_id, category)
-		except TorrentClientError as e:
-			text = add_error_text(e)
-		edit_message(chat_id, message_id, text)
+		text, markup, _item = add_or_queue(pending, download_dir, chat_id, thread_id, category, message_id=message_id)
+		edit_message(chat_id, message_id, text, markup)
 	finally:
 		with _contexts_lock:
 			_adding.discard(pending_id)
@@ -4598,14 +5090,22 @@ def start_add_flow(chat_id, name, magnet=None, data=None, thread_id=None):
 	if bot_settings.get("auto_download"):
 		category = auto_category()
 		download_dir = bot_settings.get("auto_download_dir")
-		try:
-			if not category and not download_dir:
+		manager_down = False
+		if not category and not download_dir and not queued_adds.wait_time():
+			try:
 				download_dir = client.get_default_download_dir()
-			text, markup = perform_add_torrent({"name": name, "magnet": magnet, "data": data},
-									download_dir, chat_id, thread_id, category, automatic=True)
-		except TorrentClientError as e:
-			text, markup = add_error_text(e), None
-		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+			except TorrentClientError as e:
+				# Not worth losing the add over: without a folder the manager
+				# puts it in its own default one all the same. A manager that
+				# does not answer this would not answer the add either
+				warning(f"Cannot get the default download dir, adding without one: {e}")
+				download_dir = None
+				manager_down = add_failure_is_temporary(e)
+		text, markup, item = add_or_queue({"name": name, "magnet": magnet, "data": data},
+								download_dir, chat_id, thread_id, category, automatic=True, manager_down=manager_down)
+		sent = send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
+		if item is not None and sent:
+			queued_adds.set_message(item["id"], sent.message_id)
 		return
 	pending_id = new_pending_torrent(name, magnet=magnet, data=data)
 	if get_known_categories():
@@ -4727,6 +5227,41 @@ def torrent_data_name(data):
 		return None
 	start = match.end()
 	return data[start:start + int(match.group(1))].decode("utf-8", errors="replace") or None
+
+
+def torrent_data_files(data):
+	"""The paths of the files inside a .torrent file, or None without one (a
+	magnet) or when it cannot be read"""
+	if not data:
+		return None
+	try:
+		start = data.index(b"4:info") + len(b"4:info")
+		info = _bdecode(data, start)[0]
+		if b"files" in info:
+			return ["/".join(part.decode("utf-8", "replace") for part in entry[b"path"]) for entry in info[b"files"]]
+		return [info[b"name"].decode("utf-8", "replace")]
+	except (ValueError, KeyError, TypeError, IndexError, AttributeError, RecursionError):
+		return None
+
+
+def _bdecode(data, start):
+	"""(value, end) of the bencoded value at start"""
+	kind = data[start:start + 1]
+	if kind == b"i":
+		end = data.index(b"e", start)
+		return int(data[start + 1:end]), end + 1
+	if kind in (b"l", b"d"):
+		items, position = [], start + 1
+		while data[position:position + 1] != b"e":
+			if position >= len(data):
+				raise ValueError("unterminated")
+			value, position = _bdecode(data, position)
+			items.append(value)
+		if kind == b"l":
+			return items, position + 1
+		return dict(zip(items[::2], items[1::2])), position + 1
+	end = _bencode_end(data, start)
+	return data[data.index(b":", start) + 1:end], end
 
 
 def _bencode_end(data, start):
@@ -5167,13 +5702,21 @@ def handle_pending_input(message, pending):
 		if pending_torrent is None:
 			send_message(chat_id, get_text("ADD_EXPIRED"), reply_markup=back_markup, thread_id=thread_id)
 			return
-		try:
-			result, _markup = perform_add_torrent(pending_torrent, text, chat_id, thread_id)
-		except TorrentClientError as e:
-			result = add_error_text(e)
-		send_message(chat_id, result, reply_markup=back_markup, thread_id=thread_id)
+		result, markup, item = add_or_queue(pending_torrent, text, chat_id, thread_id)
+		sent = send_message(chat_id, result, reply_markup=markup if item is not None else back_markup, thread_id=thread_id)
+		if item is not None and sent:
+			queued_adds.set_message(item["id"], sent.message_id)
 	elif action == "autoDir":
 		bot_settings.set("auto_download_dir", text.rstrip("/") or "/")
+		send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"), screen="add")
+	elif action == "newSerDir":
+		new_dir = text.rstrip("/") or "/"
+		problem = new_series_dir_problem(new_dir)
+		if problem:
+			warning_text, warning_markup = new_series_dir_warning(new_dir, problem)
+			send_message(chat_id, warning_text, reply_markup=warning_markup, thread_id=thread_id)
+			return
+		bot_settings.set("new_series_dir", new_dir)
 		send_settings_menu(chat_id, thread_id=thread_id, prefix=get_text("SETTINGS_UPDATED"), screen="add")
 	elif action == "favDir":
 		directory = text.rstrip("/") or "/"
@@ -5819,6 +6362,8 @@ def handle_callback(call):
 		tooltip = get_text("INPUT_CANCELLED")
 	elif command == "cancelAdd":
 		tooltip = get_text("ADD_CANCELLED")
+	elif command == "addQCancel" and queued_adds.is_busy(call.data.split("|")[1] if "|" in call.data else ""):
+		tooltip = get_text("ADD_QUEUE_BUSY")
 	elif command == "reannounce":
 		tooltip = get_text("REANNOUNCED")
 	try:
@@ -6359,6 +6904,18 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 				ask_for_input(chat_id, user_id, "addDir", prompt, thread_id=thread_id, message_id=message_id, pending_id=pending_id,
 							back_call=build_call("dashboard"))
 
+		elif command == "addQCancel":
+			item = queued_adds.cancel(args[0])
+			if isinstance(item, dict):
+				# A try that timed out may still land: it is not the bot's add
+				# to tell any more
+				with _bot_adds_lock:
+					for torrent_id in item["ids"]:
+						pop_late_add(torrent_id)
+				edit_message(chat_id, message_id, get_text("ADD_QUEUE_CANCELLED", html.escape(item["name"] or "?")))
+			# "busy": being sent right now, its result is about to land on this
+			# message. None: it ended already, and this message tells how
+
 		elif command == "cancelAdd":
 			# Gone already means the folder was chosen and the add is under way:
 			# its result is about to land on this message, and a dashboard
@@ -6597,6 +7154,40 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 			ask_for_input(chat_id, user_id, "autoDir", get_text("MOVE_NEW_DIR_ASK"), thread_id=thread_id, message_id=message_id,
 						back_call=settings_call("add"))
 
+		elif command == "newSerMenu":
+			markup = build_dir_markup(
+				dir_call=lambda dir_id: build_call("newSerSet", dir_id),
+				write_call=build_call("newSerNew"),
+				cancel_call=settings_call("add"),
+				page_parts=("newSerMenu",),
+				page=int(args[0]) if args else 0,
+				suggested=series_parent_dirs(),
+			)
+			markup.keyboard.insert(0, [InlineKeyboardButton(get_text("BUTTON_NEW_SERIES_DIR_NONE"), callback_data=build_call("newSerNone"))])
+			text = f"{get_text('NEW_SERIES_DIR_ASK')}\n\n{get_text('NEW_SERIES_DIR_CURRENT', new_series_dir_label())}"
+			if any(button.text.startswith("✨") for row in markup.keyboard for button in row):
+				text += f"\n{get_text('NEW_SERIES_DIR_SUGGESTED')}"
+			edit_message(chat_id, message_id, text, markup)
+
+		elif command in ("newSerSet", "newSerForce"):
+			new_dir = get_dir_by_id(args[0])
+			if new_dir is None:
+				render_settings(chat_id, message_id, "add")
+			elif command == "newSerSet" and new_series_dir_problem(new_dir):
+				text, markup = new_series_dir_warning(new_dir, new_series_dir_problem(new_dir))
+				edit_message(chat_id, message_id, text, markup)
+			else:
+				bot_settings.set("new_series_dir", new_dir.rstrip("/") or "/")
+				render_settings(chat_id, message_id, "add")
+
+		elif command == "newSerNone":
+			bot_settings.set("new_series_dir", "")
+			render_settings(chat_id, message_id, "add")
+
+		elif command == "newSerNew":
+			ask_for_input(chat_id, user_id, "newSerDir", get_text("MOVE_NEW_DIR_ASK"), thread_id=thread_id, message_id=message_id,
+						back_call=settings_call("add"))
+
 		elif command == "autoCatMenu":
 			markup = build_category_markup(
 				cat_call=lambda cat_id: build_call("autoCatSet", cat_id),
@@ -6739,9 +7330,9 @@ def handle_external_torrent(torrent_id):
 	lines = [get_text("NOTIFY_EXTERNAL_ADDED", html.escape(torrent.name), html.escape(torrent.download_dir or ""))]
 	if torrent.total_size and torrent.total_size > 0:
 		lines.append(get_text("ADD_OK_SIZE", sizeof_fmt(torrent.total_size)))
-	block, markup, target = None, None, None
+	block, markup, target, new = None, None, None, False
 	if (bot_settings.get("notify_external_added") or auto_move_series_enabled(external=True)) and not torrent.auto_managed:
-		target = external_series_target(torrent)
+		target, new = external_series_target(torrent)
 		if target is None and bot_settings.get("notify_external_added"):
 			block, markup = series_suggestion(torrent, torrent.download_dir or "")
 	renamed = []
@@ -6758,7 +7349,7 @@ def handle_external_torrent(torrent_id):
 		count_usage("auto_notify_external")
 		text = "\n".join(lines + renamed)
 		if target:
-			move_external_to_series(torrent, text, target)
+			move_external_to_series(torrent, text, target, new)
 			return
 		if block:
 			text = f"{text}\n\n{block}"
@@ -6767,14 +7358,15 @@ def handle_external_torrent(torrent_id):
 
 def external_series_target(torrent):
 	"""The folder of its series a torrent the bot did not add goes to with
-	the automatic move on, or None"""
+	the automatic move on, as (folder, new), see series_target"""
 	current_dir = torrent.download_dir or ""
 	if not (auto_move_series_enabled(external=True) and current_dir):
-		return None
-	return series_auto_dir(series_candidates(torrent.name, exclude_id=torrent.id, current_dir=current_dir))
+		return None, False
+	files = [path for path, _size, _done in torrent.files] if torrent.files else None
+	return series_target(torrent.name, exclude_id=torrent.id, current_dir=current_dir, files=files)
 
 
-def move_external_to_series(torrent, text, target):
+def move_external_to_series(torrent, text, target, new=False):
 	"""Moves a torrent the bot did not add to the folder of its series. It is
 	already in the manager, so this really moves its data, which can take
 	long: the notice goes out at once saying where it is going, and the move
@@ -6782,11 +7374,11 @@ def move_external_to_series(torrent, text, target):
 	updates the notice with where it ended up. Done inline, the monitor
 	waited for the move, and a timeout was told as the torrent staying where
 	it was while the manager went on moving it"""
-	count_usage("auto_move_series")
+	count_usage("auto_new_series" if new else "auto_move_series")
 	chat_id = TELEGRAM_GROUP if TELEGRAM_GROUP else ADMIN_IDS[0]
 	progress_text = f"{text}\n\n{get_text('SERIES_MOVING', html.escape(target))}"
 	sent = notify(progress_text)
-	placed_block, placed_markup = series_placed(torrent.id, series_identity(torrent.name)["title"], torrent.download_dir or "")
+	placed_block, placed_markup = series_placed(torrent.id, series_identity(torrent.name)["title"], torrent.download_dir or "", new)
 	deliver_move_order(chat_id, [torrent.id], target, progress_text, f"{with_dir_line(text, target)}\n\n{placed_block}",
 					message_id=sent.message_id if sent else None, thread_id=TELEGRAM_THREAD, reply_markup=placed_markup,
 					wrap=lambda failure: f"{text}\n\n{failure}", failure_markup=None)
@@ -6833,6 +7425,8 @@ def poll_torrents(states):
 				if _bot_added_ids.pop(torrent_id, None) is not None:
 					continue
 				late_add = pop_late_add(torrent_id)
+				if late_add is None and queued_adds.find(torrent_id) is not None:
+					late_add = {}  # Its queued add has what it was for
 				if late_add is not None:
 					late[torrent_id] = late_add
 				elif watch:
@@ -6926,6 +7520,7 @@ if __name__ == "__main__":
 	send_startup_message()
 	mover_close_lost_notice()
 	threading.Thread(target=torrent_monitor, daemon=True).start()
+	threading.Thread(target=add_queue_worker, daemon=True).start()
 	if TELEMETRY_DEBUG:
 		warning(f"TELEMETRY_DEBUG is on: statistics go to {TELEMETRY_ENDPOINT} a minute after every start")
 	telemetry_client.start()

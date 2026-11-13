@@ -21,6 +21,7 @@ Control your torrent client from a single place.
 - ✅ Torrent list with filters (downloading, seeding, paused, completed, with errors...) and pagination, sortable by date, name, size, progress, ratio, speed or last activity
 - ✅ Search torrents by name or by path
 - ✅ Add torrents by sending a `.torrent` file, a magnet link or a URL to a `.torrent` file, choosing the download directory
+- ✅ Add queue: when the manager does not answer (busy moving data, restarting...), what you send waits in a queue that survives a restart of the bot and is added on its own as soon as the manager answers
 - ✅ Pause, resume, verify, reannounce to the tracker and delete torrents (with or without their data)
 - ✅ Move torrents to another directory with a notice when the move finishes
 - ✅ Per torrent limits: up to which ratio each one seeds (the manager's, no limit, 0.5, 1, 2 or any other value) and its download and upload speed, and the manager's own ratio from the settings
@@ -38,7 +39,7 @@ Control your torrent client from a single place.
 - ✅ Automatic download without asking for the path, with a configurable directory
 - ✅ Automatic rename when adding a torrent, optionally including the subfolders and files it contains and the torrents added outside the bot (can be toggled from the settings)
 - ✅ Replace a previous copy: when the name a download should take already belongs to another torrent, on completion it offers to delete the old one (with its data) and keep the new one, or does it without asking if you turn that on
-- ✅ Series folder: a new episode is offered (or sent straight, if you turn it on) to the folder where the previous ones already are
+- ✅ Series folder: a new episode is offered (or sent straight, if you turn it on) to the folder where the previous ones already are, and a new series can get a folder of its own
 - ✅ Automatic mover: when the download folder runs out of space, it moves the oldest torrents to another folder with the same layout (for example from an SSD to the disks)
 - ✅ Warning if the torrent you add may not fit on the disk
 - ✅ Bot settings persist across restarts (`/config` volume)
@@ -151,7 +152,8 @@ When an episode or a season pack arrives, the bot looks among the torrents in th
 
 - **When picking the folder** (adding or moving a torrent), the series folder comes first, marked with ✨, however many favorites you have.
 - **With automatic download**, the torrent added message ends with a 💡 that offers the folder, with buttons to move it or dismiss it. Moving it edits that same message so it shows the new folder.
-- **With "Series straight to their folder"** (under automatic download, off by default), when there is no doubt the torrent is added straight into the series folder instead of the automatic one, and the message carries an ↩️ Undo button. It only happens when there is a single folder named after the series; in doubt (two possible folders, or a shared one such as `/media/series`) it is offered instead of decided for you. It can also apply to torrents added outside the bot, which are then really moved, since they are already in the manager.
+- **With "Episodes to their series folder"** (under automatic download, off by default), the bot looks in the manager for other episodes of the same series and, when there is no doubt the torrent is added straight into the series folder instead of the automatic one, and the message carries an ↩️ Undo button. It only happens when there is a single folder named after the series; in doubt (two possible folders, or a shared one such as `/media/series`) it is offered instead of decided for you. It can also apply to torrents added outside the bot, which are then really moved, since they are already in the manager.
+- **With "Folder for new series"** (right under it, unset by default), a series with no other episode of it in the manager goes to a folder named after it inside the one you pick: with `/ssd/SERIES`, the first episode of *The Bear* is downloaded into `/ssd/SERIES/The Bear` (or `Doctor Who (2005)` when the name carries a year), and the next ones find it as the series folder. It only applies when the torrent was going to stay in the default download folder or the automatic one; when there is any doubt about where the series is, or the manager does not answer while looking, you are asked as always. If you remove from the manager the torrents of a series you already have on disk, the bot cannot know it exists: the folder it creates takes the name it reads from the torrent (with the year, when there is one), so it is worth matching yours. If you pick the folder of one series (`/ssd/SERIES/Chicago Fire`) as the folder for new series, the bot warns you before saving it. It also warns when you pick the folder everything is downloaded to, and it offers (✨) the folders where you already keep your series. If the manager cannot create the new folder (Download Station needs File Station permission), the torrent is downloaded where it was going to go and the message says why. A torrent named like a series but with no video inside, such as a soundtrack, gets no folder.
 
 If you keep seasons in subfolders (`Mad Men/Season 01`), an episode of the next season is offered `Mad Men/Season 02` with the same format, even if that folder does not exist yet. The default download folder and the automatic download one are never offered unless they are named after the series. An auto managed qBittorrent torrent is left alone: its category decides the folder.
 
@@ -174,7 +176,7 @@ It is built not to surprise:
 - Torrents that share the same data (the same name in the same folder, as cross-seeding leaves them) are always moved together.
 - Torrents that are unfinished, being checked or with an error in their data are left alone (a tracker that does not answer does not count), and so are the qBittorrent ones under automatic management, whose folder is decided by their category.
 
-Transmission answers nothing while it moves data between disks: during a big move the bot will show connection errors until it is done, and the notice of the mover is updated then.
+Transmission answers nothing while it moves data between disks: during a big move the bot will show connection errors until it is done, and the notice of the mover is updated then. Whatever you send meanwhile waits in the queue and is added once it is done.
 
 The free space is asked to the manager, so the bot does not need the disks mounted. qBittorrent only knows it for its default download folder: the source has to be that folder or be inside it, and the screen warns when it is not.
 

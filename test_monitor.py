@@ -854,6 +854,370 @@ for broken in (b"", b"not a torrent", b"d4:info", b"d4:infod1:ai1e", b"d99999:x"
 	check(f"a broken .torrent {broken!r} has no hash", bot.torrent_data_hash(broken), None)
 
 # ---------------------------------------------------------------------------
+# 7c. THE ADD QUEUE: the manager does not answer, the add waits and goes later
+# ---------------------------------------------------------------------------
+
+# A Transmission busy moving terabytes times out every add. The add must not be
+# lost: it waits in CONFIG_PATH/add_queue (which survives a restart) and is sent
+# again until the manager takes it, and the message that said it was queued is
+# the one that tells how it ended. What the manager refuses is not queued.
+
+from add_queue import AddQueue, RETRY_DELAYS
+
+QUEUE = bot.queued_adds
+QUEUE_DIR = QUEUE.path
+QUEUED_TEXT = bot.get_text("ADD_QUEUED", "", 0).split("<b>")[0]
+QUEUE_HASH = "d22fe1c06bba254a9dc9f519b335aa7c1367a88b"
+QUEUE_MAGNET = f"magnet:?xt=urn:btih:{QUEUE_HASH}&dn=Queued.Movie"
+SENT = []  # (chat_id, text, markup) of the messages the add flows send
+_message_ids = itertools.count(500)
+
+
+class _Sent:
+	def __init__(self):
+		self.message_id = next(_message_ids)
+
+
+def _send(chat_id, text, reply_markup=None, thread_id=None):
+	SENT.append((chat_id, text, reply_markup))
+	return _Sent()
+
+
+_real_send = bot.send_message
+bot.send_message = _send
+
+
+def empty_queue():
+	for item in QUEUE.items():
+		QUEUE.take(item["id"])
+	QUEUE.succeeded()
+	QUEUE._busy.clear()
+	SENT.clear()
+	EDITS.clear()
+
+
+def queue_files():
+	return sorted(os.listdir(QUEUE_DIR)) if os.path.isdir(QUEUE_DIR) else []
+
+
+def _timeout():
+	raise TorrentClientError("Error adding torrent: timeout when connection to transmission daemon")
+
+
+def _refused():
+	raise TorrentClientError("Error adding torrent: invalid or corrupt torrent file")
+
+
+def pending(magnet_link=QUEUE_MAGNET, data=None, name="Queued.Movie"):
+	return {"name": name, "magnet": magnet_link, "data": data}
+
+
+def ready():
+	"""The pause after a failure is over: the next look at the queue tries"""
+	QUEUE._next_try = 0.0
+
+
+def button_calls(markup):
+	return [b.callback_data for row in (markup.keyboard if markup else []) for b in row]
+
+
+# A timeout queues it, with the cancel button, and leaves it on disk
+fresh()
+empty_queue()
+CLIENT.on_add = _timeout
+text, markup, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, thread_id=7)
+check("a timed out add is queued", item is not None, True)
+check("and says so", text.startswith(QUEUED_TEXT), True)
+check("naming the torrent", "<b>Queued.Movie</b>" in text, True)
+check("with a button to drop it", button_calls(markup), [f"addQCancel|{item['id']}"])
+check("it is kept on disk", queue_files(), [f"{item['id']}.json"])
+check("with what it is for", (item["context"]["chat_id"], item["context"]["thread_id"], item["context"]["download_dir"]),
+	(55, 7, "/downloads"))
+check("and the info hash to recognise it by", item["ids"], [QUEUE_HASH])
+check("and is not tried again straight away", QUEUE.wait_time() > RETRY_DELAYS[0] - 5, True)
+CLIENT.calls.clear()
+bot.process_add_queue()
+check("while the manager is left alone nothing is tried", [c for c in CLIENT.calls if c[0] == "add_torrent"], [])
+
+# A second one says how many wait
+text2, _m, item2 = bot.add_or_queue(pending(magnet_link="magnet:?xt=urn:btih:" + "e" * 40, name="Second"), "/downloads", chat_id=55)
+check("a second queued add says how many wait", bot.get_text("ADD_QUEUE_COUNT", 2) in text2, True)
+check("and the first one does not", bot.get_text("ADD_QUEUE_COUNT", 1) in text, False)
+
+# A restart reads them back, oldest first, the .torrent content included
+torrent_bytes = b"d4:infod6:lengthi5e4:name4:File12:piece lengthi16384e6:pieces20:" + b"y" * 20 + b"ee"
+text3, _m, item3 = bot.add_or_queue(pending(magnet_link=None, data=torrent_bytes, name="File"), "/downloads", chat_id=55)
+check("a .torrent is kept with its content", f"{item3['id']}.torrent" in queue_files(), True)
+with open(os.path.join(QUEUE_DIR, "orphan.torrent"), "wb") as orphan:
+	orphan.write(b"x")
+with open(os.path.join(QUEUE_DIR, "broken.json"), "w") as broken_file:
+	broken_file.write("{not json")
+restarted = AddQueue(QUEUE_DIR)
+check("after a restart the queue is still there, oldest first", [i["name"] for i in restarted.items()],
+	["Queued.Movie", "Second", "File"])
+check("with the content of the .torrent", restarted.data(item3["id"]), torrent_bytes)
+check("a .torrent left without its .json is cleaned up", "orphan.torrent" in os.listdir(QUEUE_DIR), False)
+os.remove(os.path.join(QUEUE_DIR, "broken.json"))
+check("a broken file does not take the rest down", len(restarted), 3)
+
+# The manager still does not answer: it waits longer each time
+ready()
+CLIENT.calls.clear()
+bot.process_add_queue()
+check("a retry is made once the pause is over", [c[0] for c in CLIENT.calls if c[0] == "add_torrent"], ["add_torrent"])
+check("only for the oldest: the manager is still not answering", len(QUEUE), 3)
+first_wait = QUEUE.wait_time()
+ready()
+bot.process_add_queue()
+check("each failure in a row waits longer", QUEUE.wait_time() > first_wait + 10, True)
+check("nothing was told meanwhile", (EDITS, NOTIFIED), ([], []))
+
+# It answers again: everything goes, in order, and each message tells its add
+added = {}
+
+
+def _add_from_calls():
+	call = CLIENT.calls[-1]
+	torrent = movie(name=f"Added.{len(added)}.mkv")
+	added[call[1] or "data"] = torrent
+	return CLIENT.put(torrent)
+
+
+CLIENT.on_add = _add_from_calls
+QUEUE.set_message(item["id"], 900)
+ready()
+CLIENT.calls.clear()
+bot.process_add_queue()
+check("once the manager answers, all of them go, oldest first",
+	[c[1] for c in CLIENT.calls if c[0] == "add_torrent"], [QUEUE_MAGNET, "magnet:?xt=urn:btih:" + "e" * 40, None])
+check("the queue is left empty", (len(QUEUE), queue_files()), (0, []))
+check("each one to where it was going", {c[2] for c in CLIENT.calls if c[0] == "add_torrent"}, {"/downloads"})
+check("the queued message turns into the add message", EDITS[0][0].startswith(bot.get_text("ADD_OK", "Added.0.mkv", "/downloads")), True)
+check("the ones without a message are told in a new one", [n[1] for n in NOTIFIED], [55, 55])
+check("and the manager is not left alone any more", QUEUE.wait_time(), 0)
+
+# What the manager refuses is final, not queued
+fresh()
+empty_queue()
+CLIENT.on_add = _refused
+text, markup, item = bot.add_or_queue(pending(), "/downloads", chat_id=55)
+check("a refused add is not queued", (item, len(QUEUE)), (None, 0))
+check("and tells the error as before", text, bot.get_text("ADD_ERROR", bot.html.escape("Error adding torrent: invalid or corrupt torrent file")))
+
+
+def _duplicate():
+	raise bot.DuplicateTorrentError("already there", torrent_id=QUEUE_HASH)
+
+
+CLIENT.on_add = _duplicate
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55)
+check("a duplicate is not queued", (item, len(QUEUE)), (None, 0))
+
+# An error that does not say: the manager is asked something simple
+CLIENT.on_add = lambda: (_ for _ in ()).throw(TorrentClientError("Error adding torrent: something odd"))
+_real_test_connection = CLIENT.test_connection
+CLIENT.test_connection = lambda: (_ for _ in ()).throw(TorrentClientError("Cannot connect"))
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55)
+check("an unclear error with the manager not answering is queued", item is not None, True)
+CLIENT.test_connection = _real_test_connection
+empty_queue()
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55)
+check("an unclear error with the manager answering is final", item, None)
+check("and told as an error", text.startswith(bot.get_text("ADD_ERROR", "").split("<code>")[0]), True)
+
+# The try that timed out had in fact added it, and the monitor sees it land
+fresh(notify_external=True, auto_rename=True)
+empty_queue()
+states = poll(None)
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, thread_id=7, message_id=901)
+landed = CLIENT.put(movie(torrent_id=QUEUE_HASH))
+states = poll(states)
+check("a queued torrent that lands is not taken for external", count_external(), 0)
+check("it leaves the queue", (len(QUEUE), queue_files()), (0, []))
+check("the queued message tells the add", EDITS[-1][0].startswith(bot.get_text("ADD_OK", bot.html.escape(MOVIE_NAME), "/downloads")), True)
+check("with the rename of an add", bot.get_text("ADD_AUTO_RENAMED", MOVIE_RENAMED) in EDITS[-1][0], True)
+check("and nothing else is sent", NOTIFIED, [])
+ready()
+CLIENT.calls.clear()
+bot.process_add_queue()
+check("nor sent again", [c for c in CLIENT.calls if c[0] == "add_torrent"], [])
+
+# The same, after a restart: no late add in memory, only the queue knows it
+fresh(notify_external=True)
+empty_queue()
+states = poll(None)
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=902)
+bot._late_adds.clear()
+CLIENT.put(movie(torrent_id=QUEUE_HASH))
+states = poll(states)
+check("after a restart the landed one is still the queued add", (count_external(), len(QUEUE)), (0, 0))
+check("told on its message", EDITS[-1][0].startswith(bot.get_text("ADD_OK", bot.html.escape(MOVIE_NAME), "/downloads")), True)
+
+# A retry answered with "already there": the earlier try had added it
+fresh()
+empty_queue()
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=903)
+bot._late_adds.clear()  # As after a restart
+CLIENT.put(movie(torrent_id=QUEUE_HASH)).added_date = time.time()
+CLIENT.on_add = _duplicate
+ready()
+bot.process_add_queue()
+check("a retry that finds it added since the first try tells the add", EDITS[-1][0].startswith(bot.get_text("ADD_OK", bot.html.escape(MOVIE_NAME), "/downloads")), True)
+check("and the queue is empty", len(QUEUE), 0)
+
+# ...but one that was there before the first try is a duplicate
+fresh()
+empty_queue()
+CLIENT.put(movie(torrent_id=QUEUE_HASH)).added_date = time.time() - 3600
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=904)
+bot._late_adds.clear()
+CLIENT.on_add = _duplicate
+ready()
+bot.process_add_queue()
+check("a torrent that was there before is told as a duplicate", EDITS[-1][0], bot.get_text("ADD_DUPLICATE", bot.html.escape(MOVIE_NAME)))
+
+# Too long waiting: given up, told, and its files deleted
+fresh()
+empty_queue()
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=905)
+QUEUE._items[item["id"]]["created"] -= bot.ADD_QUEUE_MAX_AGE + 1
+CLIENT.calls.clear()
+bot.process_add_queue()
+check("an add waiting too long is given up", (len(QUEUE), queue_files()), (0, []))
+check("and told on its message", EDITS[-1][0], bot.get_text("ADD_QUEUE_GAVE_UP", "Queued.Movie", bot.ADD_QUEUE_MAX_AGE // 3600))
+check("without trying it once more", [c for c in CLIENT.calls if c[0] == "add_torrent"], [])
+
+# The message cannot be changed any more: told in a new one
+fresh()
+empty_queue()
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, thread_id=7, message_id=906)
+_real_edit = bot.bot.edit_message_text
+bot.bot.edit_message_text = lambda *a, **k: (_ for _ in ()).throw(Exception("message to edit not found"))
+CLIENT.on_add = lambda: CLIENT.put(movie())
+ready()
+bot.process_add_queue()
+bot.bot.edit_message_text = _real_edit
+check("a result that cannot go on its message goes in a new one", [n[1:] for n in NOTIFIED], [(55, 7)])
+
+# Cancelled from its button, unless it is being sent right now
+fresh()
+empty_queue()
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=907)
+QUEUE.begin(item["id"])
+check("an add being sent cannot be dropped", QUEUE.cancel(item["id"]), "busy")
+QUEUE.end(item["id"])
+check("otherwise it is", QUEUE.cancel(item["id"])["id"], item["id"])
+check("and its files go", queue_files(), [])
+check("dropping it twice does nothing", QUEUE.cancel(item["id"]), None)
+check("a dropped add is never sent", QUEUE.begin(item["id"]), False)
+
+# The user drops it from its button: a try that timed out may still land,
+# and it is no longer the bot's add to tell
+fresh(notify_external=True)
+empty_queue()
+states = poll(None)
+CLIENT.on_add = _timeout
+text, markup, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=908)
+call = type("Call", (), {})()
+call.id, call.data = "x", f"addQCancel|{item['id']}"
+call.from_user = type("U", (), {"id": int(bot.ADMIN_IDS[0])})()
+call.message = type("M", (), {"chat": type("C", (), {"id": 55})(), "message_id": 908, "message_thread_id": None, "is_topic_message": False})()
+bot.bot.answer_callback_query = lambda *a, **k: None
+bot.handle_callback(call)
+check("the message says it was cancelled", EDITS[-1][0], bot.get_text("ADD_QUEUE_CANCELLED", "Queued.Movie"))
+check("and nothing is watched for any more", bot._late_adds, {})
+CLIENT.put(movie(torrent_id=QUEUE_HASH))
+states = poll(states)
+check("so if it lands it is not told as the bot's add", [t for t in texts() if t.startswith(bot.get_text("ADD_LATE"))], [])
+
+# A retry that finds the earlier try landed tells it once, not again as external
+fresh(notify_external=True)
+empty_queue()
+states = poll(None)
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=909)
+CLIENT.put(movie(torrent_id=QUEUE_HASH)).added_date = time.time()
+CLIENT.on_add = _duplicate
+ready()
+bot.process_add_queue()
+states = poll(states)
+check("the landed one is told once, as the add", (count_external(), EDITS[-1][0].startswith(bot.get_text("ADD_OK", bot.html.escape(MOVIE_NAME), "/downloads"))), (0, True))
+
+# A final error after waiting says which torrent it was
+fresh()
+empty_queue()
+CLIENT.on_add = _timeout
+text, _m, item = bot.add_or_queue(pending(), "/downloads", chat_id=55, message_id=910)
+CLIENT.on_add = _refused
+ready()
+bot.process_add_queue()
+check("a queued add refused later names the torrent", EDITS[-1][0],
+	bot.get_text("ADD_QUEUE_FAILED", "Queued.Movie", bot.html.escape("Error adding torrent: invalid or corrupt torrent file")))
+
+# Sent while the manager has just failed: queued without keeping the
+# conversation waiting for another timeout, behind the ones already waiting
+fresh()
+empty_queue()
+CLIENT.on_add = _timeout
+bot.add_or_queue(pending(), "/downloads", chat_id=55)
+CLIENT.on_add = lambda: CLIENT.put(movie())
+CLIENT.calls.clear()
+text, _m, item = bot.add_or_queue(pending(magnet_link="magnet:?xt=urn:btih:" + "f" * 40, name="Behind"), "/downloads", chat_id=55)
+check("an add sent while the queue waits is queued without trying", ([c for c in CLIENT.calls if c[0] == "add_torrent"], item is not None), ([], True))
+check("behind the others", [i["name"] for i in QUEUE.items()], ["Queued.Movie", "Behind"])
+QUEUE._next_try = time.time() + 500
+bot.add_or_queue(pending(magnet_link="magnet:?xt=urn:btih:" + "a" * 40, name="Third"), "/downloads", chat_id=55)
+check("and it brings a long wait forward", QUEUE.wait_time() <= RETRY_DELAYS[0], True)
+
+# Once the wait is over, a direct add that works makes the queue go now
+ready()
+QUEUE._failures = 3
+text, _m, item = bot.add_or_queue(pending(magnet_link="magnet:?xt=urn:btih:" + "b" * 40), "/downloads", chat_id=55)
+check("a direct add that works is told as usual", item, None)
+check("and the queue does not wait any more", (QUEUE.wait_time(), QUEUE._failures), (0, 0))
+ready()
+bot.process_add_queue()
+check("the ones queued without trying go with their context worked out then", len(QUEUE), 0)
+empty_queue()
+
+# Automatic adds: the default folder is not worth losing the add over
+fresh()
+empty_queue()
+bot_settings.set("auto_download", True)
+bot_settings.set("auto_download_dir", "")
+_real_default_dir = CLIENT.get_default_download_dir
+CLIENT.get_default_download_dir = lambda: (_ for _ in ()).throw(TorrentClientError("Error getting default download dir: odd answer"))
+CLIENT.on_add = lambda: CLIENT.put(movie())
+CLIENT.calls.clear()
+bot.start_add_flow(55, "Queued.Movie", magnet=QUEUE_MAGNET)
+check("without the default folder the add goes on, to the manager's own",
+	[c[2] for c in CLIENT.calls if c[0] == "add_torrent"], [None])
+check("and is told", SENT[-1][1].startswith(bot.get_text("ADD_OK", bot.html.escape(MOVIE_NAME), "/downloads")), True)
+CLIENT.get_default_download_dir = lambda: (_ for _ in ()).throw(TorrentClientError("Error getting default download dir: timeout when connection to transmission daemon"))
+CLIENT.calls.clear()
+bot.start_add_flow(55, "Queued.Movie", magnet=QUEUE_MAGNET)
+check("a manager that times out on the folder is not asked the add too", [c for c in CLIENT.calls if c[0] == "add_torrent"], [])
+check("the automatic add is queued", len(QUEUE), 1)
+check("its message is the one that will tell it", QUEUE.items()[0]["message_id"] is not None, True)
+check("and says it is queued", SENT[-1][1].startswith(QUEUED_TEXT), True)
+CLIENT.get_default_download_dir = _real_default_dir
+ready()
+bot.process_add_queue()
+check("when sent, it goes to the manager's own folder", [c[2] for c in CLIENT.calls if c[0] == "add_torrent"], [None])
+check("and its message tells the add", EDITS[-1][0].startswith(bot.get_text("ADD_OK", bot.html.escape(MOVIE_NAME), "/downloads")), True)
+CLIENT.get_default_download_dir = _real_default_dir
+bot_settings.set("auto_download", False)
+empty_queue()
+bot.send_message = _real_send
+
+# ---------------------------------------------------------------------------
 # 8. FAILURES ON THE WAY
 # ---------------------------------------------------------------------------
 

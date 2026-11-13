@@ -29,6 +29,9 @@ DEFAULTS = {
 	"auto_replace": False,  # Only used when auto_rename is enabled: on completion, replaces the torrent holding its name
 	"auto_move_series": False,  # Episodes added without asking go straight to the folder of their series
 	"auto_move_series_external": False,  # Only used when auto_move_series is enabled
+	# Only used when auto_move_series is enabled: a series with no folder yet
+	# goes to a new one named after it in here. "" = it stays where it was going
+	"new_series_dir": "",
 	"low_space_warning": True,
 	# The automatic mover, see auto_mover.py: when the source folder runs low
 	# on space, the torrents finished longest ago go to the same place under
