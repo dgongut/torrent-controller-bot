@@ -49,7 +49,12 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 
 Actualmente soporta **Transmission**, **qBittorrent**, **Deluge** y **Download Station de Synology** como gestores de torrents. La arquitectura interna es agnóstica al cliente, por lo que en el futuro podrán añadirse otros gestores. No todos ofrecen las mismas operaciones en su API: tienes el detalle en [qué puede hacer el bot con cada gestor](#qué-puede-hacer-el-bot-con-cada-gestor).
 
+<!-- dockerhub:skip -->
 ¿Lo buscas en [![](https://badgen.net/badge/icon/docker?icon=docker&label)](https://hub.docker.com/r/dgongut/torrent-controller-bot)?
+<!-- /dockerhub:skip -->
+<!-- dockerhub:only
+📦 Código fuente, incidencias y documentación completa en [GitHub](https://github.com/dgongut/torrent-controller-bot).
+-->
 
 ## Crear tu bot de Telegram
 
@@ -105,6 +110,10 @@ Las subcarpetas usan la plantilla de temporada (o la de series o películas si l
 
 Desde el detalle de un torrent, el botón 🗂️ Archivos permite navegar por sus carpetas (entrar en una subcarpeta, ⬆️ subir a la anterior) y renombrar la carpeta en la que estás, cada archivo uno a uno o todo lo que hay en la carpeta de golpe (con previsualización antes de confirmar). Los archivos heredan de su carpeta de temporada y del nombre del torrent lo que no llevan encima (título, año y temporada, nunca el episodio), así que un episodio suelto como `01.mkv` dentro de `Show.Name.S02.1080p` se convierte en `2x01 - Show Name - 1080p.mkv`. Los subtítulos que acompañan a un vídeo se renombran con él para no romper el emparejamiento, y todo se hace a través del gestor de torrents, por lo que el seeding se mantiene.
 
+<!-- dockerhub:only
+Las plantillas de renombrado admiten el título del episodio y el relleno con ceros: detalles en [GitHub](https://github.com/dgongut/torrent-controller-bot#título-del-episodio).
+-->
+<!-- dockerhub:skip -->
 ### Título del episodio
 
 El campo `{titulo_episodio}` recoge el texto que va después del marcador de episodio, así que `Family.Guy.S01E01.Death.Has.a.Shadow.1080p.mkv` conserva `Death Has a Shadow`. No todos los episodios lo traen, por lo que conviene usarlo siempre entre corchetes:
@@ -130,6 +139,7 @@ Detalles a tener en cuenta:
 - En rangos se rellena cada lado por separado, así que `S01-S08` con `{temporada.2}` da `01-08`.
 - Solo funciona en `{temporada}` y `{episodio}`; en cualquier otro campo el bot rechaza la plantilla.
 - `{capitulo}` no se ve afectado: mantiene siempre su formato de dos dígitos (`1x03`, `T2`).
+<!-- /dockerhub:skip -->
 
 ## Sustituir una versión anterior
 
@@ -167,6 +177,10 @@ Pensado para quien descarga en un disco rápido y pequeño (un SSD, una caché) 
 
 El bot lo comprueba cada cinco minutos. Cuando mueve algo manda un aviso con la lista, y ese mismo mensaje cambia cuando los torrents están de verdad en el destino. 👀 **Ver qué se movería** enseña qué torrents irían ahora mismo y a qué carpeta, y desde ahí se puede lanzar a mano sin esperar al mínimo.
 
+<!-- dockerhub:only
+Qué hace cuando algo no cuadra (no cabe, mismo disco, errores del gestor...): detalles en [GitHub](https://github.com/dgongut/torrent-controller-bot#mover-automático).
+-->
+<!-- dockerhub:skip -->
 Está hecho para no sorprender:
 
 - Si no hay nada que se pueda mover, lo dice una vez y explica por qué (torrents demasiado recientes, sin terminar...).
@@ -174,6 +188,7 @@ Está hecho para no sorprender:
 - Si el gestor no consigue mover algo (permisos, espacio), lo cuenta con el motivo y **se desactiva solo**, en vez de repetir el error cada cinco minutos. Lo mismo si después de mover el origen no ha ganado espacio.
 - Los torrents que comparten los mismos datos (el mismo nombre en la misma carpeta, como deja el *cross-seeding*) se mueven siempre juntos.
 - No se tocan los torrents sin terminar, en comprobación o con error en sus datos (un tracker que no responde no cuenta), ni los de qBittorrent en gestión automática, cuya carpeta la decide su categoría.
+<!-- /dockerhub:skip -->
 
 Transmission no responde a nada mientras mueve datos entre discos: durante un movimiento grande el bot dará error de conexión hasta que termine, y el aviso del mover se actualiza entonces.
 
@@ -208,6 +223,10 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 | Ordenar los listados | ✅ | ✅ | ✅ | ✅ ¹⁰ |
 | Elegir los archivos a descargar y su prioridad | ✅ | ✅ ¹¹ | ✅ | ✅ ¹² |
 
+<!-- dockerhub:only
+Las notas numeradas de la tabla están explicadas en [GitHub](https://github.com/dgongut/torrent-controller-bot#qué-puede-hacer-el-bot-con-cada-gestor).
+-->
+<!-- dockerhub:skip -->
 ¹ Ni Deluge ni Download Station tienen modo de velocidad alternativa. Los límites de velocidad normales sí funcionan en ambos.
 
 ² Download Station no expone ninguna forma de volver a verificar los datos de una tarea.
@@ -233,6 +252,7 @@ La arquitectura del bot es agnóstica al gestor, pero sus APIs no ofrecen las mi
 ¹² Hace falta DSM 7. Download Station sigue contando en el tamaño de una tarea los archivos que no se descargan.
 
 ¹³ El bot quita el torrent cuando el gestor lo para por uno de sus límites, nunca cuando lo pausas tú. qBittorrent tiene límite de ratio y de tiempo compartiendo, que se configura en el propio gestor; Transmission y Deluge, solo de ratio.
+<!-- /dockerhub:skip -->
 
 ## Download Station de Synology
 
@@ -318,6 +338,7 @@ Están activadas por defecto. Nada se envía hasta que el bot lleva al menos 10 
 > [!NOTE]
 > Si Transmission corre en la misma máquina que el bot pero fuera de Docker, usa `host.docker.internal` como `TORRENT_CLIENT_HOST` (en Linux añade `extra_hosts: ["host.docker.internal:host-gateway"]`).
 
+<!-- dockerhub:skip -->
 ---
 ## Solo para desarrolladores
 
@@ -364,3 +385,4 @@ pip install -r requirements.txt
 set -a && source .env && set +a
 LOCALE_PATH=./locale python3 torrent-controller-bot.py
 ```
+<!-- /dockerhub:skip -->
