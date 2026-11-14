@@ -2317,6 +2317,37 @@ bot_module.pending_inputs.clear()
 bot_module.client.get_settings, bot_module.client.set_speed_limit = _real_get_settings, _real_set_speed_limit
 bot_module.bot_settings.set("saved_speed_limits", {})
 
+# /turtle and /tortuga toggle turtle mode, whatever the language, and say what is on now
+turtle = {"on": False}
+_real_get_settings, _real_set_alt_speed = bot_module.client.get_settings, bot_module.client.set_alt_speed
+bot_module.client.get_settings = lambda: dict(_real_get_settings(), alt_speed_enabled=turtle["on"])
+bot_module.client.set_alt_speed = lambda enabled: turtle.update(on=enabled)
+for command, expected in (("/tortuga", True), ("/turtle", False), ("/turtle@OwnBot", True)):
+	EDITS.clear()
+	send_command(command)
+	text, markup = EDITS[-1]
+	check(f"{command} turns turtle mode {'on' if expected else 'off'}", turtle["on"], expected)
+	check(f"{command} says it is {'on' if expected else 'off'}",
+		bot_module.get_text("TURTLE_ON" if expected else "TURTLE_OFF").split("<b>")[1].split("</b>")[0] in text, True)
+	check(f"{command} offers the speed screen", bot_module.settings_call("speed") in callbacks_of(markup), True)
+check("on, it shows the turtle speeds", "100 KB/s" in EDITS[-1][0] and "50 KB/s" in EDITS[-1][0], True)
+turtle["on"] = False
+send_command("/tortuga", STRANGER_ID)
+check("an unauthorized /tortuga changes nothing", turtle["on"], False)
+bot_module.client.supports_alt_speed = False
+EDITS.clear()
+send_command("/turtle")
+check("without turtle mode in the manager, it says so", EDITS[-1][0], bot_module.get_text("TURTLE_NOT_SUPPORTED"))
+check("without turtle mode in the manager, nothing changes", turtle["on"], False)
+EDITS.clear()
+send_command("/help")
+check("/help leaves the turtle out when the manager has none", "HELP_TURTLE" not in EDITS[-1][0] and "/turtle" not in EDITS[-1][0], True)
+bot_module.client.supports_alt_speed = True
+EDITS.clear()
+send_command("/help")
+check("/help lists the turtle command", bot_module.get_text("HELP_TURTLE", bot_module.turtle_command()) in EDITS[-1][0], True)
+bot_module.client.get_settings, bot_module.client.set_alt_speed = _real_get_settings, _real_set_alt_speed
+
 # Environment values that used to crash the start, or break the lists
 def config_with(**env):
 	run = subprocess.run([sys.executable, "-c", "import config; print(config.TORRENTS_PER_PAGE, config.TORRENT_CLIENT_HOST, "

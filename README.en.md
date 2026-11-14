@@ -75,6 +75,7 @@ Before starting the container you need your own Telegram bot and your user ident
 | `/find text` | Search torrents by name or by path, ignoring case and accents. Words can come in any order (`/find casa papel` finds `La.Casa.de.Papel`); a path has to appear as is (`/find /ssd/movies` does not find `/media/Movies`) and quoted text as an exact phrase (`/find "the office"`) |
 | `/add` | Add a torrent (you can also send a `.torrent` file or a magnet link directly) |
 | `/settings` | Client settings: turtle mode, speed limits and ratio |
+| `/turtle` `/tortuga` | Turns turtle mode on or off (qBittorrent and Transmission) |
 | `/version` | Shows the current version and the client it is connected to |
 | `/help` | List of commands |
 

@@ -80,6 +80,7 @@ Antes de levantar el contenedor necesitas un bot propio en Telegram y conocer tu
 | `/find texto` | Busca torrents por nombre o por ruta, sin importar mayúsculas ni tildes. Cada palabra puede ir en cualquier orden (`/find casa papel` encuentra `La.Casa.de.Papel`); una ruta tiene que aparecer tal cual (`/find /ssd/peliculas` no encuentra `/media/Peliculas`) y lo que va entre comillas, como frase exacta (`/find "la casa"`) |
 | `/add` | Añade un torrent (también puedes enviar directamente un fichero `.torrent` o un enlace magnet) |
 | `/settings` | Ajustes del gestor: modo tortuga, límites de velocidad y ratio |
+| `/tortuga` `/turtle` | Activa o desactiva el modo tortuga (qBittorrent y Transmission) |
 | `/version` | Muestra la versión actual y el gestor al que está conectado |
 | `/help` | Lista de comandos |
 | `/donate` `/donors` | Dona al desarrollador / lista de donantes |

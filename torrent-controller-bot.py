@@ -31,7 +31,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.16.1"
+VERSION = "1.16.2"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -6254,7 +6254,13 @@ def command_help(message):
 		return
 	count_usage("cmd_help")
 	delete_message(message.chat.id, message.message_id)
-	send_message(message.chat.id, get_text("START_MESSAGE"), thread_id=message_thread(message))
+	lines = get_text("START_MESSAGE").split("\n")
+	if client.supports_alt_speed:
+		# Right below /settings, where turtle mode also is
+		after = next((i for i, line in enumerate(lines) if line.startswith("/settings")), len(lines) - 1)
+		lines.insert(after + 1, get_text("HELP_TURTLE", turtle_command()))
+	text = "\n".join(lines)
+	send_message(message.chat.id, text, thread_id=message_thread(message))
 
 
 @bot.message_handler(func=for_me, commands=["list"])
@@ -6301,6 +6307,40 @@ def command_settings(message):
 		text = client_error_text(e)
 		markup = back_close_markup()
 	send_message(message.chat.id, text, reply_markup=markup, thread_id=message_thread(message))
+
+
+@bot.message_handler(func=for_me, commands=["turtle", "tortuga"])
+def command_turtle(message):
+	"""Turns turtle mode on or off in one step, without going through /settings"""
+	if not check_auth(message):
+		return
+	count_usage("cmd_turtle")
+	delete_message(message.chat.id, message.message_id)
+	thread_id = message_thread(message)
+	if not client.supports_alt_speed:
+		send_message(message.chat.id, get_text("TURTLE_NOT_SUPPORTED"), reply_markup=close_markup(), thread_id=thread_id)
+		return
+	try:
+		client.set_alt_speed(not client.get_settings()["alt_speed_enabled"])
+		settings = client.get_settings()  # What the manager reports, not what was asked
+	except TorrentClientError as e:
+		send_message(message.chat.id, client_error_text(e), reply_markup=close_markup(), thread_id=thread_id)
+		return
+	if settings["alt_speed_enabled"]:
+		text = get_text("TURTLE_ON", settings["alt_speed_down"], settings["alt_speed_up"], turtle_command())
+	else:
+		text = get_text("TURTLE_OFF", speed_label(settings), turtle_command())
+	markup = InlineKeyboardMarkup()
+	markup.row(
+		InlineKeyboardButton(get_text("BUTTON_TURTLE_SPEED_SETTINGS"), callback_data=settings_call("speed")),
+		InlineKeyboardButton(get_text("BUTTON_CLOSE"), callback_data=build_call("cerrar")),
+	)
+	send_message(message.chat.id, text, reply_markup=markup, thread_id=thread_id)
+
+
+def turtle_command():
+	"""The turtle command in the language of the bot; both work in any language"""
+	return "/tortuga" if LANGUAGE.upper() == "ES" else "/turtle"
 
 
 @bot.message_handler(func=for_me, commands=["version"])
@@ -7704,17 +7744,22 @@ if __name__ == "__main__":
 		warning(f"TELEMETRY_DEBUG is on: statistics go to {TELEMETRY_ENDPOINT} a minute after every start")
 	telemetry_client.start()
 	try:
-		bot.set_my_commands([
+		commands = [
 			telebot.types.BotCommand("/start", get_text("MENU_START")),
 			telebot.types.BotCommand("/list", get_text("MENU_LIST")),
 			telebot.types.BotCommand("/find", get_text("MENU_FIND")),
 			telebot.types.BotCommand("/add", get_text("MENU_ADD")),
 			telebot.types.BotCommand("/settings", get_text("MENU_SETTINGS")),
+		]
+		if client.supports_alt_speed:
+			commands.append(telebot.types.BotCommand(turtle_command(), get_text("MENU_TURTLE")))
+		commands += [
 			telebot.types.BotCommand("/version", get_text("MENU_VERSION")),
 			telebot.types.BotCommand("/help", get_text("MENU_HELP")),
 			telebot.types.BotCommand("/donate", get_text("MENU_DONATE")),
 			telebot.types.BotCommand("/donors", get_text("MENU_DONORS")),
-		])
+		]
+		bot.set_my_commands(commands)
 	except Exception as e:
 		warning(f"Cannot set bot commands: {e}")
 	track_polling_heartbeat()
