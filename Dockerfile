@@ -1,9 +1,9 @@
 # Named once, for FROM and for the label that says which base this is.
-ARG BASE_IMAGE=alpine:3.24.2
+ARG BASE_IMAGE=alpine:3.24.4
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
 
-ARG VERSION=1.16.2
+ARG VERSION=1.16.3
 
 # Standard OCI labels. The version comes from the same VERSION that picks the
 # source tag below, so it cannot say one thing and contain another; it is

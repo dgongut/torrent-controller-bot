@@ -31,7 +31,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.16.2"
+VERSION = "1.16.3"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
