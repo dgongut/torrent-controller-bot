@@ -22,6 +22,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Búsqueda de torrents por nombre o por ruta
 - ✅ Añadir torrents enviando un fichero `.torrent`, un enlace magnet o una URL a un fichero `.torrent`, eligiendo el directorio de descarga
 - ✅ Cola de añadidos: si el gestor no responde (está ocupado moviendo datos, reiniciándose...), lo que envías queda en cola, sobrevive a un reinicio del bot y se añade solo en cuanto el gestor responde
+- ✅ Arranca aunque el gestor no responda todavía (por ejemplo, si el bot arranca antes que él): avisa en el mensaje de arranque, se conecta solo en cuanto el gestor responde y te lo dice
 - ✅ Pausar, reanudar, verificar, reanunciar al tracker y borrar torrents (con o sin sus datos)
 - ✅ Mover torrents de directorio con aviso al terminar el movimiento
 - ✅ Límites por torrent: hasta qué ratio compartir cada uno (el del gestor, sin límite, 0.5, 1, 2 u otro valor) y su velocidad de bajada y subida, y el ratio del propio gestor desde los ajustes

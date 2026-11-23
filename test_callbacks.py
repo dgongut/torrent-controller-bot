@@ -1746,6 +1746,142 @@ CALLS.clear()
 bot_module.handle_text(tg_message(pasted))
 check("a magnet pasted while a question waits is added", added, [pasted])
 check("and not taken as the answer", ([c for c in CALLS if c[0] == "move_torrents"], bot_module.pending_inputs.get((CHAT_ID, 1))), ([], None))
+
+# A forwarded channel post: a photo whose caption hides the link behind "Enlace"
+added.clear()
+post = tg_message("")
+post.text = None
+post.caption = "🎬 Tadeo Jones y La Lámpara Maravillosa (2026)\n📦 1080p · HEVC · 2.5 GB\n\n⬇️ Enlace"
+post.caption_entities = [types.SimpleNamespace(type="bold", offset=3, length=10, url=None),
+						 types.SimpleNamespace(type="text_link", offset=len(post.caption.encode("utf-16-le")) // 2 - 6, length=6, url=pasted)]
+bot_module.handle_media(post)
+check("the link hidden in the caption of a photo is added", added, [pasted])
+added.clear()
+post.caption, post.caption_entities = "Mira esto: " + pasted + " y ya", None
+bot_module.handle_media(post)
+check("and a magnet written in a caption too", added, [pasted])
+added.clear()
+post.caption = "Una foto sin enlace"
+SENDS.clear()
+bot_module.handle_media(post)
+check("a photo without a link is left alone", (added, SENDS), ([], []))
+added.clear()
+post.caption = "Descarga: " + pasted
+post.document = types.SimpleNamespace(file_name="cartel.pdf", file_size=1000, file_id="x")
+bot_module.handle_document(post)
+check("any other file with a link in its caption adds the link", added, [pasted])
+added.clear()
+post.caption = "Un pdf sin enlace"
+post.chat.type = "private"
+SENDS.clear()
+bot_module.handle_document(post)
+check("and without one it is still not a .torrent", (added, len(SENDS)), ([], 1))
+added.clear()
+post.caption, post.chat.type = "Descarga: " + pasted, "supergroup"
+post.document = types.SimpleNamespace(file_name="Peli.torrent", file_size=1000, file_id="x")
+_real_download = bot_module.download_telegram_file
+bot_module.download_telegram_file = lambda file_id: b"torrent-bytes"
+added_data = []
+bot_module.start_add_flow = lambda chat_id, name, magnet=None, data=None, thread_id=None: added_data.append((name, magnet, data))
+bot_module.handle_document(post)
+check("a .torrent with a link in its caption adds the file only", added_data, [("Peli", None, b"torrent-bytes")])
+bot_module.download_telegram_file = _real_download
+bot_module.start_add_flow = lambda chat_id, name, magnet=None, data=None, thread_id=None: added.append(magnet)
+added.clear()
+bot_module.handle_text(tg_message("Aquí va: " + pasted))
+check("a magnet in the middle of a message is added", added, [pasted])
+# A channel post carries other links (the film's page, the trailer): no answer for them
+added.clear()
+_real_download_url = bot_module.download_torrent_from_url
+def _not_torrent(url):
+	raise ValueError("not a torrent")
+bot_module.download_torrent_from_url = _not_torrent
+post = tg_message("", chat_type="private")
+post.text = None
+post.caption = "Peli (2026) · IMDb · Descargar"
+post.caption_entities = [types.SimpleNamespace(type="text_link", offset=14, length=4, url="https://www.imdb.com/title/tt1"),
+						 types.SimpleNamespace(type="text_link", offset=21, length=9, url=pasted)]
+SENDS.clear()
+bot_module.handle_media(post)
+check("the other links of a forwarded post get no answer", (added, SENDS), ([pasted], []))
+# The film's page often refuses a bot (403): an error, not "not a torrent"
+def _forbidden(url):
+	raise OSError("403 Client Error: Forbidden")
+bot_module.download_torrent_from_url = _forbidden
+added.clear()
+bot_module.handle_media(post)
+check("nor when they cannot be downloaded", (added, SENDS), ([pasted], []))
+post.caption_entities = post.caption_entities[:1]
+added.clear()
+bot_module.handle_media(post)
+check("a forwarded post with no torrent in its links is told so, once", (added, [text for text, _ in EDITS[-1:]]),
+	([], [get_text("ADD_NO_TORRENT_LINK")]))
+check("in one message", len(SENDS), 1)
+post.chat.type = "supergroup"
+SENDS.clear()
+bot_module.handle_media(post)
+check("but not in a group, where it may not be for the bot", SENDS, [])
+post.chat.type = "private"
+post.document = types.SimpleNamespace(file_name="cartel.pdf", file_size=1000, file_id="x")
+SENDS.clear()
+bot_module.handle_document(post)
+check("a file that is not a .torrent with links that are not either is told once too", len(SENDS), 1)
+SENDS.clear()
+linked = tg_message("Mira https://www.imdb.com/title/tt1", chat_type="private")
+linked.entities = [types.SimpleNamespace(type="url", offset=5, length=29, url=None)]
+bot_module.handle_text(linked)
+check("a link written in a message that cannot be downloaded is still told with its error", len(SENDS), 1)
+bot_module.download_torrent_from_url = _real_download_url
+# A magnet whose name is written with its spaces keeps what comes after it
+spaced = "magnet:?xt=urn:btih:" + "b" * 40 + "&dn=Ubuntu 22.04 Desktop&tr=udp://tracker.test:80/announce"
+encoded = spaced.replace(" ", "%20")
+added.clear()
+bot_module.handle_text(tg_message(spaced))
+check("a magnet with spaces in its name is added whole, trackers included", added, [encoded])
+added.clear()
+bot_module.handle_text(tg_message("Aquí va: " + spaced + " y ya"))
+check("also in the middle of a message, without what follows it", added, [encoded])
+added.clear()
+bot_module.handle_text(tg_message(pasted + " mira esto"))
+check("a magnet with a comment after it is added without the comment", added, [pasted])
+added.clear()
+bot_module.handle_text(tg_message(pasted + " y " + spaced))
+check("two magnets in a line are two torrents", added, [pasted, encoded])
+bot_module.pending_inputs.clear()
+press(bot_module.build_call("search"))
+added.clear()
+CALLS.clear()
+bot_module.handle_text(tg_message(spaced))
+check("a magnet with spaces pasted while a question waits is added, not taken as the answer",
+	(added, bot_module.pending_inputs.get((CHAT_ID, 1))), ([encoded], None))
+urls = []
+_real_add_url = bot_module.add_url_from_message
+bot_module.add_url_from_message = lambda message, url, quiet=False: urls.append(url) or True
+two = tg_message("https://a.test/x.torrent\nhttps://b.test/y.torrent")
+two.entities = [types.SimpleNamespace(type="url", offset=0, length=24, url=None), types.SimpleNamespace(type="url", offset=25, length=24, url=None)]
+bot_module.handle_text(two)
+check("two links, one per line, are two links and not one", urls, ["https://a.test/x.torrent", "https://b.test/y.torrent"])
+bot_module.add_url_from_message = _real_add_url
+added.clear()
+bot_module.handle_text(tg_message("Aquí (" + pasted + ")."))
+check("a magnet in brackets does not take the bracket", added, [pasted])
+added.clear()
+shown = tg_message("Enlace: " + pasted[:30] + "… y el bueno")
+shown.entities = [types.SimpleNamespace(type="text_link", offset=0, length=6, url=pasted)]
+bot_module.handle_text(shown)
+check("a magnet shown cut short next to the full one in a link is added once", added, [pasted])
+added.clear()
+shown = tg_message("Magnet: " + pasted.split("&")[0] + " o aquí")
+shown.entities = [types.SimpleNamespace(type="text_link", offset=0, length=6, url=pasted)]
+bot_module.handle_text(shown)
+check("the same magnet written and in a link is added once", added, [pasted])
+added.clear()
+stranger = tg_message("", chat_type="private", user_id=999)
+stranger.text, stranger.caption = None, "Descarga: " + pasted
+stranger.document = types.SimpleNamespace(file_name="cartel.pdf", file_size=1000, file_id="x")
+SENDS.clear()
+bot_module.handle_document(stranger)
+check("a stranger's file with a link is not added, and they are told they are not allowed", (added, len(SENDS)), ([], 1))
 bot_module.start_add_flow = _real_start_add_flow
 
 # Mass actions act on what their confirmation counted

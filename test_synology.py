@@ -770,6 +770,8 @@ check("a NAS without Download Station is explained", str(e), "Download Station i
 dsm = nas()
 dsm.password = "other"
 check("a wrong password is explained", str(raised(connect, dsm)), "Synology login failed: Wrong user or password")
+check("and is a refused login, which the bot does not insist on", type(raised(connect, dsm)).__name__, "LoginRefusedError")
+check("a NAS whose Download Station has not started yet is not", type(raised(connect, nas(missing=[TASK]))), TorrentClientError)
 dsm = nas()
 dsm.login_error = 403
 check("so is an account with two step verification", "two step verification" in str(raised(connect, dsm)), True)

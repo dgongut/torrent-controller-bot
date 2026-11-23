@@ -17,6 +17,7 @@ from torrent_clients.base import (
 	PermanentTorrentError,
 	SessionSummary,
 	TorrentClient,
+	LoginRefusedError,
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
@@ -109,6 +110,15 @@ class TransmissionClient(TorrentClient):
 				protocol=protocol,
 				path=rpc_path,
 			)
+		except transmission_rpc.TransmissionAuthError as e:
+			# It answers: told apart from one that does not, since waiting will
+			# not help. 401 is the login; 403 is Transmission not letting the
+			# address of the bot in, whatever its password
+			if getattr(getattr(e, "original", None), "status_code", None) == 403:
+				raise LoginRefusedError(
+					f"Transmission does not let the bot in at {host}:{port} (HTTP 403): its address is not in the "
+					"RPC whitelist of Transmission, or it failed to log in too many times")
+			raise LoginRefusedError(f"Transmission login failed at {host}:{port}: wrong user or password")
 		except Exception as e:
 			raise TorrentClientError(f"Cannot connect to Transmission at {host}:{port}: {e}")
 

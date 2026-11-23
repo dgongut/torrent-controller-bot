@@ -1212,6 +1212,143 @@ check("qbit: and of a folder inside it", free_qbit.get_free_space("/downloads/Fi
 check("qbit: a folder elsewhere is unknown", free_qbit.get_free_space("/mnt/other_disk"), -1)
 check("qbit: a folder only sharing the start is elsewhere", free_qbit.get_free_space("/downloads2"), -1)
 
+# LazyClient: the bot starts while the manager is down and connects later
+from torrent_clients.lazy import LazyClient, RETRY_SECONDS
+
+
+class LazyFake:
+	supports_alt_speed = False
+	def __init__(self):
+		self.flag = 1
+	def test_connection(self):
+		return "Fake 2.0"
+	def get_torrents(self):
+		return ["t"]
+
+
+lazy_now = [1000.0]
+lazy_up = [False]
+lazy_built = []
+def lazy_factory():
+	lazy_built.append(1)
+	if not lazy_up[0]:
+		raise TorrentClientError("Cannot connect to Fake: Connection refused")
+	return LazyFake()
+
+
+lazy = LazyClient(lazy_factory, LazyFake, clock=lambda: lazy_now[0])
+check("lazy: a capability is read before connecting", (lazy.supports_alt_speed, len(lazy_built)), (False, 0))
+check("lazy: a call while the manager is down fails like an unreachable manager",
+	isinstance(raised(lazy.get_torrents), TorrentClientError), True)
+check("lazy: and says why", (lazy.connected, str(lazy.last_error)), (False, "Cannot connect to Fake: Connection refused"))
+raised(lazy.get_torrents)
+check("lazy: a call right after a failure fails at once, without trying again", len(lazy_built), 1)
+lazy_up[0] = True
+lazy_now[0] += RETRY_SECONDS
+check("lazy: once the manager answers a call connects and works", lazy.get_torrents(), ["t"])
+check("lazy: and the version is known", (lazy.connected, lazy.version, lazy.last_error), (True, "Fake 2.0", None))
+lazy.flag = 5
+check("lazy: attributes are set on the real client", lazy.connect().flag, 5)
+lazy_up[0] = False
+check("lazy: once connected the client is never built again", (lazy.get_torrents(), len(lazy_built)), (["t"], 2))
+
+
+class LazyBrokenFake(LazyFake):
+	def test_connection(self):
+		raise ValueError("bad answer")
+
+
+lazy = LazyClient(LazyBrokenFake, LazyBrokenFake, clock=lambda: lazy_now[0])
+check("lazy: any failure to connect is a TorrentClientError", isinstance(raised(lazy.connect), TorrentClientError), True)
+import threading as _lazy_threading
+_lazy_release = _lazy_threading.Event()
+_lazy_started = _lazy_threading.Event()
+def _slow_factory():
+	_lazy_started.set()
+	_lazy_release.wait(5)
+	raise TorrentClientError("Cannot connect to Fake: timed out")
+lazy = LazyClient(_slow_factory, LazyFake, clock=lambda: lazy_now[0])
+_slow = _lazy_threading.Thread(target=lambda: raised(lazy.connect))
+_slow.start()
+_lazy_started.wait(5)
+_t0 = time.monotonic()
+_meanwhile = raised(lazy.get_torrents)
+check("lazy: a call while another attempt is in progress fails at once, without waiting for it",
+	(isinstance(_meanwhile, TorrentClientError), time.monotonic() - _t0 < 1), (True, True))
+_lazy_release.set()
+_slow.join()
+check("lazy: and the attempt still ends as failed", str(lazy.last_error), "Cannot connect to Fake: timed out")
+check("lazy: setting an attribute before connecting is refused", isinstance(raised(setattr, lazy, "flag", 2), AttributeError), True)
+
+# A refused login is not insisted on: the manager would end up blocking the bot
+from torrent_clients import LoginRefusedError
+from torrent_clients.lazy import REFUSED_RETRY_SECONDS
+lazy_built.clear()
+lazy_error = [LoginRefusedError("Fake login failed: wrong password")]
+def lazy_refusing():
+	lazy_built.append(1)
+	if lazy_error[0] is not None:
+		raise lazy_error[0]
+	return LazyFake()
+lazy = LazyClient(lazy_refusing, LazyFake, clock=lambda: lazy_now[0])
+raised(lazy.connect)
+check("lazy: a refused login is told apart", (lazy.refused, str(lazy.last_error)), (True, "Fake login failed: wrong password"))
+lazy_now[0] += RETRY_SECONDS
+raised(lazy.get_torrents)
+check("lazy: and is not tried again as soon as an unreachable manager is", len(lazy_built), 1)
+waited = RETRY_SECONDS  # Since the last try
+for wait in REFUSED_RETRY_SECONDS + (REFUSED_RETRY_SECONDS[-1],):
+	lazy_now[0] += wait - 1 - waited
+	raised(lazy.get_torrents)
+	early = len(lazy_built)
+	lazy_now[0] += 1
+	raised(lazy.get_torrents)
+	check(f"lazy: the next try of a refused login waits {wait} s", (early, len(lazy_built)), (early, early + 1))
+	waited = 0
+check("lazy: every wait is longer than the one before, and the last one is repeated", len(lazy_built), len(REFUSED_RETRY_SECONDS) + 2)
+lazy_error[0] = TorrentClientError("Cannot connect to Fake: Connection refused")
+lazy_now[0] += REFUSED_RETRY_SECONDS[-1]
+raised(lazy.get_torrents)
+check("lazy: a manager that stops answering is no longer one that refuses", lazy.refused, False)
+lazy_error[0] = None
+lazy_now[0] += RETRY_SECONDS
+check("lazy: and is tried again soon", (lazy.get_torrents(), lazy.refused), (["t"], False))
+
+# What each manager answers to a wrong login is a refusal; one that does not answer is not
+def _transmission_connect_error(status):
+	def client(**kwargs):
+		raise transmission_rpc.TransmissionAuthError("transmission daemon require auth", original=types.SimpleNamespace(status_code=status))
+	transmission_client.transmission_rpc = types.SimpleNamespace(Client=client, TransmissionAuthError=transmission_rpc.TransmissionAuthError)
+	try:
+		return raised(transmission_client.TransmissionClient, "transmission.test", 9091, "bot", "wrong")
+	finally:
+		transmission_client.transmission_rpc = transmission_rpc
+e = _transmission_connect_error(401)
+check("transmission: a wrong password is a refused login, told in plain words",
+	(type(e), str(e)), (LoginRefusedError, "Transmission login failed at transmission.test:9091: wrong user or password"))
+e = _transmission_connect_error(403)
+check("transmission: an address it does not let in is not told as a wrong password",
+	(type(e), "whitelist" in str(e), "password" in str(e)), (LoginRefusedError, True, False))
+def _transmission_down(**kwargs):
+	raise transmission_rpc.TransmissionConnectError("can't connect to transmission daemon")
+transmission_client.transmission_rpc = types.SimpleNamespace(Client=_transmission_down, TransmissionAuthError=transmission_rpc.TransmissionAuthError)
+e = raised(transmission_client.TransmissionClient, "transmission.test", 9091)
+transmission_client.transmission_rpc = transmission_rpc
+check("transmission: one that does not answer is not a refusal", type(e), TorrentClientError)
+
+refusing_qbit = FakeQbit()
+refusing_qbit.e_auth_login = lambda params, data, files: http_response(403, text="Forbidden")
+check("qbit: a wrong password or a banned address is a refused login", type(raised(make_qbit, refusing_qbit)), LoginRefusedError)
+refusing_qbit.e_auth_login = lambda params, data, files: http_response(200, text="Fails.")
+check("qbit: so is the answer of the older versions", type(raised(make_qbit, refusing_qbit)), LoginRefusedError)
+refusing_qbit.e_auth_login = lambda params, data, files: http_response(502, text="Bad Gateway")
+check("qbit: a proxy in front that fails meanwhile is not", type(raised(make_qbit, refusing_qbit)), TorrentClientError)
+
+refusing_deluge = FakeDelugeWeb()
+refusing_deluge.password = "another"
+check("deluge: a wrong password is a refused login", type(raised(make_deluge, refusing_deluge)), LoginRefusedError)
+
+
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
 	print("\n\n".join(FAILED))

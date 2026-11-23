@@ -22,6 +22,7 @@ Control your torrent client from a single place.
 - ✅ Search torrents by name or by path
 - ✅ Add torrents by sending a `.torrent` file, a magnet link or a URL to a `.torrent` file, choosing the download directory
 - ✅ Add queue: when the manager does not answer (busy moving data, restarting...), what you send waits in a queue that survives a restart of the bot and is added on its own as soon as the manager answers
+- ✅ Starts even if the torrent client is not answering yet (for example, when the bot starts before it): the startup message says so, and it connects on its own as soon as the client answers and tells you
 - ✅ Pause, resume, verify, reannounce to the tracker and delete torrents (with or without their data)
 - ✅ Move torrents to another directory with a notice when the move finishes
 - ✅ Per torrent limits: up to which ratio each one seeds (the manager's, no limit, 0.5, 1, 2 or any other value) and its download and upload speed, and the manager's own ratio from the settings

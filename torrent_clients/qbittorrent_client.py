@@ -20,6 +20,7 @@ from torrent_clients.base import (
 	RATIO_MODE_TORRENT,
 	SessionSummary,
 	TorrentClient,
+	LoginRefusedError,
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
@@ -155,7 +156,11 @@ class QBittorrentClient(TorrentClient):
 			)
 		except Exception as e:
 			raise TorrentClientError(f"Cannot connect to qBittorrent at {self.base_url}: {e}")
-		if response.status_code >= 300 or response.text.strip() == "Fails.":
+		# Its own "no" (a wrong user or password, a banned address) is told
+		# apart from a proxy in front of it that is failing meanwhile
+		if 400 <= response.status_code < 500 or response.text.strip() == "Fails.":
+			raise LoginRefusedError(f"qBittorrent login failed (HTTP {response.status_code})")
+		if response.status_code >= 300:
 			raise TorrentClientError(f"qBittorrent login failed (HTTP {response.status_code})")
 
 	def _request(self, method, endpoint, timeout=REQUEST_TIMEOUT, **kwargs):

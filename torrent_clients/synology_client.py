@@ -33,6 +33,7 @@ from torrent_clients.base import (
 	PermanentTorrentError,
 	SessionSummary,
 	TorrentClient,
+	LoginRefusedError,
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
@@ -502,7 +503,7 @@ class SynologyClient(TorrentClient):
 			raise TorrentClientError(f"Cannot log in to Synology DSM at {self.base_url}: {e}")
 		if not data.get("success"):
 			code = _num((data.get("error") or {}).get("code"), 0)
-			raise TorrentClientError(f"Synology login failed: {self._describe_error(AUTH_API, code)}")
+			raise LoginRefusedError(f"Synology login failed: {self._describe_error(AUTH_API, code)}")
 		self.sid = (data.get("data") or {}).get("sid")
 		if not self.sid:
 			raise TorrentClientError("Synology login failed: no session id returned")

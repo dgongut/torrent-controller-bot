@@ -2253,6 +2253,137 @@ check("and it is applied on the next round", (applied_fields[-1], bot._rule_retr
 bot.apply_rule_fields = _real_apply_rule_fields
 bot_settings.set("tracker_limits", {})
 
+# ---------------------------------------------------------------------------
+# STARTING WITHOUT THE MANAGER: the monitor connects and tells it
+# ---------------------------------------------------------------------------
+
+from torrent_clients import LazyClient
+from torrent_clients.lazy import RETRY_SECONDS
+
+fresh(notify_external=True, notify_completed=True)
+_real_client = bot.client
+_lazy_clock = [0.0]
+_manager_up = [False]
+def _lazy_factory():
+	if not _manager_up[0]:
+		raise TorrentClientError("Cannot connect to Fake: Connection refused")
+	return CLIENT
+bot.client = LazyClient(_lazy_factory, FakeClient, clock=lambda: _lazy_clock[0])
+_real_mover_tick = bot.auto_mover_tick
+mover_ticks = []
+bot.auto_mover_tick = lambda: mover_ticks.append(1)
+monitor = bot.new_monitor()
+for _ in range(3):
+	bot.monitor_pass(monitor)
+	_lazy_clock[0] += RETRY_SECONDS
+check("down at start: the monitor tells nothing while the manager does not answer", NOTIFIED, [])
+check("and logs the wait once, not on every pass", len([w for w in WARNINGS if "Torrent monitor" in w]), 1)
+check("and the mover does not run", (mover_ticks, monitor["states"]), ([], None))
+done = CLIENT.put(movie(progress=100.0))
+CLIENT.put(movie(name="Other.Movie.2020.mkv"))
+_manager_up[0] = True
+bot.monitor_pass(monitor)
+check("once it answers, the connection is told with the torrents there",
+	texts(), [bot.get_text("CLIENT_CONNECTED", "Fake 1.0")])
+check("and what was there is the baseline: nothing else is told", len(NOTIFIED), 1)
+
+# A manager that has just started may list only part of its torrents at first
+def had_already(torrent, ago=3600):
+	"""A torrent the manager says it had before the bot first listed it"""
+	torrent.added_date = time.time() - ago
+	return torrent
+
+
+NOTIFIED.clear()
+late_ones = [CLIENT.put(had_already(movie(name=f"Late.{i}.2020.mkv", progress=100.0))) for i in range(3)]
+bot.monitor_pass(monitor)
+bot.monitor_pass(monitor)  # A pass with nothing new in between does not end it
+late_ones += [CLIENT.put(had_already(movie(name=f"Later.{i}.2020.mkv", progress=100.0))) for i in range(3)]
+bot.monitor_pass(monitor)
+check("torrents a just started manager lists late, over several passes, join the baseline silently; the connection is told once",
+	NOTIFIED, [])
+check("and are remembered", all(t.id in monitor["states"] for t in late_ones), True)
+# What comes in meanwhile is new: Sonarr sends what it was holding as soon as the manager is back
+sent = CLIENT.put(movie(name="Sent.Meanwhile.2021.mkv", progress=100.0))
+sent.added_date = time.time()
+undated = CLIENT.put(movie(name="Undated.2021.mkv"))
+bot.monitor_pass(monitor)
+check("a torrent added while the baseline settles is told as external, and so is one that does not say when it was added",
+	count_external(), 2)
+check("and its completion is told", completed_text(sent.name) in texts(), True)
+NOTIFIED.clear()
+recent = CLIENT.put(had_already(movie(name="Just.Before.2021.mkv"), ago=bot.BASELINE_CLOCK_MARGIN // 2))
+bot.monitor_pass(monitor)
+check("one added just before the baseline, by a clock that may not be the bot's, is told rather than missed", count_external(), 1)
+NOTIFIED.clear()
+for _ in range(bot.BASELINE_SETTLE_POLLS):
+	bot.monitor_pass(monitor)
+CLIENT.put(had_already(movie(name="Old.But.Seen.Late.2019.mkv")))
+bot.monitor_pass(monitor)
+check("the baseline settles for a while only: after it a torrent first seen is told, whatever its date", count_external(), 1)
+
+# A torrent the bot adds while the baseline settles is still the bot's
+fresh(notify_external=True)
+bot.client = LazyClient(lambda: CLIENT, FakeClient, clock=lambda: _lazy_clock[0])
+bot.client.connect()  # As the bot does when it starts
+monitor = bot.new_monitor()
+check("up at start: nothing to tell about the connection", monitor["tell_connected"], False)
+bot.monitor_pass(monitor)
+added = bot_add(movie(progress=100.0))
+CLIENT.put(movie(name="Added.Outside.2020.mkv")).added_date = time.time()
+# A manager started just before the bot answers at once and is still loading its torrents
+CLIENT.put(had_already(movie(name="Late.Listed.2020.mkv", progress=100.0)))
+bot.monitor_pass(monitor)
+check("a finished torrent the bot added right after starting is told", completed_text(added.name) in texts(), True)
+check("and one added from outside right after starting is told too", count_external(), 1)
+check("but not one the manager already had and listed late", completed_text("Late.Listed.2020.mkv") in texts(), False)
+
+# While settling, what the bot adds is still the bot's
+fresh(notify_external=True)
+_manager_up[0] = False
+bot.client = LazyClient(_lazy_factory, FakeClient, clock=lambda: _lazy_clock[0])
+_lazy_clock[0] += RETRY_SECONDS
+monitor = bot.new_monitor()
+bot.monitor_pass(monitor)
+_manager_up[0] = True
+_lazy_clock[0] += RETRY_SECONDS
+bot.monitor_pass(monitor)
+NOTIFIED.clear()
+added = bot_add(movie(progress=100.0))
+CLIENT.put(had_already(movie(name="Late.Listed.2020.mkv")))
+bot.monitor_pass(monitor)
+check("while settling, a finished torrent the bot added is still told", completed_text(added.name) in texts(), True)
+check("and the late listed one is not told as external", count_external(), 0)
+
+# What the startup message says when the manager is not there: wait, or fix the configuration
+from torrent_clients import LoginRefusedError
+def startup_text(error):
+	def failing():
+		raise error
+	NOTIFIED.clear()
+	bot.client = LazyClient(failing, FakeClient, clock=lambda: _lazy_clock[0])
+	_lazy_clock[0] += 2 * 3600
+	try:
+		bot.client.connect()
+	except TorrentClientError:
+		pass
+	bot.send_startup_message()
+	return texts()[0]
+def startup_key(error):
+	text = startup_text(error)
+	return [key for key in ("STARTUP_MESSAGE_WAITING", "STARTUP_MESSAGE_REFUSED")
+			if text == bot.get_text(key, bot.VERSION, bot.html.escape(str(error)))]
+check("a manager that does not answer yet: the bot waits for it",
+	startup_key(TorrentClientError("Cannot connect to Transmission at tr:9091: Connection refused")), ["STARTUP_MESSAGE_WAITING"])
+check("a NAS whose Download Station has not started yet is waited for too, not told as a wrong password",
+	startup_key(TorrentClientError("Download Station is not installed or not running on this NAS")), ["STARTUP_MESSAGE_WAITING"])
+check("a refused login: the user is told to check the configuration",
+	startup_key(LoginRefusedError("qBittorrent login failed (HTTP 403)")), ["STARTUP_MESSAGE_REFUSED"])
+check("whatever words the error has", startup_key(LoginRefusedError("Cannot connect: timed out")), ["STARTUP_MESSAGE_REFUSED"])
+
+bot.client = _real_client
+bot.auto_mover_tick = _real_mover_tick
+
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")
 	print("\n\n".join(FAILED))

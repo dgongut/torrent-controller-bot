@@ -23,7 +23,7 @@ from telebot.types import InlineKeyboardMarkup
 from logger import debug, error, warning
 from message_queue import MessageQueue, describe_error
 from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, is_sample_file, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
-from torrent_clients import DuplicateTorrentError, RestartRequiredError, expected_torrent_ids, FILE_HIGH, FILE_LOW, FILE_NORMAL, FILE_SKIP, PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, content_root, create_client
+from torrent_clients import DuplicateTorrentError, RestartRequiredError, expected_torrent_ids, FILE_HIGH, FILE_LOW, FILE_NORMAL, FILE_SKIP, PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, client_class, content_root, create_client, LazyClient
 import auto_mover
 from add_queue import AddQueue, MAX_AGE as ADD_QUEUE_MAX_AGE
 import bot_settings
@@ -31,7 +31,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.16.3"
+VERSION = "1.16.4"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -148,13 +148,20 @@ ADMIN_IDS = [x.strip() for x in str(TELEGRAM_ADMIN).split(',')]
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 message_queue = MessageQueue(delay_between_messages=0.3)
 
+# The bot starts even when the manager does not answer yet: exiting made a
+# container with restart: always go up and down until it did. Until then
+# every call tries to connect first and fails like a call to a manager that
+# went away (see LazyClient), and the monitor connects in the background
 try:
-	client = create_client(_config_module)
-	client_version = client.test_connection()
-	debug(f"Connected to {client_version}")
-except TorrentClientError as e:
+	client = LazyClient(lambda: create_client(_config_module), client_class(_config_module))
+except TorrentClientError as e:  # A TORRENT_CLIENT that does not exist: no point in waiting
 	error(str(e))
 	sys.exit(1)
+try:
+	client.connect()
+	debug(f"Connected to {client.version}")
+except TorrentClientError as e:
+	warning(f"{e}. Starting anyway: the bot connects as soon as the torrent client answers")
 
 
 # ---------------------------------------------------------------------------
@@ -6450,12 +6457,19 @@ def download_telegram_file(file_id):
 def handle_document(message):
 	document = message.document
 	is_torrent = bool(document.file_name) and document.file_name.lower().endswith(".torrent")
+	# Any other file with a link in its caption is a post carrying a torrent:
+	# its links are added, as with a photo
+	links = [] if is_torrent or not message.caption else message_links(message)
 	# In a group the bot sees every file anyone posts: only an admin's .torrent
-	# is for it, and the rest gets no answer, as with the links posted there
+	# (or post with a link) is for it, and the rest gets no answer, as with
+	# the links posted there
 	if getattr(message.chat, "type", None) != "private" and (
-			not is_torrent or not is_authorized(message.from_user.id, message.chat.id)):
+			not (is_torrent or links) or not is_authorized(message.from_user.id, message.chat.id)):
 		return
 	if not check_auth(message):
+		return
+	if links:
+		add_links_from_message(message, links, quiet=True)
 		return
 	if not is_torrent:
 		send_message(message.chat.id, get_text("ADD_INVALID_FILE"), thread_id=message_thread(message))
@@ -6495,32 +6509,77 @@ def handle_text(message):
 			handle_pending_input(message, pending)
 			return
 
-	if text.lower().startswith("magnet:"):
+	alone = is_link(text) and not re.search(r"\s", text)
+	if alone and text.lower().startswith("magnet:"):
 		add_magnet_from_message(message, text)
-	elif text.lower().startswith(("http://", "https://")) and " " not in text:
+	elif alone:
 		add_url_from_message(message, text)
 	else:
-		# Links inside a longer message or hidden behind text ("Hola! Esto es un enlace")
-		for url in message_links(message):
-			if url.lower().startswith("magnet:"):
-				add_magnet_from_message(message, url)
-			elif url.lower().startswith(("http://", "https://")):
-				add_url_from_message(message, url)
+		# Links inside a longer message or hidden behind text ("Hola! Esto es
+		# un enlace"), and a magnet with something after it
+		add_links_from_message(message, message_links(message))
+
+
+@bot.message_handler(content_types=["photo", "video", "animation", "audio"])
+def handle_media(message):
+	"""A post with a picture (a forwarded release from a channel) carries its
+	text and links in the caption: its links are torrents to add. Without a
+	link it is not for the bot and gets no answer"""
+	if not message.caption or not is_authorized(message.from_user.id, message.chat.id):
+		return
+	links = message_links(message)
+	if not links:
+		return
+	drop_pending_input(message.chat.id, message.from_user.id)
+	add_links_from_message(message, links, quiet=True)
+
+
+def add_links_from_message(message, links, quiet=False):
+	"""quiet: a link that is not a torrent, or cannot be downloaded, gets no
+	answer. A post forwarded from a channel carries others (the film's page,
+	the trailer...) next to the one to the torrent, and each would be told
+	as not being one. When none of them was a torrent that is told, once and
+	only in private: in a group the post may not be for the bot"""
+	added = 0
+	for url in links:
+		if url.lower().startswith("magnet:"):
+			add_magnet_from_message(message, url)
+			added += 1
+		elif url.lower().startswith(("http://", "https://")):
+			added += add_url_from_message(message, url, quiet=quiet)
+	if quiet and not added and message.chat.type == "private":
+		send_message(message.chat.id, get_text("ADD_NO_TORRENT_LINK"), thread_id=message_thread(message))
 
 
 def is_link(text):
-	"""A whole message that is a magnet or a single web link"""
+	"""A message that is a single web link, or that starts with a magnet:
+	alone, with its name written with spaces or with something after it, it
+	is a torrent to add and never the answer to a question ("Magnet: ..." is
+	a message with a magnet in it)"""
 	lowered = (text or "").strip().lower()
-	return lowered.startswith("magnet:") or (lowered.startswith(("http://", "https://")) and " " not in lowered)
+	return lowered.startswith("magnet:?") or (lowered.startswith(("http://", "https://")) and not re.search(r"\s", lowered))
+
+
+# A magnet inside a text ends at the first space, except in its name (dn),
+# which some sites write with its spaces: there it goes on while more of the
+# magnet (&tr=...) follows on the same line. Cut at the first space it lost
+# its trackers
+_MAGNET_PARAM = r"(?:dn=(?:(?!magnet:\?|://)[^&\n])*(?=&)|[^\s&]+)"
+MAGNET_IN_TEXT = re.compile(rf"magnet:\?{_MAGNET_PARAM}(?:&{_MAGNET_PARAM}?)*", re.IGNORECASE)
 
 
 def message_links(message):
-	"""The URLs of the link entities of a message, without duplicates. A
-	text_link carries its URL; a url entity is a slice of the text, whose
-	offsets Telegram counts in UTF-16 code units"""
+	"""The URLs of the link entities of a message or of the caption of a
+	photo or video, without duplicates. A text_link carries its URL; a url
+	entity is a slice of the text, whose offsets Telegram counts in UTF-16
+	code units"""
 	links = []
-	encoded = message.text.encode("utf-16-le")
-	for entity in message.entities or []:
+	if message.text:
+		text, entities = message.text, message.entities
+	else:
+		text, entities = message.caption or "", getattr(message, "caption_entities", None)
+	encoded = text.encode("utf-16-le")
+	for entity in entities or []:
 		if entity.type == "text_link":
 			url = entity.url
 		elif entity.type == "url":
@@ -6529,6 +6588,17 @@ def message_links(message):
 			continue
 		if url and url not in links:
 			links.append(url)
+	# Telegram does not mark a magnet as a link: one in the middle of the text
+	# is only text. Without what closes the sentence around it, and not when
+	# it is cut short ("…") or is one a link already gave
+	hashes = {magnet_hash(url) for url in links if url.lower().startswith("magnet:")}
+	for url in MAGNET_IN_TEXT.findall(text):
+		url = re.sub(r"[ \t]", "%20", url.rstrip(".,;:!?)]}>»\"'"))
+		info_hash = magnet_hash(url)
+		if "…" in url or not info_hash or info_hash in hashes:
+			continue
+		hashes.add(info_hash)
+		links.append(url)
 	return links
 
 
@@ -6538,7 +6608,8 @@ def add_magnet_from_message(message, magnet):
 	start_add_flow(message.chat.id, name, magnet=magnet, thread_id=message_thread(message))
 
 
-def add_url_from_message(message, url):
+def add_url_from_message(message, url, quiet=False):
+	"""Whether the link was a torrent. quiet: see add_links_from_message"""
 	# In groups, ignore invalid links silently (the bot may live with other
 	# bots and people pasting links); only reply in private chats
 	is_private = message.chat.type == "private"
@@ -6546,19 +6617,20 @@ def add_url_from_message(message, url):
 		data, name = download_torrent_from_url(url)
 	except MagnetRedirect as redirect:
 		add_magnet_from_message(message, redirect.magnet)
-		return
+		return True
 	except ValueError:
 		debug(f"URL is not a torrent, ignored: {url}")
-		if is_private:
+		if is_private and not quiet:
 			send_message(message.chat.id, get_text("ADD_URL_NOT_TORRENT"), thread_id=message_thread(message))
-		return
+		return False
 	except Exception as e:
 		debug(f"Cannot download URL {url}: {e}")
-		if is_private:
+		if is_private and not quiet:
 			send_message(message.chat.id, get_text("ADD_URL_ERROR", html.escape(str(e))), thread_id=message_thread(message))
-		return
+		return False
 	count_usage("add_url")
 	start_add_flow(message.chat.id, name, data=data, thread_id=message_thread(message))
+	return True
 
 
 # ---------------------------------------------------------------------------
@@ -7528,9 +7600,15 @@ def dispatch_callback(chat_id, message_id, user_id, data, thread_id=None, messag
 # ---------------------------------------------------------------------------
 
 def send_startup_message():
+	if not client.connected:
+		# A manager that answers and refuses the bot (a wrong password...)
+		# will not connect by waiting: the user has to fix the configuration
+		key = "STARTUP_MESSAGE_REFUSED" if client.refused else "STARTUP_MESSAGE_WAITING"
+		notify(get_text(key, VERSION, html.escape(str(client.last_error))))
+		return
 	try:
 		torrent_count = len(client.get_torrents())
-		text = get_text("STARTUP_MESSAGE", VERSION, html.escape(client_version), torrent_count)
+		text = get_text("STARTUP_MESSAGE", VERSION, html.escape(client.version), torrent_count)
 	except TorrentClientError as e:
 		text = get_text("STARTUP_MESSAGE_ERROR", VERSION, html.escape(str(e)))
 	notify(text)
@@ -7623,18 +7701,24 @@ def torrent_error_text(torrent):
 	return torrent.error_message or ""
 
 
-def poll_torrents(states):
+def poll_torrents(states, had_before=None):
 	"""One pass of the monitor. states holds the last state of every torrent
 	seen since the bot started (None on the first poll, which only builds the
 	baseline). Torrents that drop out of the list are remembered too, so a
 	manager that is restarting and lists them bit by bit never makes them look
-	new or freshly completed. Returns the updated states"""
+	new or freshly completed. While the baseline settles (see monitor_pass)
+	had_before is when it was built: a torrent seen for the first time that
+	the manager says it had by then joins it silently, unless the bot added
+	it. One added since is new, and one that does not say when it was added
+	is taken as new too. Returns the updated states"""
 	baseline = states is None
 	states = {} if baseline else states
 	torrents = client.get_torrents()
 	new_ids = [str(t.id) for t in torrents if str(t.id) not in states]
 	external = set()
 	late = {}
+	absorbed = set()
+	added = {str(t.id): added_timestamp(t.added_date) for t in torrents} if had_before else {}
 	if new_ids and not baseline:
 		watch = (bot_settings.get("notify_external_added") or (auto_rename_enabled() and bot_settings.get("auto_rename_external"))
 				or auto_move_series_enabled(external=True))
@@ -7648,13 +7732,15 @@ def poll_torrents(states):
 					late_add = {}  # Its queued add has what it was for
 				if late_add is not None:
 					late[torrent_id] = late_add
+				elif had_before and 0 < added[torrent_id] < had_before:
+					absorbed.add(torrent_id)
 				elif watch:
 					external.add(torrent_id)
 	for torrent in torrents:
 		torrent_id = str(torrent.id)
 		prev = states.get(torrent_id)
 		state = {"finished": torrent_finished(torrent, prev), "error": torrent_error_text(torrent), "status": torrent.status}
-		if not baseline:
+		if not baseline and torrent_id not in absorbed:
 			if torrent_id in late:
 				try:
 					handle_late_add(torrent.id, late[torrent_id])
@@ -7695,25 +7781,77 @@ def poll_torrents(states):
 	return states
 
 
+# A manager that has just started (with the bot, or after it) can list only
+# part of its torrents at first: for this many polls after the first one the
+# baseline keeps taking in what the manager already had, see poll_torrents
+BASELINE_SETTLE_POLLS = 10
+# The clock of the manager is not the one of the bot: a torrent added up to
+# this long before the baseline, by the clock of the manager, counts as new.
+# Telling one the manager had for a minute is better than missing a new one
+BASELINE_CLOCK_MARGIN = 60
+
+
+def monitor_pass(monitor):
+	"""One pass of torrent_monitor. monitor holds what it carries from pass
+	to pass: the states, when the baseline was built and the polls it still
+	settles for, whether the connection still has to be told (the bot started
+	without the manager), when the mover last ran and whether the wait for
+	the manager was logged"""
+	before = monitor["states"]
+	started = time.time()
+	settling = monitor["baseline_at"] is not None and monitor["settle_polls"] > 0
+	try:
+		monitor["states"] = poll_torrents(before, monitor["baseline_at"] - BASELINE_CLOCK_MARGIN if settling else None)
+	except Exception as e:
+		# While the manager has never answered every pass fails the same way:
+		# once in the log is enough
+		if client.connected:
+			warning(f"Torrent monitor: {e}")
+		elif not monitor["wait_logged"]:
+			monitor["wait_logged"] = True
+			how_often = "now and then, without insisting" if client.refused else f"every {MONITOR_INTERVAL_SECONDS} s"
+			warning(f"Torrent monitor: {e}. Trying again {how_often}")
+	else:
+		if before is None:
+			monitor["baseline_at"] = started
+		elif settling:
+			monitor["settle_polls"] -= 1
+	if monitor["tell_connected"] and client.connected and monitor["states"] is not None:
+		monitor["tell_connected"] = False
+		debug(f"Connected to {client.version}")
+		notify(get_text("CLIENT_CONNECTED", html.escape(client.version)))
+		# What was added while it was away goes now, not after the back-off of
+		# the queue (only here: a manager that answers this but not an add is
+		# busy, and is left alone as the queue decides)
+		if len(queued_adds):
+			queued_adds.succeeded()
+	if not client.connected:
+		return
+	# The first check of the mover comes one interval after the manager
+	# answered, once it had time to be listing all its torrents
+	if monitor["last_mover"] is None:
+		monitor["last_mover"] = time.monotonic()
+	elif time.monotonic() - monitor["last_mover"] >= AUTO_MOVER_INTERVAL_SECONDS:
+		monitor["last_mover"] = time.monotonic()
+		try:
+			auto_mover_tick()
+		except Exception as e:
+			warning(f"Automatic mover: {e}")
+
+
+def new_monitor():
+	return {"states": None, "baseline_at": None, "settle_polls": BASELINE_SETTLE_POLLS, "tell_connected": not client.connected,
+			"last_mover": time.monotonic() if client.connected else None, "wait_logged": False}
+
+
 def torrent_monitor():
 	"""Background loop that detects finished/errored/externally added torrents
 	and notifies. The first poll only builds the baseline, so restarting the
-	bot never re-notifies torrents that were already there"""
-	states = None
-	# The first check of the mover comes one interval after the start, once
-	# the manager had time to be up and listing all its torrents
-	last_mover = time.monotonic()
+	bot never re-notifies torrents that were already there. It is also what
+	connects to a manager that was not answering when the bot started"""
+	monitor = new_monitor()
 	while True:
-		try:
-			states = poll_torrents(states)
-		except Exception as e:
-			warning(f"Torrent monitor: {e}")
-		if time.monotonic() - last_mover >= AUTO_MOVER_INTERVAL_SECONDS:
-			last_mover = time.monotonic()
-			try:
-				auto_mover_tick()
-			except Exception as e:
-				warning(f"Automatic mover: {e}")
+		monitor_pass(monitor)
 		time.sleep(MONITOR_INTERVAL_SECONDS)
 
 
@@ -7735,7 +7873,10 @@ def track_polling_heartbeat():
 
 
 if __name__ == "__main__":
-	debug(f"torrent-controller-bot {VERSION} started. Connected to {client_version}")
+	if client.connected:
+		debug(f"torrent-controller-bot {VERSION} started. Connected to {client.version}")
+	else:
+		debug(f"torrent-controller-bot {VERSION} started. Waiting for the torrent client to answer")
 	send_startup_message()
 	mover_close_lost_notice()
 	threading.Thread(target=torrent_monitor, daemon=True).start()

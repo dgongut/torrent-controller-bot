@@ -23,6 +23,7 @@ from torrent_clients.base import (
 	RestartRequiredError,
 	SessionSummary,
 	TorrentClient,
+	LoginRefusedError,
 	TorrentClientError,
 	TorrentInfo,
 	TorrentStatus,
@@ -198,7 +199,7 @@ class DelugeClient(TorrentClient):
 	def _login(self):
 		try:
 			if not self._rpc("auth.login", self.password):
-				raise TorrentClientError("Deluge login failed: wrong password")
+				raise LoginRefusedError("Deluge login failed: wrong password")
 			if not self._rpc("web.connected"):
 				hosts = self._rpc("web.get_hosts") or []
 				if not hosts:

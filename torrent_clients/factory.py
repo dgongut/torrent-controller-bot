@@ -4,13 +4,25 @@ from torrent_clients.base import TorrentClientError
 
 
 def create_client(config):
-	"""Creates a TorrentClient based on config.TORRENT_CLIENT.
-	New torrent managers only need to be registered here."""
+	"""Creates a TorrentClient based on config.TORRENT_CLIENT, connecting to
+	the manager. New torrent managers only need to be registered here."""
+	client_class, kwargs = client_spec(config)
+	return client_class(**kwargs)
+
+
+def client_class(config):
+	"""The class of the configured client, without connecting: its
+	capabilities are class attributes"""
+	return client_spec(config)[0]
+
+
+def client_spec(config):
+	"""The class of the configured client and what it is created with"""
 	client_name = (config.TORRENT_CLIENT or "transmission").lower()
 
 	if client_name == "transmission":
 		from torrent_clients.transmission_client import TransmissionClient
-		return TransmissionClient(
+		return TransmissionClient, dict(
 			host=config.TORRENT_CLIENT_HOST,
 			port=int(config.TORRENT_CLIENT_PORT or 9091),
 			username=config.TORRENT_CLIENT_USER,
@@ -21,7 +33,7 @@ def create_client(config):
 
 	if client_name == "qbittorrent":
 		from torrent_clients.qbittorrent_client import QBittorrentClient
-		return QBittorrentClient(
+		return QBittorrentClient, dict(
 			host=config.TORRENT_CLIENT_HOST,
 			port=int(config.TORRENT_CLIENT_PORT or 8080),
 			username=config.TORRENT_CLIENT_USER,
@@ -31,7 +43,7 @@ def create_client(config):
 
 	if client_name == "deluge":
 		from torrent_clients.deluge_client import DelugeClient
-		return DelugeClient(
+		return DelugeClient, dict(
 			host=config.TORRENT_CLIENT_HOST,
 			port=int(config.TORRENT_CLIENT_PORT or 8112),
 			password=config.TORRENT_CLIENT_PASSWORD,
@@ -41,7 +53,7 @@ def create_client(config):
 	if client_name == "download_station":
 		from torrent_clients.synology_client import SynologyClient
 		default_port = 5001 if config.TORRENT_CLIENT_PROTOCOL == "https" else 5000
-		return SynologyClient(
+		return SynologyClient, dict(
 			host=config.TORRENT_CLIENT_HOST,
 			port=int(config.TORRENT_CLIENT_PORT or default_port),
 			username=config.TORRENT_CLIENT_USER,

@@ -4,6 +4,7 @@ from torrent_clients.base import (
 	FILE_LOW,
 	FILE_NORMAL,
 	FILE_SKIP,
+	LoginRefusedError,
 	PermanentTorrentError,
 	RATIO_MODE_GLOBAL,
 	RATIO_MODE_NONE,
@@ -17,4 +18,5 @@ from torrent_clients.base import (
 	content_root,
 	expected_torrent_ids,
 )
-from torrent_clients.factory import create_client
+from torrent_clients.factory import client_class, create_client
+from torrent_clients.lazy import LazyClient

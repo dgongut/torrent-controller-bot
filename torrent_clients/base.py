@@ -44,6 +44,14 @@ class TorrentClientError(Exception):
 	pass
 
 
+class LoginRefusedError(TorrentClientError):
+	"""The manager answers and refuses the bot: a wrong user or password, an
+	address it does not let in. Waiting will not fix it, and insisting makes
+	it worse: managers count the failed logins and end up blocking whoever
+	keeps trying"""
+	pass
+
+
 class PermanentTorrentError(TorrentClientError):
 	"""Failure that retrying cannot fix, because the torrent manager will not
 	do what was asked no matter how many times it is told. Callers that retry
