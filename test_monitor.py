@@ -1533,6 +1533,30 @@ for notify_completed in (True, False):
 		texts(), [f"{completed_text(MOVIE_NAME)}\n\n{replaced_text([old], MOVIE_RENAMED)}"])
 	check(f"{label} with no button", MARKUPS, [None])
 
+# Capitals do not tell two names apart: "El Lobo de..." is "El lobo de..."
+OTHER_CASE = MOVIE_RENAMED.swapcase()
+fresh(auto_rename=True)
+old = old_copy(name=OTHER_CASE)
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("a name that differs only in its capitals is offered to replace too", (texts(), removals(), renames()),
+	([offer_text(new.name, MOVIE_RENAMED)], [], []))
+fresh(auto_rename=True, auto_replace=True)
+old = old_copy(name=OTHER_CASE)
+new = CLIENT.put(movie())
+finish(new, poll(None))
+check("and replaced when it is automatic, the new one with its own capitals",
+	(removals(), CLIENT.torrents[new.id].name, list(CLIENT.torrents)), ([("remove_torrents", [old.id], True)], MOVIE_RENAMED, [new.id]))
+fresh(notify_external=False, auto_rename=True, rename_external=True)
+CLIENT.put(movie(name=OTHER_CASE, progress=100.0))
+states = poll(None)
+t = CLIENT.put(movie())
+states = poll(states)
+check("the automatic rename does not take a name another has in other capitals",
+	(CLIENT.torrents[t.id].name, bot.get_text("ADD_AUTO_RENAME_DUPLICATE", bot.html.escape(MOVIE_RENAMED)) in "".join(texts())), (MOVIE_NAME, True))
+check("nor do accents written in another way make a name new",
+	bot.name_key("Am\u00e9lie") == bot.name_key("AME\u0301LIE"), True)
+
 # The automatic setting depends on the automatic rename
 fresh(auto_rename=False, auto_replace=True)
 old = old_copy()

@@ -12,6 +12,7 @@ import telebot
 import functools
 import threading
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from config import *
@@ -4543,11 +4544,18 @@ def ask_add_category(chat_id, pending_id, name, thread_id=None, message_id=None,
 		send_message(chat_id, text, reply_markup=markup, thread_id=thread_id)
 
 
+def name_key(name):
+	"""What two names are compared by: capitals do not tell them apart. The
+	same film arrives as "El Lobo de..." and "El lobo de...", and on many
+	disks both would be the same folder"""
+	return unicodedata.normalize("NFC", name or "").casefold()
+
+
 def name_already_exists(name, exclude_id=None):
-	"""True when another torrent already has exactly that name"""
+	"""True when another torrent already has that name, whatever its capitals"""
 	try:
 		for t in client.get_torrents():
-			if t.name == name and str(t.id) != str(exclude_id):
+			if name_key(t.name) == name_key(name) and str(t.id) != str(exclude_id):
 				return True
 	except TorrentClientError:
 		pass
@@ -4705,7 +4713,7 @@ def replace_targets(torrent):
 	if not suggested or suggested == torrent.name:
 		return None, []
 	try:
-		holders = [t for t in client.get_torrents() if t.name == suggested and str(t.id) != str(torrent.id)]
+		holders = [t for t in client.get_torrents() if name_key(t.name) == name_key(suggested) and str(t.id) != str(torrent.id)]
 		if not holders:
 			return None, []
 		# Managers list torrents without their files
