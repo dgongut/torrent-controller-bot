@@ -31,7 +31,7 @@ Control your torrent client from a single place.
 - ✅ Renaming the folders and files inside a torrent, one by one or in batch, dragging their subtitles along
 - ✅ Choose which files are downloaded and with what priority, one by one or a whole folder at once (for example, only some episodes of a season), seeing how far each file has got
 - ✅ Complete series: renames the folder, the season subfolders and the episodes in one go
-- ✅ Mass actions over a filter or search: resume, pause, verify, delete, move all or set their ratio and speed limits
+- ✅ Mass actions over a filter or search: resume, pause, verify, reannounce, delete, move all or set their ratio and speed limits
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
 - ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits

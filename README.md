@@ -31,7 +31,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Renombrado de las carpetas y archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
 - ✅ Elegir qué archivos se descargan y con qué prioridad, uno a uno o una carpeta entera (por ejemplo, bajar solo unos capítulos de una temporada), viendo cuánto lleva cada archivo
 - ✅ Series completas: renombra de una vez la carpeta, las subcarpetas de temporada y los episodios
-- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, verificar, borrar, mover todos o fijarles el límite de ratio y de velocidad
+- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, verificar, reanunciar, borrar, mover todos o fijarles el límite de ratio y de velocidad
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada

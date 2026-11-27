@@ -1652,7 +1652,7 @@ calls = callbacks_of(screen[1])
 check("the actions on all say how many torrents they cover",
 	screen[0].startswith(get_text("MASS_MENU_TITLE", bot_module.get_filter_label(config.FILTER_ALL), len(TORRENT_IDS))), True)
 check("the actions on all are all there", [c for c in calls if c.startswith("mass|")],
-	[bot_module.build_call("mass", a, config.FILTER_ALL) for a in ("resume", "pause", "verify", "move", "cat", "ratio", "delete")])
+	[bot_module.build_call("mass", a, config.FILTER_ALL) for a in ("resume", "pause", "verify", "reannounce", "move", "cat", "ratio", "delete")])
 check("their back goes to the page they were opened from", calls[-2], bot_module.build_call("list", config.FILTER_ALL, 1))
 tf = tracker_filter()
 calls = callbacks_of(press(bot_module.build_call("massMenu", tf, 0))[1])
@@ -2007,6 +2007,37 @@ check("a manager that cannot verify has no verify of all",
 CALLS.clear()
 check("nor does an old button verify anything there", (press(bot_module.build_call("mass", "verify", config.FILTER_ALL)), CALLS)[1], [])
 FakeClient.supports_verify = True
+# Reannouncing all: only the ones that have somebody to ask
+def _announcing(torrent_id, status=bot_module.TorrentStatus.SEEDING, trackers=("tracker.example.org",)):
+	torrent = fake_torrent(torrent_id)
+	torrent.status, torrent.trackers = status, list(trackers)
+	return torrent
+_mixed = [_announcing(TORRENT_IDS[0]), _announcing(TORRENT_IDS[1], bot_module.TorrentStatus.DOWNLOADING),
+	_announcing(TORRENT_IDS[2], trackers=()), _announcing(TORRENT_IDS[3], bot_module.TorrentStatus.PAUSED),
+	_announcing(TORRENT_IDS[4], bot_module.TorrentStatus.CHECKING)]
+bot_module.client.get_torrents = lambda status=None, query=None: list(_mixed)
+reannounce_screen = press(bot_module.build_call("mass", "reannounce", config.FILTER_ALL))
+check("reannouncing all counts the ones that announce and says the rest stay out", reannounce_screen[0],
+	get_text("MASS_CONFIRM_REANNOUNCE", 3) + "\n" + get_text("MASS_REANNOUNCE_SKIPPED", 2))
+CALLS.clear()
+reannounced = press(labelled(reannounce_screen[1])[get_text("BUTTON_CONFIRM")])
+check("and asks the manager for those only, in one call", (CALLS, reannounced[0]),
+	([("reannounce_torrents", list(TORRENT_IDS[:3]))], get_text("MASS_DONE_REANNOUNCE", 3)))
+bot_module.client.get_torrents = lambda status=None, query=None: _mixed[:3]
+check("with all of them announcing nothing is said of the rest",
+	press(bot_module.build_call("mass", "reannounce", config.FILTER_ALL))[0], get_text("MASS_CONFIRM_REANNOUNCE", 3))
+bot_module.client.get_torrents = lambda status=None, query=None: _mixed[3:]
+CALLS.clear()
+none_screen = press(bot_module.build_call("mass", "reannounce", config.FILTER_ALL))
+check("with none that announces it says why and offers nothing to confirm", (none_screen[0], get_text("BUTTON_CONFIRM") in labelled(none_screen[1]), CALLS),
+	(get_text("MASS_REANNOUNCE_NONE", 2), False, []))
+bot_module.client.get_torrents = _real_get_torrents
+bot_module.client.supports_reannounce = False
+check("a manager that cannot reannounce has no reannounce of all",
+	bot_module.build_call("mass", "reannounce", config.FILTER_ALL) in callbacks_of(bot_module.build_mass_menu(config.FILTER_ALL, 0)[1]), False)
+CALLS.clear()
+check("nor does an old button reannounce anything there", (press(bot_module.build_call("mass", "reannounce", config.FILTER_ALL)), CALLS)[1], [])
+bot_module.client.supports_reannounce = True
 CALLS.clear()
 old_button = press(bot_module.build_call("confirmMass", "delete", config.FILTER_ALL, "1"))
 check("a confirm button from before deletes nothing and asks again", (CALLS, old_button[0]),

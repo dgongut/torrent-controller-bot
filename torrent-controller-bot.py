@@ -31,7 +31,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.16.5"
+VERSION = "1.16.6"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -1110,6 +1110,11 @@ def build_list(filter_key, page, refreshing=False, order=None):
 	return text, markup
 
 
+def announces(torrent):
+	"""Only an active torrent announces: not a paused one, nor one being checked"""
+	return torrent.status in (TorrentStatus.DOWNLOADING, TorrentStatus.SEEDING)
+
+
 def mass_menu_rows(filter_key, total):
 	"""Buttons of the actions on every torrent of a list, empty when there is none"""
 	rows = []
@@ -1118,8 +1123,13 @@ def mass_menu_rows(filter_key, total):
 			InlineKeyboardButton(get_text("BUTTON_MASS_RESUME"), callback_data=build_call("mass", "resume", filter_key)),
 			InlineKeyboardButton(get_text("BUTTON_MASS_PAUSE"), callback_data=build_call("mass", "pause", filter_key)),
 		])
+		upkeep = []
 		if client.supports_verify:
-			rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_VERIFY"), callback_data=build_call("mass", "verify", filter_key))])
+			upkeep.append(InlineKeyboardButton(get_text("BUTTON_MASS_VERIFY"), callback_data=build_call("mass", "verify", filter_key)))
+		if client.supports_reannounce:
+			upkeep.append(InlineKeyboardButton(get_text("BUTTON_MASS_REANNOUNCE"), callback_data=build_call("mass", "reannounce", filter_key)))
+		if upkeep:
+			rows.append(upkeep)
 		rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key))])
 		if client.supports_categories:
 			# Where the folders go by category, the category is what is changed, not the folder
@@ -1286,8 +1296,8 @@ def build_detail(torrent_id, filter_key, page, refreshing=False):
 	first_row = [toggle]
 	if client.supports_verify:
 		first_row.append(InlineKeyboardButton(get_text("BUTTON_VERIFY"), callback_data=build_call("verify", torrent.id, filter_key, page)))
-	# Only an active torrent announces, and only if it has a tracker to ask
-	if client.supports_reannounce and torrent.trackers and torrent.status in (TorrentStatus.DOWNLOADING, TorrentStatus.SEEDING):
+	# And only if it has a tracker to ask
+	if client.supports_reannounce and torrent.trackers and announces(torrent):
 		first_row.append(InlineKeyboardButton(get_text("BUTTON_REANNOUNCE"), callback_data=build_call("reannounce", torrent.id, filter_key, page)))
 	markup.row(*first_row)
 	action_row = []
@@ -5656,6 +5666,19 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 	elif action == "verify" and client.supports_verify:
 		text = get_text("MASS_CONFIRM_VERIFY", count)
 		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "verify", mass_ctx, "-")))
+	elif action == "reannounce" and client.supports_reannounce:
+		# Only the active ones are counted. The trackers of the listing are not
+		# looked at: qBittorrent names there only a tracker that is answering,
+		# and the ones whose tracker is failing are the ones to ask again
+		announcing = [str(t.id) for t in torrents if announces(t)]
+		if not announcing:
+			edit_message(chat_id, message_id, get_text("MASS_REANNOUNCE_NONE", count), back_close_markup(back_call))
+			return
+		mass_ctx = new_action_context("m", filter_key=filter_key, ids=announcing)
+		text = get_text("MASS_CONFIRM_REANNOUNCE", len(announcing))
+		if len(announcing) < count:
+			text += "\n" + get_text("MASS_REANNOUNCE_SKIPPED", count - len(announcing))
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "reannounce", mass_ctx, "-")))
 	elif action == "delete":
 		text = get_text("MASS_CONFIRM_DELETE", count)
 		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmMass", "delete", mass_ctx, "0")))
@@ -5772,6 +5795,9 @@ def do_mass_action(chat_id, message_id, action, mass_ctx, extra=None):
 		elif action == "verify":
 			client.verify_torrents(ids)
 			text = get_text("MASS_DONE_VERIFY", count)
+		elif action == "reannounce":
+			client.reannounce_torrents(ids)
+			text = get_text("MASS_DONE_REANNOUNCE", count)
 		elif action == "ratio":
 			limit = None if extra == "g" else (-1 if extra == "n" else parse_ratio(extra or ""))
 			if limit is None and extra != "g":
