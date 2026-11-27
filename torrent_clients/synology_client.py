@@ -263,6 +263,10 @@ def _num(value, default=0):
 			return default
 
 
+# What a title is told apart from an info hash by, among the keys of an add (see add_keys)
+TITLE_KEY = "title:"
+
+
 def _magnet_keys(link):
 	"""Info hashes (lowercase hex, or the multihash of a v2 torrent) and
 	display names (casefolded) of a magnet link: what tells its task apart"""
@@ -430,6 +434,7 @@ class SynologyClient(TorrentClient):
 		self._saved_limits = {}
 		self._moves = {}  # Task id -> _Move of its data that has not ended
 		self._moves_lock = threading.RLock()
+		self._plan_lock = threading.Lock()  # See _move
 		self._moves_file = _moves_path()
 		self._restored = set()  # Moves taken back from a previous run whose tasks are still to be checked
 		self._discover()
@@ -905,6 +910,36 @@ class SynologyClient(TorrentClient):
 			raise DuplicateTorrentError(message, torrent_id=str(existing.get("id")) if existing else None)
 		return info
 
+	@staticmethod
+	def add_keys(magnet=None, torrent_data=None):
+		"""The id of a task says nothing of its torrent, and Download Station
+		does not report the info hash: a task is told by the info hash in its
+		link, or by its title, which is the name in the link or in the file"""
+		hashes = set(expected_torrent_ids(magnet=magnet, torrent_data=torrent_data))
+		names = set()
+		if magnet:
+			magnet_hashes, names = _magnet_keys(magnet)
+			hashes |= magnet_hashes
+		name = _torrent_name(torrent_data)
+		if name:
+			names.add(name.casefold())
+		return sorted(hashes) + sorted(TITLE_KEY + name for name in names)
+
+	def torrent_keys(self, torrent_id):
+		keys = [str(torrent_id).lower()]
+		try:
+			tasks = self._raw_tasks([str(torrent_id)], "detail")
+		except TorrentClientError:
+			return keys
+		for t in tasks:
+			uri = (_mapping(_mapping(t.get("additional")).get("detail")).get("uri") or "").strip()
+			keys += sorted(_magnet_keys(uri)[0])
+			title = (t.get("title") or "").strip().casefold()
+			if title:
+				# Until the metadata comes a task can be titled after the info hash itself
+				keys += [title, TITLE_KEY + title]
+		return list(dict.fromkeys(keys))
+
 	def _duplicated(self, failed, magnet, torrent_data):
 		"""The raw task already in Download Station that the add of a magnet
 		or a .torrent file failed as a duplicate of, None when it cannot be
@@ -1229,31 +1264,40 @@ class SynologyClient(TorrentClient):
 		ids = [str(i) for i in torrent_ids]
 		if not destination:
 			raise TorrentClientError("No destination given")
-		# A move of these tasks that has not ended is seen through first: until
-		# then they only look like they are where they point
-		for move in self._moves_of(ids):
-			self._drive(move)
-		self._require_folder(destination)
-		tasks = [t for t in self._tasks_by_id(ids) if (t.download_dir or "").strip("/") != destination]
-		if not tasks:
-			return  # Everything is already there
-		sources = self._content_on_disk(tasks)
-		# A finished download has its data in its folder. Not finding it there
-		# means it goes by another name, and pointing the task elsewhere
-		# without its data would only break it
-		lost = [t for t in tasks if t.id not in sources and self._complete(t)]
-		if lost:
-			raise PermanentTorrentError(f"Cannot find on disk the data of {_placed(lost)}: nothing was moved")
-		self._refuse_collisions(destination, list(sources.values()))
+		while True:
+			# A move of these tasks that has not ended is seen through first: until
+			# then they only look like they are where they point
+			for move in self._moves_of(ids):
+				self._drive(move)
+			# One order at a time from here until its move is on record. Two
+			# for the same task (a move by hand over the automatic one, a
+			# double tap) would otherwise both find nothing under way and both
+			# move its data, leaving the task with a move that can never end
+			with self._plan_lock:
+				if self._moves_of(ids):
+					continue  # Another order got there first: its move is followed
+				self._require_folder(destination)
+				tasks = [t for t in self._tasks_by_id(ids) if (t.download_dir or "").strip("/") != destination]
+				if not tasks:
+					return  # Everything is already there
+				sources = self._content_on_disk(tasks)
+				# A finished download has its data in its folder. Not finding it there
+				# means it goes by another name, and pointing the task elsewhere
+				# without its data would only break it
+				lost = [t for t in tasks if t.id not in sources and self._complete(t)]
+				if lost:
+					raise PermanentTorrentError(f"Cannot find on disk the data of {_placed(lost)}: nothing was moved")
+				self._refuse_collisions(destination, list(sources.values()))
 
-		# A task that is running holds its files: it is stopped for the move and
-		# started again once its data is where the task points
-		active = [t.id for t in tasks if t.status in PAUSABLE_STATUSES]
-		if active:
-			self._check_items(self._call(TASK_API, "pause", params={"id": ",".join(active)}), "pause")
-			time.sleep(PAUSE_SETTLE_DELAY)
-		move = _Move(destination, tasks, sources, active)
-		self._remember(move)
+				# A task that is running holds its files: it is stopped for the move and
+				# started again once its data is where the task points
+				active = [t.id for t in tasks if t.status in PAUSABLE_STATUSES]
+				if active:
+					self._check_items(self._call(TASK_API, "pause", params={"id": ",".join(active)}), "pause")
+					time.sleep(PAUSE_SETTLE_DELAY)
+				move = _Move(destination, tasks, sources, active)
+				self._remember(move)
+			break
 		self._drive(move)
 
 	@staticmethod

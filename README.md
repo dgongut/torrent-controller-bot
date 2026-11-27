@@ -31,7 +31,7 @@ Lleva el control de tu gestor de torrents desde un único lugar.
 - ✅ Renombrado de las carpetas y archivos que hay dentro de un torrent, uno a uno o en lote, arrastrando los subtítulos
 - ✅ Elegir qué archivos se descargan y con qué prioridad, uno a uno o una carpeta entera (por ejemplo, bajar solo unos capítulos de una temporada), viendo cuánto lleva cada archivo
 - ✅ Series completas: renombra de una vez la carpeta, las subcarpetas de temporada y los episodios
-- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, borrar, mover todos o fijarles el límite de ratio y de velocidad
+- ✅ Acciones masivas sobre un filtro o búsqueda: reanudar, pausar, verificar, borrar, mover todos o fijarles el límite de ratio y de velocidad
 - ✅ Filtro de torrents por tracker e información del tracker en el detalle de cada torrent
 - ✅ Categorías de qBittorrent: filtrar por ellas, asignarlas y elegirlas al añadir un torrent
 - ✅ Ajustes del gestor: modo tortuga y límites de velocidad de subida/bajada
@@ -210,7 +210,7 @@ Está hecho para no sorprender:
 
 Transmission no responde a nada mientras mueve datos entre discos: durante un movimiento grande el bot dará error de conexión hasta que termine, y el aviso del mover se actualiza entonces. Lo que envíes mientras tanto queda en cola y se añade cuando termine.
 
-El espacio libre se le pregunta al gestor, así que el bot no necesita tener montados los discos. qBittorrent solo lo sabe de su carpeta de descargas por defecto: el origen tiene que ser esa carpeta o estar dentro de ella, y la pantalla lo avisa si no es así.
+El espacio libre se le pregunta al gestor, así que el bot no necesita tener montados los discos. Un qBittorrent reciente (5.3) lo dice de cualquier carpeta; uno antiguo solo de su carpeta de descargas por defecto: con él, el origen tiene que ser esa carpeta o estar dentro de ella, y la pantalla lo avisa si no es así.
 
 ## Qué puede hacer el bot con cada gestor
 

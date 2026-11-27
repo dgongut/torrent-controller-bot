@@ -31,7 +31,7 @@ Control your torrent client from a single place.
 - ✅ Renaming the folders and files inside a torrent, one by one or in batch, dragging their subtitles along
 - ✅ Choose which files are downloaded and with what priority, one by one or a whole folder at once (for example, only some episodes of a season), seeing how far each file has got
 - ✅ Complete series: renames the folder, the season subfolders and the episodes in one go
-- ✅ Mass actions over a filter or search: resume, pause, delete, move all or set their ratio and speed limits
+- ✅ Mass actions over a filter or search: resume, pause, verify, delete, move all or set their ratio and speed limits
 - ✅ Filter torrents by tracker and tracker info in each torrent's detail
 - ✅ qBittorrent categories: filter by them, assign them and pick one when adding a torrent
 - ✅ Client settings: turtle mode and upload/download speed limits
@@ -194,7 +194,7 @@ It is built not to surprise:
 
 Transmission answers nothing while it moves data between disks: during a big move the bot will show connection errors until it is done, and the notice of the mover is updated then. Whatever you send meanwhile waits in the queue and is added once it is done.
 
-The free space is asked to the manager, so the bot does not need the disks mounted. qBittorrent only knows it for its default download folder: the source has to be that folder or be inside it, and the screen warns when it is not.
+The free space is asked to the manager, so the bot does not need the disks mounted. A recent qBittorrent (5.3) tells it for any folder; an old one only for its default download folder: with it, the source has to be that folder or be inside it, and the screen warns when it is not.
 
 ## What the bot can do with each client
 

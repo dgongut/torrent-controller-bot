@@ -15,6 +15,7 @@ Every story starts from a fresh fake, and one that blows up fails without
 stopping the others."""
 
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -77,7 +78,7 @@ def raised(function, *args, **kwargs):
 
 
 # The adds poll the manager while it registers a new torrent: no waiting here
-qbittorrent_client.time = types.SimpleNamespace(sleep=lambda seconds: None, time=time.time)
+qbittorrent_client.time = types.SimpleNamespace(sleep=lambda seconds: None, time=time.time, monotonic=time.monotonic)
 deluge_client.time = types.SimpleNamespace(sleep=lambda seconds: None, time=time.time)
 
 
@@ -799,6 +800,19 @@ class FakeQbit:
 		self.version = "v5.3.0"
 		self.tags = set()
 		self.hash_of = {TORRENT_DATA: TORRENT_HASH, MAGNET: TORRENT_HASH, MAGNET_B32: TORRENT_HASH, OTHER_MAGNET: OTHER_HASH}
+		self.server_state = {"dl_info_speed": 10, "up_info_speed": 5, "dl_info_data": 3000, "up_info_data": 2000,
+							"free_space_on_disk": 5000, "alltime_dl": 90000, "alltime_ul": 80000, "use_alt_speed_limits": False}
+		self.rid = 0
+		self.sent = None  # (rid, torrents, server state) of the last sync answer, what the next one is told against
+		self.maindata = []  # Every sync answer, to tell what was transferred
+		self.rechecked = []
+		self.free_at = None  # Folder -> free bytes app/getFreeSpaceAtPath answers, None for a version without it
+		self.asked_hashes = []  # The hashes of each torrents/info asked by hash
+		self.info_status = None  # HTTP error a torrents/info by hash answers (a proxy refusing a long URL)
+		# Since 4.6 sync/maindata only tells what qBittorrent signals: a rename or
+		# a limit waits for the next state update. Hash -> fields it still
+		# reports with their old value
+		self.unsignalled = {}
 
 	def post(self, url, data=None, timeout=None, **kwargs):
 		return self.request("POST", url, data=data, timeout=timeout, **kwargs)
@@ -811,6 +825,7 @@ class FakeQbit:
 		return getattr(self, "e_" + endpoint.replace("/", "_"))(params or {}, data or {}, files)
 
 	def e_auth_login(self, params, data, files):
+		self.forget_session()
 		return http_response(204)
 
 	def e_app_version(self, params, data, files):
@@ -829,6 +844,9 @@ class FakeQbit:
 	def e_torrents_info(self, params, data, files):
 		torrents = list(self.torrents.values())
 		if "hashes" in params:
+			self.asked_hashes.append(params["hashes"])
+			if self.info_status:
+				return http_response(self.info_status, text="Request-URI Too Large")
 			torrents = [t for t in torrents if t["hash"] in params["hashes"].split("|")]
 		if "tag" in params:
 			if self.hidden_from_tag > 0:
@@ -860,6 +878,35 @@ class FakeQbit:
 			return http_response(payload={"added_torrent_ids": [torrent_hash], "failure_count": 0, "pending_count": 0, "success_count": 1})
 		return http_response(text="Ok.")
 
+	def e_torrents_rename(self, params, data, files):
+		t = self.torrents[data["hash"]]
+		self.unsignalled.setdefault(data["hash"], {}).setdefault("name", t["name"])
+		t["name"] = data["name"]
+		return http_response()
+
+	def e_torrents_setUploadLimit(self, params, data, files):
+		for torrent_hash in data["hashes"].split("|"):
+			self.unsignalled.setdefault(torrent_hash, {}).setdefault("up_limit", self.torrents[torrent_hash]["up_limit"])
+			self.torrents[torrent_hash]["up_limit"] = data["limit"]
+		return http_response()
+
+	def e_torrents_setShareLimits(self, params, data, files):
+		self.torrents[data["hashes"]]["ratio_limit"] = data["ratioLimit"]
+		return http_response()
+
+	def e_app_getFreeSpaceAtPath(self, params, data, files):
+		if self.free_at is None:
+			return http_response(404, text="Not Found")
+		# Like qBittorrent: the disk of the nearest folder that exists
+		path = params["path"].rstrip("/")
+		while path and path not in self.free_at:
+			path = path.rpartition("/")[0]
+		return http_response(text=str(self.free_at.get(path, -1)))
+
+	def e_torrents_recheck(self, params, data, files):
+		self.rechecked.append(data["hashes"])
+		return http_response()
+
 	def e_torrents_filePrio(self, params, data, files):
 		for index in data["id"].split("|"):
 			self.files[data["hash"]][int(index)]["priority"] = data["priority"]
@@ -869,7 +916,28 @@ class FakeQbit:
 		return http_response(payload={"dl_info_speed": 10, "up_info_speed": 5, "dl_info_data": 3000, "up_info_data": 2000})
 
 	def e_sync_maindata(self, params, data, files):
-		return http_response(payload={"server_state": {"free_space_on_disk": 5000, "alltime_dl": 90000, "alltime_ul": 80000}})
+		# Like qBittorrent: only what changed since the answer whose rid comes
+		# back, everything again (full_update) for a rid it does not know
+		torrents = {h: {k: v for k, v in {**t, **self.unsignalled.get(h, {})}.items() if k != "hash"} for h, t in self.torrents.items()}
+		self.rid += 1
+		answer = {"rid": self.rid}
+		if self.sent is None or params.get("rid") != self.sent[0]:
+			answer.update(full_update=True, torrents=copy.deepcopy(torrents), server_state=dict(self.server_state))
+		else:
+			_, before, state = self.sent
+			changed = {h: {k: v for k, v in t.items() if before.get(h, {}).get(k, object()) != v} for h, t in torrents.items()}
+			changed = {h: fields for h, fields in changed.items() if fields}
+			removed = [h for h in before if h not in torrents]
+			server = {k: v for k, v in self.server_state.items() if state.get(k) != v}
+			answer.update({key: value for key, value in (("torrents", changed), ("torrents_removed", removed),
+														("server_state", server)) if value})
+		self.sent = (self.rid, copy.deepcopy(torrents), dict(self.server_state))
+		self.maindata.append(answer)
+		return http_response(payload=answer)
+
+	def forget_session(self):
+		"""A new login (qBittorrent restarted, the session expired): it no longer knows any rid"""
+		self.sent = None
 
 	def e_transfer_speedLimitsMode(self, params, data, files):
 		return http_response(text="0")
@@ -959,6 +1027,156 @@ def qbit_session_stats():
 	summary = qbit.get_summary()
 	check("qBittorrent session stats", (summary.session_downloaded, summary.session_uploaded, summary.total_downloaded,
 		summary.total_uploaded, summary.free_space), (3000, 2000, 90000, 80000, 5000))
+
+
+@scenario
+def qbit_incremental_sync():
+	# Thousands of torrents are several MB on every listing: after the first
+	# one, qBittorrent is only asked what changed
+	a, b, c = "a" * 40, "b" * 40, "c" * 40
+	api, qbit = fresh_qbit({a: qbit_torrent(a, "Alpha"), b: qbit_torrent(b, "Beta", state="stalledUP", progress=1)})
+	check("the first listing has every torrent", sorted(t.name for t in qbit.get_torrents()), ["Alpha", "Beta"])
+	qbit.get_torrents()
+	check("a listing with nothing new transfers no torrent", "torrents" in api.maindata[-1], False)
+	check("and still lists them all", sorted(t.name for t in qbit.get_torrents()), ["Alpha", "Beta"])
+	api.torrents[a].update(state="stoppedDL", dlspeed=0)
+	api.torrents[b]["upspeed"] = 2048
+	api.torrents[c] = qbit_torrent(c, "Gamma")
+	listed = {t.name: t for t in qbit.get_torrents()}
+	check("only the fields that changed are transferred", api.maindata[-1]["torrents"][a], {"state": "stoppedDL"})
+	check("and merged into what the bot had", (listed["Alpha"].status, listed["Alpha"].name, listed["Beta"].upload_rate,
+		listed["Beta"].status), (TorrentStatus.PAUSED, "Alpha", 2048, TorrentStatus.SEEDING))
+	check("a new torrent shows up with its id", (sorted(listed), listed["Gamma"].id), (["Alpha", "Beta", "Gamma"], c))
+	del api.torrents[b]
+	check("a removed one goes away", sorted(t.name for t in qbit.get_torrents()), ["Alpha", "Gamma"])
+	api.server_state.update(use_alt_speed_limits=True, free_space_on_disk=4000)
+	summary = qbit.get_summary()
+	check("the dashboard follows the server state that changed", (summary.alt_speed_enabled, summary.free_space,
+		summary.total, summary.counts.get(TorrentStatus.PAUSED)), (True, 4000, 2, 1))
+	check("in one request", api.calls[-1:], ["sync/maindata"])
+	check("free space too", qbit.get_free_space("/downloads"), 4000)
+	check("as do the folders", qbit.get_download_dirs(), ["/downloads"])
+	# A new login (qBittorrent restarted, the session expired) knows no rid: it answers everything again
+	api.forget_session()
+	api.torrents = {c: qbit_torrent(c, "Gamma")}
+	check("after qBittorrent forgets the session, the listing is rebuilt",
+		([t.name for t in qbit.get_torrents()], api.maindata[-1].get("full_update")), (["Gamma"], True))
+	# A web page answered halfway (a proxy in front) leaves nothing half applied
+	api.page = LOGIN_PAGE
+	check("a failed sync is an error", isinstance(raised(qbit.get_torrents), TorrentClientError), True)
+	api.page = None
+	api.torrents[a] = qbit_torrent(a, "Alpha")
+	check("and the next one asks for everything again",
+		(sorted(t.name for t in qbit.get_torrents()), api.maindata[-1].get("full_update")), (["Alpha", "Gamma"], True))
+	listed = qbit.get_torrents()
+	listed[0].name = "changed by a screen"
+	check("what a listing returns is the caller's own", sorted(t.name for t in qbit.get_torrents()), ["Alpha", "Gamma"])
+
+
+@scenario
+def qbit_changes_told_late():
+	# Since 4.6 a rename reaches sync/maindata only on the next state update:
+	# auto rename checks right away that a name is free after giving it to another torrent
+	a, b = "a" * 40, "b" * 40
+	api, qbit = fresh_qbit({a: qbit_torrent(a, "Alpha"), b: qbit_torrent(b, "Beta")})
+	qbit.get_torrents()
+	qbit.rename_torrent(a, "Show.S01")
+	check("a torrent just renamed is listed with its new name", sorted(t.name for t in qbit.get_torrents()), ["Beta", "Show.S01"])
+	qbit.set_torrent_speed_limit([b], "up", 50)
+	check("and one just limited with its new limit", {t.name: t.upload_limit for t in qbit.get_torrents()}["Beta"], 50)
+	calls = len(api.calls)
+	qbit.get_torrents()
+	check("read apart once, not on every listing", api.calls[calls:], ["sync/maindata"])
+	api.unsignalled.clear()  # The state update comes and qBittorrent tells them
+	check("when qBittorrent tells the change it stays", sorted(t.name for t in qbit.get_torrents()), ["Beta", "Show.S01"])
+	# Only what is told late is taken from torrents/info: a speed read ahead of
+	# sync/maindata would stay for good once it is back to what was last told
+	qbit.rename_torrent(a, "Show.S02")
+	api.torrents[a]["dlspeed"] = 999
+	api.unsignalled[a]["dlspeed"] = 0
+	check("nothing else is taken from that reading", [(t.name, t.download_rate) for t in qbit.get_torrents() if t.id == a], [("Show.S02", 0)])
+	api.unsignalled.clear()
+	api.torrents[a]["dlspeed"] = 0
+	# A proxy in front refusing that request (a URL too long) does not take the listing away
+	qbit.rename_torrent(a, "Show.S03")
+	api.info_status = 414
+	check("when it cannot be read the listing still comes, late about that torrent",
+		sorted(t.name for t in qbit.get_torrents()), ["Beta", "Show.S02"])
+	api.info_status = None
+	api.unsignalled.clear()
+	check("until qBittorrent tells it", sorted(t.name for t in qbit.get_torrents()), ["Beta", "Show.S03"])
+	# Many torrents changed at once: their hashes do not all go in one URL
+	many = {f"{i:040x}": qbit_torrent(f"{i:040x}", f"T{i}") for i in range(250)}
+	api, qbit = fresh_qbit(many)
+	qbit.get_torrents()
+	qbit.set_torrent_speed_limit(list(many), "up", 10)
+	api.asked_hashes.clear()
+	check("all of them are listed with the new limit", {t.upload_limit for t in qbit.get_torrents()}, {10})
+	check("asked in groups that fit in a URL", [len(h.split("|")) for h in api.asked_hashes], [100, 100, 50])
+	api.asked_hashes.clear()
+	qbit.set_ratio_limit(list(many), 2)
+	check("the ratio of many torrents asks for them in groups too", [len(h.split("|")) for h in api.asked_hashes], [100, 100, 50])
+
+
+@scenario
+def qbit_sync_does_not_queue_timeouts():
+	# A qBittorrent that takes the connection and does not answer: the calls
+	# that waited for a sync that failed fail with it, they do not each wait their own
+	api, qbit = fresh_qbit({"a" * 40: qbit_torrent("a" * 40, "Alpha")})
+	qbit.get_torrents()
+	gate, entered = threading.Event(), threading.Event()
+	real = api.e_sync_maindata
+
+	def hanging(params, data, files):
+		entered.set()
+		gate.wait(5)
+		return http_response(text=LOGIN_PAGE, content_type="text/html")
+
+	api.e_sync_maindata = hanging
+	errors = []
+	threads = [threading.Thread(target=lambda: errors.append(raised(qbit.get_torrents))) for _ in range(4)]
+	threads[0].start()
+	entered.wait(5)
+	for thread in threads[1:]:
+		thread.start()
+	time.sleep(0.2)  # The other three are waiting for the first
+	calls = len(api.calls)
+	gate.set()
+	for thread in threads:
+		thread.join(5)
+	check("every waiting call fails", [isinstance(e, TorrentClientError) for e in errors], [True] * 4)
+	check("without asking qBittorrent again", api.calls[calls:], [])
+	api.e_sync_maindata = real
+	check("and the next one asks anew", [t.name for t in qbit.get_torrents()], ["Alpha"])
+
+
+@scenario
+def qbit_free_space():
+	# qBittorrent 5.3 tells the free space of any folder; older ones only of the default save path
+	api, qbit = fresh_qbit()
+	api.free_at = {"/downloads": 5000, "/mnt/other_disk": 777}
+	check("qBittorrent tells the free space of a folder on another disk", qbit.get_free_space("/mnt/other_disk/Films"), 777)
+	check("and of the default save path", (qbit.get_free_space("/downloads"), qbit.free_space_anywhere), (5000, True))
+	check("with no folder, that of the default save path", qbit.get_free_space(None), 5000)
+	api.free_at = {}
+	check("a folder it cannot tell is unknown", qbit.get_free_space("/nowhere"), -1)
+	api.free_at = None  # A version without the call
+	api.calls.clear()
+	check("an older qBittorrent still tells its default save path", qbit.get_free_space("/downloads/Films"), 5000)
+	check("and not a folder elsewhere", qbit.get_free_space("/mnt/other_disk"), -1)
+	check("it is asked for the call only once", api.calls.count("app/getFreeSpaceAtPath"), 1)
+	check("and the bot knows it only tells its own folder", qbit.free_space_anywhere, False)
+	api, qbit = fresh_qbit()
+	api.free_at = {"/downloads": 5000}
+	api.page = LOGIN_PAGE
+	check("a web page instead of the number is unknown, not an error", qbit.get_free_space("/downloads"), -1)
+
+
+@scenario
+def qbit_verify_many():
+	api, qbit = fresh_qbit()
+	qbit.verify_torrents(["a" * 40, "b" * 40])
+	check("qBittorrent rechecks several torrents in one request", api.rechecked, ["a" * 40 + "|" + "b" * 40])
 
 
 @scenario
@@ -1202,11 +1420,17 @@ def transmission_session_stats():
 		(3000, 2000, 60, 90000, 80000, 6000, 7))
 
 
-# qBittorrent only knows the free space of its default save path: another
-# folder may be on another disk, so its space is unknown
+# An older qBittorrent only knows the free space of its default save path:
+# another folder may be on another disk, so its space is unknown
 free_qbit = qbittorrent_client.QBittorrentClient.__new__(qbittorrent_client.QBittorrentClient)
+free_qbit._sync_lock = threading.Lock()
+free_qbit._changed_lock = threading.Lock()
+free_qbit._changed = set()
+free_qbit._sync_failed = None
+free_qbit._no_free_space_at = True
+free_qbit._forget_sync()
 free_qbit._get_json = lambda endpoint, params=None, kind=None: (
-	{"save_path": "/downloads/"} if endpoint == "app/preferences" else {"server_state": {"free_space_on_disk": 111}})
+	{"save_path": "/downloads/"} if endpoint == "app/preferences" else {"rid": 1, "full_update": True, "server_state": {"free_space_on_disk": 111}})
 check("qbit: free space of the default save path", free_qbit.get_free_space("/downloads"), 111)
 check("qbit: and of a folder inside it", free_qbit.get_free_space("/downloads/Films"), 111)
 check("qbit: a folder elsewhere is unknown", free_qbit.get_free_space("/mnt/other_disk"), -1)
@@ -1348,6 +1572,79 @@ refusing_deluge = FakeDelugeWeb()
 refusing_deluge.password = "another"
 check("deluge: a wrong password is a refused login", type(raised(make_deluge, refusing_deluge)), LoginRefusedError)
 
+
+# The log never shows the token of the bot, which a failed request to Telegram says in its URL
+import contextlib
+import io
+import logging
+import logger as bot_logger
+
+FAKE_TOKEN = "1234567890:AAF" + "x" * 32
+_token_before = os.environ.get("TELEGRAM_TOKEN")
+os.environ["TELEGRAM_TOKEN"] = FAKE_TOKEN
+failed_call = (f"HTTPSConnectionPool(host='api.telegram.org', port=443): Max retries exceeded with url: "
+	f"/bot{FAKE_TOKEN}/setMyCommands?commands=%5B%5D (Caused by NameResolutionError)")
+
+
+def logged(function, *args):
+	out, err = io.StringIO(), io.StringIO()
+	with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+		function(*args)
+	return out.getvalue() + err.getvalue()
+
+
+for log in (bot_logger.debug, bot_logger.warning, bot_logger.error):
+	line = logged(log, f"Cannot set bot commands: {failed_call}")
+	check(f"log: {log.__name__} does not show the token", (FAKE_TOKEN in line, "/bot<token>/setMyCommands" in line), (False, True))
+check("log: nor with its colon encoded", FAKE_TOKEN.split(":")[1] in logged(bot_logger.warning, FAKE_TOKEN.replace(":", "%3A")), False)
+check("log: in lower case either", FAKE_TOKEN.split(":")[1] in logged(bot_logger.warning, FAKE_TOKEN.replace(":", "%3a")), False)
+other_token = "987654321:BBG" + "y" * 32
+check("log: nor the token of another bot", other_token in logged(bot_logger.warning, f"/file/bot{other_token}/documents/x.torrent"), False)
+check("log: a torrent hash, a port or a time are left alone",
+	logged(bot_logger.debug, "0123456789abcdef0123456789abcdef01234567 at host:9091 12:30:00").split("DEBUG: ")[1],
+	"0123456789abcdef0123456789abcdef01234567 at host:9091 12:30:00\n")
+os.environ["TELEGRAM_TOKEN"] = ""
+check("log: a token is masked by its shape when none is configured", FAKE_TOKEN in logged(bot_logger.warning, failed_call), False)
+check("log: by its shape with a lower case encoded colon too", FAKE_TOKEN.split(":")[1] in logged(bot_logger.warning, FAKE_TOKEN.replace(":", "%3a")), False)
+os.environ["TELEGRAM_TOKEN"] = FAKE_TOKEN
+
+library_log = logging.getLogger("FakeLibrary")
+library_log.propagate = False
+library_stream = io.StringIO()
+library_handler = logging.StreamHandler(library_stream)
+library_handler.setFormatter(logging.Formatter('%(levelname)s - %(name)s: "%(message)s"'))
+library_log.addHandler(library_handler)
+bot_logger.mask_library_log(library_log)
+bot_logger.mask_library_log(library_log)  # Twice changes nothing
+try:
+	raise ConnectionError(failed_call)
+except ConnectionError as e:
+	library_log.error("Infinity polling exception: %s", e, exc_info=True)
+check("log: what a library logs on its own is masked, traceback included, in the format it had",
+	(FAKE_TOKEN in library_stream.getvalue(), library_stream.getvalue().startswith('ERROR - FakeLibrary: "Infinity polling exception:'),
+	"Traceback" in library_stream.getvalue()), (False, True, True))
+
+_hooks_before = (sys.excepthook, threading.excepthook)
+bot_logger.mask_tracebacks()
+def _uncaught():
+	raise ConnectionError(failed_call)
+def _in_thread():
+	thread = threading.Thread(target=_uncaught, name="worker-1")
+	thread.start()
+	thread.join()
+uncaught = logged(_in_thread)
+check("log: an exception nobody caught in a thread is printed without the token",
+	(FAKE_TOKEN in uncaught, "Exception in thread worker-1" in uncaught, "ConnectionError" in uncaught), (False, True, True))
+try:
+	_uncaught()
+except ConnectionError:
+	uncaught = logged(sys.excepthook, *sys.exc_info())
+check("log: and so is one in the main thread", (FAKE_TOKEN in uncaught, "ConnectionError" in uncaught), (False, True))
+sys.excepthook, threading.excepthook = _hooks_before
+if _token_before is None:
+	del os.environ["TELEGRAM_TOKEN"]
+else:
+	os.environ["TELEGRAM_TOKEN"] = _token_before
 
 if FAILED:
 	print(f"{len(FAILED)} FAILED:\n")

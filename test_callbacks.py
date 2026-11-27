@@ -189,6 +189,9 @@ class FakeClient:
 	def verify_torrent(self, torrent_id):
 		CALLS.append(("verify_torrent", torrent_id))
 
+	def verify_torrents(self, torrent_ids):
+		CALLS.append(("verify_torrents", list(torrent_ids)))
+
 	def rename_torrent(self, torrent_id, new_name):
 		CALLS.append(("rename_torrent", torrent_id, new_name))
 
@@ -1649,7 +1652,7 @@ calls = callbacks_of(screen[1])
 check("the actions on all say how many torrents they cover",
 	screen[0].startswith(get_text("MASS_MENU_TITLE", bot_module.get_filter_label(config.FILTER_ALL), len(TORRENT_IDS))), True)
 check("the actions on all are all there", [c for c in calls if c.startswith("mass|")],
-	[bot_module.build_call("mass", a, config.FILTER_ALL) for a in ("resume", "pause", "move", "cat", "ratio", "delete")])
+	[bot_module.build_call("mass", a, config.FILTER_ALL) for a in ("resume", "pause", "verify", "move", "cat", "ratio", "delete")])
 check("their back goes to the page they were opened from", calls[-2], bot_module.build_call("list", config.FILTER_ALL, 1))
 tf = tracker_filter()
 calls = callbacks_of(press(bot_module.build_call("massMenu", tf, 0))[1])
@@ -1738,6 +1741,53 @@ check("a button pressed meanwhile drops the question", bot_module.pending_inputs
 bot_module.set_pending_input(GROUP_ID, 1, "rename", torrent_id=TORRENT_ID)
 send_command("/list")
 check("a command drops it too", bot_module.pending_inputs.get((GROUP_ID, 1)), None)
+# An answer typed after the bot stopped waiting for it is not swallowed without a word
+bot_module.set_pending_input(CHAT_ID, 1, "rename", torrent_id=TORRENT_ID)
+bot_module.pending_inputs[(CHAT_ID, 1)]["ts"] -= config.INPUT_TTL + 1
+CALLS.clear()
+EDITS.clear()
+bot_module.handle_text(tg_message("Too.Late.2024"))
+check("a late answer renames nothing and is told as late", (CALLS, [text for text, _ in EDITS]), ([], [get_text("INPUT_EXPIRED", config.INPUT_TTL // 60)]))
+check("and the question is gone", bot_module.pending_inputs.get((CHAT_ID, 1)), None)
+waiting = bot_module.new_pending_torrent("Waiting.Movie.2024.1080p", magnet="magnet:?xt=urn:btih:" + "d" * 40)
+bot_module.set_pending_input(CHAT_ID, 1, "addDir", pending_id=waiting)
+bot_module.pending_inputs[(CHAT_ID, 1)]["ts"] -= config.INPUT_TTL + 1
+EDITS.clear()
+bot_module.handle_text(tg_message("/downloads/late"))
+check("a late typed folder for a torrent brings its folder choice back, and says so",
+	(EDITS[0][0].startswith(get_text("ADD_ASK_DIR", "Waiting.Movie.2024.1080p")), EDITS[-1][0], bot_module.get_pending_torrent(waiting) is not None),
+	(True, get_text("INPUT_EXPIRED_ADD", config.INPUT_TTL // 60), True))
+bot_module.pop_pending_torrent(waiting)
+# A late text with a link in it is a torrent to add, as it was with no question waiting
+bot_module.set_pending_input(CHAT_ID, 1, "rename", torrent_id=TORRENT_ID)
+bot_module.pending_inputs[(CHAT_ID, 1)]["ts"] -= config.INPUT_TTL + 1
+_links_before = bot_module.add_links_from_message
+linked = []
+bot_module.add_links_from_message = lambda message, links, quiet=False: linked.extend(links)
+EDITS.clear()
+bot_module.handle_text(tg_message("Mira esta: magnet:?xt=urn:btih:" + "c" * 40))
+bot_module.add_links_from_message = _links_before
+check("a late text carrying a link is added, not told as a late answer", (len(linked), EDITS), (1, []))
+
+# A file renamed by typing its name: never onto a name its folder already has
+_profile_before = dict(PROFILE)
+PROFILE.update(name=SERIES_NAME, files=SERIES_FILES)
+season = f"{SERIES_NAME}/Mad.Men.2007.S01.NF.WEB-DL.1080P.AV1-Txv2"
+bot_module.set_pending_input(CHAT_ID, 1, "renameFile", torrent_id=TORRENT_ID, file_path=f"{season}/Mad.Men.S01E02.1080p.mkv")
+CALLS.clear()
+SENDS.clear()
+bot_module.handle_text(tg_message("Mad.Men.S01E03.1080p.mkv"))
+check("a typed file name another file of the folder has renames nothing",
+	([c for c in CALLS if c[0] == "rename_file"], EDITS[-1][0]), ([], get_text("FILE_RENAME_DUPLICATE", "Mad.Men.S01E03.1080p.mkv")))
+bot_module.set_pending_input(CHAT_ID, 1, "renameFile", torrent_id=TORRENT_ID, file_path=f"{season}/Mad.Men.S01E01.1080p.mkv")
+CALLS.clear()
+bot_module.handle_text(tg_message("Mad.Men.S02E03.1080p.mkv"))
+check("a name only a file of another folder has is free, and the subtitle follows",
+	[c for c in CALLS if c[0] == "rename_file"],
+	[("rename_file", TORRENT_ID, f"{season}/Mad.Men.S01E01.1080p.mkv", "Mad.Men.S02E03.1080p.mkv"),
+	("rename_file", TORRENT_ID, f"{season}/Mad.Men.S01E01.1080p.es.srt", "Mad.Men.S02E03.1080p.es.srt")])
+PROFILE.clear()
+PROFILE.update(_profile_before)
 added = []
 bot_module.start_add_flow = lambda chat_id, name, magnet=None, data=None, thread_id=None: added.append(magnet)
 pasted = "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=New.Movie.2024.1080p"
@@ -1941,6 +1991,22 @@ FakeClient.supports_categories = False
 check("a manager without categories has no category of all",
 	bot_module.build_call("mass", "cat", config.FILTER_ALL) in callbacks_of(bot_module.build_mass_menu(config.FILTER_ALL, 0)[1]), False)
 FakeClient.supports_categories = True
+# Verifying all: told what it costs, then one call with what was counted
+bot_module.client.get_torrents = _real_get_torrents
+verify_screen = press(bot_module.build_call("mass", "verify", config.FILTER_ALL))
+check("verifying all asks first, saying it can take long", verify_screen[0], get_text("MASS_CONFIRM_VERIFY", len(TORRENT_IDS)))
+bot_module.client.get_torrents = lambda status=None, query=None: [fake_torrent(t) for t in TORRENT_IDS[1:]]
+CALLS.clear()
+verified = press(labelled(verify_screen[1])[get_text("BUTTON_CONFIRM")])
+check("and rechecks the torrents counted still there, in one call", (CALLS, verified[0]),
+	([("verify_torrents", list(TORRENT_IDS[1:]))], get_text("MASS_DONE_VERIFY", len(TORRENT_IDS) - 1)))
+bot_module.client.get_torrents = _real_get_torrents
+FakeClient.supports_verify = False
+check("a manager that cannot verify has no verify of all",
+	bot_module.build_call("mass", "verify", config.FILTER_ALL) in callbacks_of(bot_module.build_mass_menu(config.FILTER_ALL, 0)[1]), False)
+CALLS.clear()
+check("nor does an old button verify anything there", (press(bot_module.build_call("mass", "verify", config.FILTER_ALL)), CALLS)[1], [])
+FakeClient.supports_verify = True
 CALLS.clear()
 old_button = press(bot_module.build_call("confirmMass", "delete", config.FILTER_ALL, "1"))
 check("a confirm button from before deletes nothing and asks again", (CALLS, old_button[0]),
@@ -2244,6 +2310,41 @@ check("a ratio set by hand before the rule reached the torrent: the rest of the 
 	CALLS, [("set_ratio_limit", [TORRENT_ID], 0.5), ("set_torrent_speed_limit", [TORRENT_ID], "up", 50)])
 check("and the monitor leaves its ratio alone",
 	TORRENT_ID in [i for tracker, ids in tracker_limits.pending([fake_torrent(t) for t in TORRENT_IDS]) for i in ids], False)
+# Deluge lists the tracker of a torrent as example.org and the torrent itself says tracker.example.org
+tracker_limits.forget(ruled)
+_get_before_subdomain = bot_module.client.get_torrent
+
+
+def with_subdomain(torrent_id):
+	torrent = _get_before_subdomain(torrent_id)
+	torrent.trackers = ["tracker." + ruled]
+	return torrent
+
+
+bot_module.client.get_torrent = with_subdomain
+CALLS.clear()
+press(bot_module.build_call("ratioSet", ratio_ctx, "0.7"))
+bot_module.client.get_torrent = _get_before_subdomain
+check("a manager naming the tracker differently in the torrent than in the listing: the rule is still found",
+	CALLS, [("set_ratio_limit", [TORRENT_ID], 0.7), ("set_torrent_speed_limit", [TORRENT_ID], "up", 50)])
+# qBittorrent only lists a tracker that is working: before the first announce the listing names none
+tracker_limits.forget(ruled)
+_list_before_announce = bot_module.client.get_torrents
+
+
+def without_trackers(status=None, query=None):
+	torrents = _list_before_announce(status=status, query=query)
+	for torrent in torrents:
+		torrent.trackers = []
+	return torrents
+
+
+bot_module.client.get_torrents = without_trackers
+CALLS.clear()
+press(bot_module.build_call("ratioSet", ratio_ctx, "0.9"))
+bot_module.client.get_torrents = _list_before_announce
+check("with no tracker in the listing yet, the rule is found through the torrent itself",
+	CALLS, [("set_ratio_limit", [TORRENT_ID], 0.9), ("set_torrent_speed_limit", [TORRENT_ID], "up", 50)])
 tracker_limits.delete_rule(ruled)
 tracker_limits.set_field("persist.example.org", "ratio", 3.0)
 bot_module.bot_settings._settings = None  # What a restart does

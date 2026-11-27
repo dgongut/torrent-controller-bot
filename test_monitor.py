@@ -819,6 +819,29 @@ check("and no longer watched for", bot._late_adds, {})
 states = poll(states)
 check("nor told again", len(NOTIFIED), 1)
 
+# A manager whose ids are its own (Download Station: dbid_N) and does not
+# report the info hash: the late add is told by what the manager keeps of the link
+fresh(notify_external=True)
+FakeClient.add_keys = staticmethod(lambda magnet=None, torrent_data=None: [LATE_HASH, "title:late.movie"])
+FakeClient.torrent_keys = lambda self, torrent_id: (CLIENT.calls.append(("torrent_keys", torrent_id)), [torrent_id, "title:late.movie"])[1]
+states = poll(None)
+CLIENT.put(movie(torrent_id="dbid_7"))
+states = poll(states)
+check("with no add waited for, the manager is not asked what a new torrent goes by",
+	(count_external(), [c for c in CLIENT.calls if c[0] == "torrent_keys"]), (1, []))
+NOTIFIED.clear()
+CLIENT.on_add = _timeout_add
+try:
+	bot.perform_add_torrent({"magnet": f"magnet:?xt=urn:btih:{LATE_HASH}&dn=Late.Movie", "data": None}, "/downloads", chat_id=55, thread_id=7)
+except TorrentClientError:
+	pass
+check("the timed out add is watched for by every key the manager gives", sorted(bot._late_adds), sorted([LATE_HASH, "title:late.movie"]))
+CLIENT.put(movie(torrent_id="dbid_8"))
+states = poll(states)
+check("the late task is the bot's add, not an external one", (count_external(), len(NOTIFIED), NOTIFIED[0][0].startswith(bot.get_text("ADD_LATE"))), (0, 1, True))
+check("and none of its keys is left waiting", bot._late_adds, {})
+del FakeClient.add_keys, FakeClient.torrent_keys
+
 # Without anything to tell the info hash by, a failed add watches for nothing
 fresh(notify_external=True)
 states = poll(None)
@@ -1185,6 +1208,17 @@ check("and the queue does not wait any more", (QUEUE.wait_time(), QUEUE._failure
 ready()
 bot.process_add_queue()
 check("the ones queued without trying go with their context worked out then", len(QUEUE), 0)
+
+# The wait is for what is queued: once the last one is cancelled, the next add is tried at once
+only = bot.add_or_queue(pending(magnet_link="magnet:?xt=urn:btih:" + "c" * 40, name="Only"), "/downloads", chat_id=55)[2]
+check("an add is tried directly with nothing queued and no wait", (only, len(QUEUE)), (None, 0))
+QUEUE.put("Cancelled", "magnet:?xt=urn:btih:" + "e" * 40, None, ["e" * 40], {})
+QUEUE._failures, QUEUE._next_try = 4, time.time() + 500
+QUEUE.cancel(QUEUE.items()[0]["id"])
+CLIENT.calls.clear()
+text, _m, item = bot.add_or_queue(pending(magnet_link="magnet:?xt=urn:btih:" + "9" * 40, name="After"), "/downloads", chat_id=55)
+check("after the last queued add is cancelled the next one is not queued unasked",
+	(item, len([c for c in CLIENT.calls if c[0] == "add_torrent"]), QUEUE.wait_time()), (None, 1, 0))
 empty_queue()
 
 # Automatic adds: the default folder is not worth losing the add over
@@ -1373,15 +1407,38 @@ m = CLIENT.put(magnet())
 _real_deferred(m.id, m.name)
 check("a magnet whose metadata never arrives is not renamed", renames(), [])
 check("and giving up is logged", any("gave up" in w for w in WARNINGS), True)
+check("and told: the add promised the rename", texts(), [bot.get_text("NOTIFY_AUTO_RENAME_GAVE_UP", MAGNET_NAME)])
 check("it asked as many times as configured",
 	len([c for c in CLIENT.calls if c[0] == "get_torrent"]), bot.AUTO_RENAME_WAIT_ATTEMPTS)
 
 fresh(auto_rename=True, rename_external=True)
 m = CLIENT.put(magnet())
-CLIENT.fail_get = TorrentClientError("gone")
+full = series(torrent_id=m.id)
+later = MetadataLater(2, full)
+
+
+def failing_once(torrent_id):
+	if later.asked == 1 and not later.__dict__.setdefault("failed", False):
+		later.failed = True
+		CLIENT.calls.append(("get_torrent", torrent_id))
+		raise TorrentClientError("timeout")
+	return later(torrent_id)
+
+
+CLIENT.get_torrent = failing_once
 _real_deferred(m.id, m.name)
-check("a manager failing while waiting stops the wait", len([c for c in CLIENT.calls if c[0] == "get_torrent"]), 1)
-check("and that is logged", any("Auto-rename failed" in w for w in WARNINGS), True)
+CLIENT.get_torrent = _real_get.__get__(CLIENT)
+check("a manager failing once while waiting is asked again, and the magnet renamed", CLIENT.torrents[m.id].name, SERIES_RENAMED)
+
+fresh(auto_rename=True, rename_external=True)
+m = CLIENT.put(magnet())
+CLIENT.get_torrent = MetadataLater(1, series(torrent_id=m.id))
+CLIENT.fail_rename = TorrentClientError("disk busy")
+_real_deferred(m.id, m.name)
+CLIENT.get_torrent = _real_get.__get__(CLIENT)
+CLIENT.fail_rename = None
+check("a rename the manager fails is told, with a way to do it by hand",
+	texts(), [bot.get_text("NOTIFY_AUTO_RENAME_FAILED", MAGNET_NAME, "disk busy")])
 
 # The whole chain: the monitor finds a magnet and the real deferred rename finishes it
 fresh(notify_external=True, auto_rename=True, rename_external=True)
@@ -1823,6 +1880,93 @@ states = poll(None)
 poll(states)
 check("a torrent already stopped at startup is not told", NOTIFIED, [])
 
+# A torrent removed and added again has the id it had: it is a new torrent all the same
+fresh(notify_external=True)
+bot_settings.set("notify_completed", True)
+old = movie(progress=100.0)
+old.added_date = 1700000000
+CLIENT.put(old)
+states = poll(None)
+states = poll(states)
+check("a torrent the bot already knew is not told", NOTIFIED, [])
+del CLIENT.torrents[old.id]
+states = poll(states)
+again = movie(progress=20.0, torrent_id=old.id)
+again.added_date = 1700009000
+CLIENT.put(again)
+states = poll(states)
+check("added again under the same id, it is told as the new torrent it is", len(NOTIFIED), 1)
+CLIENT.torrents[old.id].progress = 100.0
+states = poll(states)
+check("and its completion too", len(NOTIFIED), 2)
+CLIENT.torrents[old.id].added_date = 1700009002
+states = poll(states)
+check("a clock set right by a couple of seconds is not another add", len(NOTIFIED), 2)
+
+# Started by force, the manager does not stop it at its limit: past it and paused by hand, it reached nothing
+fresh()
+forced = seeding(ratio=3.0, limit=0.5)
+forced.forced = True
+states = poll(None)
+CLIENT.torrents[forced.id].status, CLIENT.torrents[forced.id].forced = TorrentStatus.PAUSED, False
+poll(states)
+check("a force started torrent paused past its limit is not told as reaching it", NOTIFIED, [])
+
+# A limit already reached when the download ends: it never gets to be seen seeding
+fresh()
+bot_settings.set("notify_completed", False)
+at_once = seeding(ratio=1.2, limit=1.0)
+at_once.status, at_once.progress = TorrentStatus.DOWNLOADING, 90.0
+states = poll(None)
+CLIENT.torrents[at_once.id].status, CLIENT.torrents[at_once.id].progress = TorrentStatus.PAUSED, 100.0
+states = poll(states)
+check("a torrent stopped at its limit as soon as it finished is told", texts(), [ratio_text(at_once)])
+bot_settings.set("notify_completed", True)
+fresh()
+unfinished = seeding(ratio=1.2, limit=1.0)
+unfinished.status, unfinished.progress = TorrentStatus.DOWNLOADING, 50.0
+states = poll(None)
+CLIENT.torrents[unfinished.id].status = TorrentStatus.PAUSED
+poll(states)
+check("one paused half way is not", NOTIFIED, [])
+
+# The manager not answering on the poll that sees the stop: looked at again
+fresh()
+later = seeding()
+states = poll(None)
+CLIENT.torrents[later.id].status = TorrentStatus.PAUSED
+CLIENT.fail_get = TorrentClientError("timeout")
+states = poll(states)
+check("a stop that cannot be read is not told yet", NOTIFIED, [])
+CLIENT.fail_get = None
+states = poll(states)
+check("it is on the next poll", texts(), [ratio_text(later)])
+states = poll(states)
+check("and only once", len(NOTIFIED), 1)
+fresh()
+resumed = seeding()
+states = poll(None)
+CLIENT.torrents[resumed.id].status = TorrentStatus.PAUSED
+CLIENT.fail_get = TorrentClientError("timeout")
+states = poll(states)
+CLIENT.fail_get = None
+CLIENT.torrents[resumed.id].status = TorrentStatus.SEEDING
+states = poll(states)
+CLIENT.torrents[resumed.id].ratio = 0.1
+states = poll(states)
+check("one resumed meanwhile is no longer waited for", NOTIFIED, [])
+fresh()
+never = seeding()
+states = poll(None)
+CLIENT.torrents[never.id].status = TorrentStatus.PAUSED
+CLIENT.fail_get = TorrentClientError("timeout")
+for _ in range(bot.STOP_CHECK_TRIES + 3):
+	states = poll(states)
+tries = len([c for c in CLIENT.calls if c == ("get_torrent", never.id)])
+CLIENT.fail_get = None
+poll(states)
+check("a manager that never answers is not asked for ever", (tries, NOTIFIED), (bot.STOP_CHECK_TRIES, []))
+
 # Automatic removal: the torrent leaves the manager, never its files, and
 # the notice offering to keep it seeding gives way to the one telling it
 
@@ -2014,6 +2158,18 @@ states = poll(None)
 check("after a restart only the torrent added while the bot was down gets the rule",
 	limit_calls(), [("set_ratio_limit", [while_down.id], 0.5), ("set_torrent_speed_limit", [while_down.id], "up", 50)])
 check("and the exception is still one", CLIENT.torrents[arrived.id].ratio_limit, -1)
+
+# Removed and added again, a torrent has its id but none of the limits it had
+CLIENT.torrents[while_down.id].added_date = 1700000000
+states = poll(states)
+del CLIENT.torrents[while_down.id]
+states = poll(states)
+back = on_tracker(PUBLIC, torrent_id=while_down.id)
+back.added_date = 1700009000
+CLIENT.calls.clear()
+states = poll(states)
+check("a torrent added again under its old id gets the rule of its tracker again",
+	limit_calls(), [("set_ratio_limit", [back.id], 0.5), ("set_torrent_speed_limit", [back.id], "up", 50)])
 
 CLIENT.calls.clear()
 unannounced = on_tracker()  # A magnet the manager has not announced yet: no tracker known

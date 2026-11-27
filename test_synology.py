@@ -981,6 +981,51 @@ dsm.calls.clear()
 raised(client.move_torrents, [show], "video/library")
 check("moving it where it already is does nothing", [(c.api, c.method) for c in dsm.calls if c.method in ("edit", "start", "pause")], [])
 
+# What tells that a task is the one an add was for: Download Station gives it
+# an id of its own and does not report the info hash
+dsm = nas()
+HASH = "c12fe1c06bba254a9dc9f519b335aa7c1367a88a"
+by_link = dsm.add_task("Some.Show.S01", uri=f"magnet:?xt=urn:btih:{HASH.upper()}&dn=Whatever", files=[("E01.mkv", 100)])
+by_title = dsm.add_task("Some.Movie.2020", uri="upload.torrent", files=[("m.mkv", 100)])
+other = dsm.add_task("Other.Thing", files=[("o.mkv", 100)])
+client = connect(dsm)
+magnet_keys = sc.SynologyClient.add_keys(magnet=f"magnet:?xt=urn:btih:{HASH}&dn=Some.Movie.2020")
+check("an add is told by its info hash and by the name in the link", magnet_keys, [HASH, "title:some.movie.2020"])
+check("a task goes by the info hash of its link", HASH in client.torrent_keys(by_link), True)
+check("and by its title", "title:some.movie.2020" in client.torrent_keys(by_title), True)
+check("another task shares nothing with that add", set(magnet_keys) & set(client.torrent_keys(other)), set())
+check("a task that is gone only has its id", client.torrent_keys("dbid_999"), ["dbid_999"])
+
+# Two orders for the same task at once (a move by hand over the automatic
+# one, a double tap): the second waits for the first to be on record and then
+# follows it, instead of also moving the data and leaving a move that never ends
+dsm = nas(rate=100 * MB)
+show = dsm.add_task("Show.S03.1080p", files=[("E01.mkv", 700 * MB)])
+client = connect(dsm)
+second = {}
+real_content_on_disk = client._content_on_disk
+
+
+def while_the_first_is_planned(tasks):
+	if not second:
+		second["error"] = "not run"
+		second["thread"] = threading.Thread(target=lambda: second.update(error=raised(client.move_torrents, [show], "video/library")))
+		second["thread"].start()
+		second["thread"].join(0.3)
+		second["waited"] = second["thread"].is_alive()
+		second["starts"] = len(dsm.made(COPYMOVE, "start"))
+	return real_content_on_disk(tasks)
+
+
+client._content_on_disk = while_the_first_is_planned
+first_error = raised(client.move_torrents, [show], "video/library")
+second["thread"].join(10)
+check("a second order for a task waits while the first is being prepared", (second["waited"], second["starts"]), (True, 0))
+check("both end well", (first_error, second["error"], second["thread"].is_alive()), (None, None, False))
+check("its data was moved once", len(dsm.made(COPYMOVE, "start")), 1)
+check("and the task is where it was sent, seeding, with no move left",
+	(dsm.where(show), dsm.status(show), dsm.broken, client._moves), ("video/library", "seeding", [], {}))
+
 dsm = nas()
 show = dsm.add_task("Show.S04", files=[("E01.mkv", 100)])
 client = connect(dsm)

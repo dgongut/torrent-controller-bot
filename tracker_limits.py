@@ -191,6 +191,18 @@ def forget(tracker):
 			_save()
 
 
+def unmark(torrent_ids):
+	"""Forgets that these torrents got a rule: a torrent added again under an
+	id it had before is another torrent, with the limits of a new one"""
+	with _lock:
+		_load()
+		gone = [str(torrent_id) for torrent_id in torrent_ids if str(torrent_id) in _applied]
+		for key in gone:
+			del _applied[key]
+		if gone:
+			_save()
+
+
 def prune(present_ids):
 	"""Forgets torrents that are no longer in the manager"""
 	present = {str(torrent_id) for torrent_id in present_ids}

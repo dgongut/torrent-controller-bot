@@ -429,6 +429,14 @@ class TransmissionClient(TorrentClient):
 		except Exception as e:
 			raise TorrentClientError(f"Error verifying torrent {torrent_id}: {e}")
 
+	def verify_torrents(self, torrent_ids):
+		try:
+			self.client.verify_torrent([rpc_id(torrent_id) for torrent_id in torrent_ids])
+		except PermanentTorrentError:
+			raise
+		except Exception as e:
+			raise TorrentClientError(f"Error verifying torrents: {e}")
+
 	def set_file_priority(self, torrent_id, paths, priority):
 		try:
 			torrent = self.client.get_torrent(rpc_id(torrent_id), arguments=["id", "files"])

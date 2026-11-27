@@ -2,6 +2,7 @@
 
 import json
 import re
+import threading
 import time
 import uuid
 from collections import Counter
@@ -38,6 +39,20 @@ ETA_INFINITE = 8640000
 TRACKER_WORKING = 2
 TRACKER_FAILED = (4, 5, 6)  # Not working, tracker error (5.0+), unreachable (5.0+)
 TEMP_TAG_PREFIX = "tcb-"
+# Since 4.6 sync/maindata only tells a change qBittorrent signals: a rename
+# or a speed or ratio limit waits for libtorrent's next state update (about
+# 1.5 s, longer on a busy NAS). The next sync after the bot changes one reads
+# these fields of those torrents straight from torrents/info, which is always
+# live. Only these: qBittorrent tells them later with the same value, while a
+# speed or a state read ahead of sync/maindata could stay in the bot for good
+# (back to what it last told by the next sync, qBittorrent tells nothing)
+LATE_FIELDS = ("name", "dl_limit", "up_limit", "ratio_limit", "max_ratio", "seeding_time_limit", "max_seeding_time",
+	"inactive_seeding_time_limit", "max_inactive_seeding_time", "share_limit_action", "share_limits_mode")
+# The hashes of a torrents/info request go in its URL, and a proxy in front of
+# qBittorrent refuses a long one (nginx, 8 KB by default): asked in groups,
+# and all of them at once when that would be too many requests
+HASHES_PER_REQUEST = 100
+HASH_REQUESTS_LIMIT = 3
 TEMP_TAG_RE = re.compile(rf"^{TEMP_TAG_PREFIX}[0-9a-f]{{8}}$")
 # What qBittorrent 5.x answers when it does not add a torrent: it already has
 # it, or the magnet link cannot be read. Older versions answer "Fails."
@@ -123,6 +138,10 @@ STATUS_MAP = {
 }
 
 
+# Force started: qBittorrent keeps these going past their ratio and seeding time limits
+FORCED_STATES = ("forcedDL", "forcedUP", "forcedMetaDL")
+
+
 def _file_priority(value):
 	"""qBittorrent file priority -> normalized one: 0 is not downloaded, 1 is
 	normal, 6 high and 7 maximal. It has nothing below normal"""
@@ -144,6 +163,12 @@ class QBittorrentClient(TorrentClient):
 		self.username = username or ""
 		self.password = password or ""
 		self.session = requests.Session()
+		self._sync_lock = threading.Lock()
+		self._changed_lock = threading.Lock()
+		self._changed = set()  # Hashes whose next sync is read from torrents/info
+		self._sync_failed = None  # (when, error) of the last sync that failed
+		self._no_free_space_at = False  # This qBittorrent lacks app/getFreeSpaceAtPath
+		self._forget_sync()
 		self._login()
 		self._purge_temp_tags()
 
@@ -244,6 +269,7 @@ class QBittorrentClient(TorrentClient):
 			upload_limit=_speed_limit(t.get("up_limit")),
 			seeding_time=_num(t.get("seeding_time"), -1),
 			seeding_time_limit=_limit(t.get("max_seeding_time"), 60),  # minutes
+			forced=state in FORCED_STATES,
 			peers=t.get("num_leechs", 0) + t.get("num_seeds", 0),
 			seeders=t.get("num_seeds", 0),
 			leechers=t.get("num_leechs", 0),
@@ -295,6 +321,80 @@ class QBittorrentClient(TorrentClient):
 			pass
 		return trackers, (seeders, leechers), "" if working or not errors else errors[0]
 
+	def _forget_sync(self):
+		"""Drops what the bot knows of the torrents: the next sync asks for everything"""
+		self._rid = 0
+		self._synced = {}
+		self._server_state = {}
+
+	def _sync(self):
+		"""Every torrent (as torrents/info lists it) and the server state. With
+		thousands of torrents the full listing is several MB that qBittorrent has
+		to build on every call, and the screens repaint every 2 s: sync/maindata
+		answers only what changed since the last call (a few bytes while nothing
+		moves), so the bot keeps the rest. qBittorrent answers everything again
+		(full_update) whenever it does not know the rid, after a new login too"""
+		asked = time.monotonic()
+		with self._sync_lock:
+			# One sync at a time. With a qBittorrent that takes the connection and
+			# does not answer, the calls waiting here would each run out their own
+			# timeout one after another: they fail with the one they waited for
+			if self._sync_failed and self._sync_failed[0] >= asked:
+				raise self._sync_failed[1]
+			try:
+				data = self._get_json("sync/maindata", params={"rid": self._rid}, kind=dict)
+				if data.get("full_update") or not self._rid:
+					self._synced, self._server_state = {}, {}
+				for torrent_hash, fields in (data.get("torrents") or {}).items():
+					self._synced.setdefault(torrent_hash, {"hash": torrent_hash}).update(fields or {})
+				for torrent_hash in data.get("torrents_removed") or []:
+					self._synced.pop(torrent_hash, None)
+				self._server_state.update(data.get("server_state") or {})
+				self._rid = _num(data.get("rid"), 0)
+			except Exception as e:
+				# A half applied answer must not stay: start again from scratch
+				self._forget_sync()
+				self._sync_failed = (time.monotonic(), e)
+				raise
+			self._refresh_changed()
+			# Copies: another thread may apply the next answer while these are read
+			return [dict(t) for t in self._synced.values()], dict(self._server_state)
+
+	def _mark_changed(self, torrent_ids):
+		"""A change sync/maindata may tell late (see LATE_FIELDS): the bot
+		checks right away that a name is free after renaming another torrent
+		to it, and must not find the old name still there"""
+		with self._changed_lock:
+			self._changed.update(torrent_ids)
+
+	def _refresh_changed(self):
+		"""Overwrites what the bot changed a moment ago in some torrents with
+		what torrents/info says of them now. Once is enough: when sync/maindata
+		tells the change later it sends the same values. If it cannot be read,
+		the listing is still good, only late about those torrents for a moment"""
+		with self._changed_lock:
+			wanted, self._changed = [h for h in self._changed if h in self._synced], set()
+		try:
+			for t in self._info_of(wanted):
+				torrent_hash = t.get("hash")
+				if torrent_hash in self._synced:
+					self._synced[torrent_hash].update({field: t[field] for field in LATE_FIELDS if field in t})
+		except TorrentClientError:
+			pass
+
+	def _info_of(self, hashes):
+		"""torrents/info of the torrents with these hashes (see HASHES_PER_REQUEST)"""
+		hashes = list(hashes)
+		if not hashes:
+			return []
+		if len(hashes) > HASHES_PER_REQUEST * HASH_REQUESTS_LIMIT:
+			wanted = set(hashes)
+			return [t for t in self._get_json("torrents/info", kind=list) if t.get("hash") in wanted]
+		torrents = []
+		for start in range(0, len(hashes), HASHES_PER_REQUEST):
+			torrents += self._get_json("torrents/info", params={"hashes": "|".join(hashes[start:start + HASHES_PER_REQUEST])}, kind=list)
+		return torrents
+
 	def test_connection(self):
 		try:
 			return self._version()
@@ -303,9 +403,7 @@ class QBittorrentClient(TorrentClient):
 
 	def get_summary(self):
 		try:
-			torrents = self._get_json("torrents/info", kind=list)
-			transfer = self._get_json("transfer/info", kind=dict)
-			maindata = self._get_json("sync/maindata", kind=dict)
+			torrents, server_state = self._sync()
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting summary: {e}")
 
@@ -322,26 +420,25 @@ class QBittorrentClient(TorrentClient):
 			if int(t.get("dlspeed", 0) or 0) > 0:
 				downloading += 1
 
-		server_state = maindata.get("server_state", {})
 		return SessionSummary(
 			counts=dict(counts),
 			total=len(torrents),
 			completed=completed,
 			uploading=uploading,
 			downloading=downloading,
-			download_rate=transfer.get("dl_info_speed", 0),
-			upload_rate=transfer.get("up_info_speed", 0),
+			download_rate=server_state.get("dl_info_speed", 0),
+			upload_rate=server_state.get("up_info_speed", 0),
 			free_space=server_state.get("free_space_on_disk", -1),
-			alt_speed_enabled=self._alt_speed_enabled(),
-			session_downloaded=transfer.get("dl_info_data", -1),
-			session_uploaded=transfer.get("up_info_data", -1),
+			alt_speed_enabled=bool(server_state.get("use_alt_speed_limits", False)),
+			session_downloaded=server_state.get("dl_info_data", -1),
+			session_uploaded=server_state.get("up_info_data", -1),
 			total_downloaded=server_state.get("alltime_dl", -1),
 			total_uploaded=server_state.get("alltime_ul", -1),
 		)
 
 	def get_torrents(self, status=None, query=None):
 		try:
-			torrents = self._get_json("torrents/info", kind=list)
+			torrents, _ = self._sync()
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error listing torrents: {e}")
 
@@ -502,7 +599,7 @@ class QBittorrentClient(TorrentClient):
 			# The same call sets the seeding time limits and, since qBittorrent
 			# 5.x, what to do when one is reached (it refuses the call without
 			# them): each torrent is sent back its own so only the ratio changes
-			current = {t.get("hash"): t for t in self._get_json("torrents/info", params={"hashes": "|".join(torrent_ids)}, kind=list)}
+			current = {t.get("hash"): t for t in self._info_of(torrent_ids)}
 			ratio = -2 if limit is None else (-1 if limit < 0 else round(float(limit), 2))
 			for torrent_id in torrent_ids:
 				t = current.get(torrent_id, {})
@@ -518,6 +615,8 @@ class QBittorrentClient(TorrentClient):
 				self._post("torrents/setShareLimits", data=data)
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error setting ratio limit: {e}")
+		finally:
+			self._mark_changed(torrent_ids)
 
 	def set_torrent_speed_limit(self, torrent_ids, direction, kbps):
 		endpoint = "torrents/setDownloadLimit" if direction == "down" else "torrents/setUploadLimit"
@@ -525,6 +624,8 @@ class QBittorrentClient(TorrentClient):
 			self._post(endpoint, data={"hashes": "|".join(torrent_ids), "limit": int(kbps) * 1024 if kbps > 0 else 0})
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error setting speed limit: {e}")
+		finally:
+			self._mark_changed(torrent_ids)
 
 	def reannounce_torrents(self, torrent_ids):
 		try:
@@ -564,6 +665,12 @@ class QBittorrentClient(TorrentClient):
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error verifying torrent {torrent_id}: {e}")
 
+	def verify_torrents(self, torrent_ids):
+		try:
+			self._post("torrents/recheck", data={"hashes": "|".join(torrent_ids)})
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error verifying torrents: {e}")
+
 	def set_file_priority(self, torrent_id, paths, priority):
 		try:
 			files = self._get_json("torrents/files", params={"hash": torrent_id}, kind=list)
@@ -602,6 +709,8 @@ class QBittorrentClient(TorrentClient):
 					"hash": torrent_id, "oldPath": paths[0], "newPath": new_name})
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error renaming torrent {torrent_id}: {e}")
+		finally:
+			self._mark_changed([torrent_id])
 
 	def rename_file(self, torrent_id, old_path, new_name):
 		folder = old_path.rsplit("/", 1)[0] if "/" in old_path else ""
@@ -662,7 +771,7 @@ class QBittorrentClient(TorrentClient):
 
 	def get_download_dirs(self):
 		try:
-			torrents = self._get_json("torrents/info", kind=list)
+			torrents, _ = self._sync()
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error getting download dirs: {e}")
 		counts = Counter()
@@ -682,18 +791,46 @@ class QBittorrentClient(TorrentClient):
 			raise TorrentClientError(f"Error getting default download dir: {e}")
 
 	def get_free_space(self, path):
-		"""qBittorrent only tells the free space of its default save path: any
-		other folder may be on another disk, so its space is unknown (-1)"""
+		"""The free space of any folder where qBittorrent can tell it (see
+		_free_space_at). An older one only tells that of its default save path:
+		any other folder may be on another disk, so its space is unknown (-1)"""
 		try:
 			if path:
+				free = self._free_space_at(path)
+				if free is not None:
+					return free
 				save_path = (self._get_json("app/preferences", kind=dict).get("save_path") or "").rstrip("/")
 				folder = path.rstrip("/")
 				if save_path and folder != save_path and not folder.startswith(save_path + "/"):
 					return -1
-			server_state = self._get_json("sync/maindata", kind=dict).get("server_state", {})
-			return server_state.get("free_space_on_disk", -1)
+			return self._sync()[1].get("free_space_on_disk", -1)
 		except TorrentClientError:
 			return -1
+
+	@property
+	def free_space_anywhere(self):
+		"""Whether it tells the free space of any folder, and not only of its
+		default save path. Known once it has been asked for one"""
+		return not self._no_free_space_at
+
+	def _free_space_at(self, path):
+		"""Free bytes of the disk a folder is on (or would be made on, when it
+		does not exist yet), -1 when qBittorrent cannot tell. None when this
+		qBittorrent does not have the call: it is in 5.3, not in every version"""
+		if self._no_free_space_at:
+			return None
+		try:
+			answer = self._get("app/getFreeSpaceAtPath", params={"path": path}).text.strip()
+		except QBittorrentHTTPError as e:
+			if e.status_code not in (404, 405):
+				raise
+			self._no_free_space_at = True  # Not asked again: it will not grow the call
+			return None
+		try:
+			free = int(answer)
+		except ValueError:
+			raise TorrentClientError(f"qBittorrent answered app/getFreeSpaceAtPath with something that is not a number: {NOT_THE_API}")
+		return free if free >= 0 else -1
 
 	def get_settings(self):
 		try:

@@ -189,6 +189,12 @@ class AddQueue:
 		item = self._items.pop(item_id, None)
 		if item is not None:
 			self._delete(item_id)
+			if not self._items:
+				# The wait between tries is for what is queued. With nothing left
+				# (cancelled, given up), the next add is tried at once: it would
+				# otherwise be queued unasked, told the manager does not answer
+				self._failures = 0
+				self._next_try = 0.0
 		return dict(item) if item else None
 
 	def cancel(self, item_id):

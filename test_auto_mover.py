@@ -150,7 +150,7 @@ STATE = {}
 
 
 def reset_state():
-	STATE.update(free={"/ssd": 500 * GB, "/media": 4000 * GB}, torrents=[], move="instant", default_dir="/ssd", frees=True, refill=False)
+	STATE.update(free={"/ssd": 500 * GB, "/media": 4000 * GB}, torrents=[], move="instant", default_dir="/ssd", frees=True, refill=False, leaves=())
 
 
 reset_state()
@@ -238,6 +238,8 @@ FakeClient.pause_torrents = fake_pause
 
 def arrive(download_dir, *torrent_ids):
 	"""The manager finished moving these torrents"""
+	# Torrents leaving the manager with their data left on disk while the move goes on
+	STATE["torrents"] = [t for t in STATE["torrents"] if t.id not in STATE.get("leaves", ())]
 	for t in list(STATE["torrents"]):
 		if t.id in torrent_ids:
 			if STATE["frees"] and auto_mover.is_under(t.download_dir, "/ssd"):
@@ -586,6 +588,21 @@ fresh(35, refill=True)
 SENT.clear()
 tick()
 check("room freed and taken again by new downloads is no alarm", (settings.get("auto_mover"), [text for text in SENT if "⚠️" in text]), (True, []))
+
+# A torrent of the source removed from the manager meanwhile, its data kept
+# (the removal at the ratio limit does that): its size is not room the move failed to free
+fresh(35, leaves=("big",))
+STATE["torrents"].append(torrent("big", 1, 300, now=time.time()))
+SENT.clear()
+tick()
+check("a torrent removed from the source during the move is no alarm",
+	(settings.get("auto_mover"), [text for text in SENT if "⚠️" in text]), (True, []))
+settings.set("auto_mover", True)
+fresh(35, leaves=("big",), frees=False)
+STATE["torrents"].append(torrent("big", 1, 300, now=time.time()))
+tick()
+check("and a move that freed nothing is still told then", (settings.get("auto_mover"), T("MOVER_NO_GAIN", bot.sizeof_fmt(35 * GB), bot.sizeof_fmt(35 * GB)) in SENT[-1]), (False, True))
+settings.set("auto_mover", True)
 
 # Once told as moved, the wait for the free space is not told as a move
 fresh(35)

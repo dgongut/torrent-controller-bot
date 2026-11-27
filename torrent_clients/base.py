@@ -290,6 +290,7 @@ class TorrentInfo:
 	upload_limit: int = -1  # KB/s this torrent may upload at, -1 none or unknown
 	seeding_time: int = -1  # seconds spent seeding, -1 unknown
 	seeding_time_limit: int = -1  # seconds of seeding before the client stops it, -1 none or unknown
+	forced: bool = False  # Started by force: the client does not stop it at its limits (qBittorrent)
 	peers: int = 0
 	seeders: int = 0  # connected peers that have the whole torrent
 	leechers: int = 0  # connected peers still downloading
@@ -453,6 +454,23 @@ class TorrentClient(ABC):
 	@abstractmethod
 	def verify_torrent(self, torrent_id):
 		pass
+
+	@staticmethod
+	def add_keys(magnet=None, torrent_data=None):
+		"""What tells that a torrent of the manager is the one a magnet link or
+		a .torrent file adds: the ids it can get. See torrent_keys"""
+		return expected_torrent_ids(magnet, torrent_data)
+
+	def torrent_keys(self, torrent_id):
+		"""What a torrent of the manager goes by among the add_keys of the
+		adds: its id, where the id is the info hash"""
+		return [str(torrent_id).lower()]
+
+	def verify_torrents(self, torrent_ids):
+		"""Rechecks several torrents. The managers that take them all in one
+		call do so: one by one, thousands of torrents are thousands of requests"""
+		for torrent_id in torrent_ids:
+			self.verify_torrent(torrent_id)
 
 	@abstractmethod
 	def rename_torrent(self, torrent_id, new_name):

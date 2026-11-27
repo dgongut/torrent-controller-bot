@@ -20,7 +20,7 @@ from urllib.parse import urljoin
 from telebot.types import ForceReply
 from telebot.types import InlineKeyboardButton
 from telebot.types import InlineKeyboardMarkup
-from logger import debug, error, warning
+from logger import debug, error, mask_library_log, mask_tracebacks, warning
 from message_queue import MessageQueue, describe_error
 from name_parser import DEFAULT_MOVIE_TEMPLATE, DEFAULT_SERIES_TEMPLATE, DEFAULT_SEASON_PACK_TEMPLATE, SUBTITLE_EXTENSIONS, TemplateError, VALID_EXTENSIONS, companion_subtitle_name, is_sample_file, series_auto_dir, series_dir_candidates, series_identity, suggest_file_name, suggest_folder_name, suggest_name, validate_template
 from torrent_clients import DuplicateTorrentError, RestartRequiredError, expected_torrent_ids, FILE_HIGH, FILE_LOW, FILE_NORMAL, FILE_SKIP, PermanentTorrentError, RATIO_MODE_GLOBAL, RATIO_MODE_NONE, RATIO_MODE_TORRENT, TorrentClientError, TorrentStatus, client_class, content_root, create_client, LazyClient
@@ -31,7 +31,7 @@ import config as _config_module
 import telemetry
 import tracker_limits
 
-VERSION = "1.16.4"
+VERSION = "1.16.5"
 
 if LANGUAGE.lower() not in ("es", "en"):
 	error("LANGUAGE only can be ES/EN")
@@ -146,6 +146,9 @@ except:
 ADMIN_IDS = [x.strip() for x in str(TELEGRAM_ADMIN).split(',')]
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# Neither what telebot logs on its own nor an exception nobody caught shows the token
+mask_library_log(telebot.logger)
+mask_tracebacks()
 message_queue = MessageQueue(delay_between_messages=0.3)
 
 # The bot starts even when the manager does not answer yet: exiting made a
@@ -1115,6 +1118,8 @@ def mass_menu_rows(filter_key, total):
 			InlineKeyboardButton(get_text("BUTTON_MASS_RESUME"), callback_data=build_call("mass", "resume", filter_key)),
 			InlineKeyboardButton(get_text("BUTTON_MASS_PAUSE"), callback_data=build_call("mass", "pause", filter_key)),
 		])
+		if client.supports_verify:
+			rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_VERIFY"), callback_data=build_call("mass", "verify", filter_key))])
 		rows.append([InlineKeyboardButton(get_text("BUTTON_MASS_MOVE"), callback_data=build_call("mass", "move", filter_key))])
 		if client.supports_categories:
 			# Where the folders go by category, the category is what is changed, not the folder
@@ -2434,9 +2439,17 @@ def keep_hand_limit(torrent_id, fields):
 	if not tracker_limits_supported():
 		return
 	try:
-		torrent = client.get_torrent(torrent_id)
+		# From the listing, like the monitor that gives the rules: a manager can
+		# name the tracker of a torrent differently there (Deluge lists
+		# example.org for what the torrent itself calls tracker.example.org)
+		torrent = next((t for t in client.get_torrents() if str(t.id) == str(torrent_id)), None)
 		current = tracker_limits.rules()
 		tracker = tracker_limits.rule_tracker(torrent.trackers, current) if torrent else None
+		if torrent and not tracker:
+			# The listing may not name the tracker yet (qBittorrent only lists
+			# one that is working): the torrent itself has them all
+			full = client.get_torrent(torrent_id)
+			tracker = tracker_limits.rule_tracker(full.trackers, current) if full else None
 		if not tracker or tracker_limits.applied_tracker(torrent_id) == tracker:
 			return
 		others = [f for f in tracker_limits.non_default_fields(current[tracker]) if f not in fields]
@@ -3727,9 +3740,10 @@ def mover_restart(torrents):
 		warning(f"Automatic mover: cannot restart the torrents that were not moved: {e}")
 
 
-def mover_occupied(source):
-	"""The bytes the torrents of the source have on disk, the ones sharing
-	their data counted once. None when the manager does not answer"""
+def mover_source_sizes(source):
+	"""What each torrent of the source has on disk, as {id: (data, bytes)}:
+	torrents sharing their data have the same data. None when the manager does
+	not answer"""
 	try:
 		torrents = client.get_torrents()
 	except TorrentClientError:
@@ -3738,9 +3752,23 @@ def mover_occupied(source):
 	for torrent in torrents:
 		if torrent.download_dir and auto_mover.is_under(torrent.download_dir, source):
 			size = (torrent.total_size or 0) * min(max(torrent.progress or 0, 0), 100) / 100
-			key = (torrent.download_dir, torrent.name)
-			sizes[key] = max(sizes.get(key, 0), size)
-	return sum(sizes.values())
+			sizes[str(torrent.id)] = ((torrent.download_dir, torrent.name), size)
+	return sizes
+
+
+def mover_occupied_bytes(sizes):
+	"""The bytes of mover_source_sizes, the torrents sharing their data counted once"""
+	by_data = {}
+	for data, size in sizes.values():
+		by_data[data] = max(by_data.get(data, 0), size)
+	return sum(by_data.values())
+
+
+def mover_occupied(source):
+	"""The bytes the torrents of the source have on disk, the ones sharing
+	their data counted once. None when the manager does not answer"""
+	sizes = mover_source_sizes(source)
+	return None if sizes is None else mover_occupied_bytes(sizes)
 
 
 def mover_job(plan, sent, chat_id, thread_id):
@@ -3751,7 +3779,7 @@ def mover_job(plan, sent, chat_id, thread_id):
 	rule = plan.rule
 	source, target = html.escape(rule["source"]), html.escape(rule["target"])
 	ordered, failed = [], {}
-	occupied = mover_occupied(rule["source"])
+	before = mover_source_sizes(rule["source"])
 	for target_dir, group in auto_mover.group_by_target(plan.units, rule["source"], rule["target"]):
 		ids = [torrent.id for torrent in group]
 		order = register_move_order(ids)
@@ -3794,9 +3822,16 @@ def mover_job(plan, sent, chat_id, thread_id):
 	time.sleep(AUTO_MOVER_SETTLE_SECONDS)
 	if not not_moved and bot_settings.get("auto_mover"):
 		free = mover_free(rule["source"])
-		occupied_now = mover_occupied(rule["source"])
-		if free < 0 or occupied is None or occupied_now is None:
+		now = mover_source_sizes(rule["source"])
+		if free < 0 or before is None or now is None:
 			return
+		# A torrent that left the source some other way meanwhile (removed
+		# keeping its data, as the removal at the ratio limit does, or sent by
+		# hand to another folder) may have freed nothing: counted as still
+		# there, or its size would pass for room this move did not free
+		moved_ids = {str(torrent.id) for torrent in moved}
+		occupied = mover_occupied_bytes(before)
+		occupied_now = mover_occupied_bytes({**{i: v for i, v in before.items() if i not in now and i not in moved_ids}, **now})
 		# Free space plus what the torrents of the source take stays the same
 		# when what left the source freed its room, whatever was downloaded
 		# or added meanwhile. It drops by what was moved when it freed nothing
@@ -3968,10 +4003,11 @@ def mover_outcome_text(plan):
 
 
 def mover_unknown_text():
-	"""The manager does not tell the free space of the source. qBittorrent only
-	knows the one of its default folder, which is then named"""
+	"""The manager does not tell the free space of the source. A qBittorrent
+	without app/getFreeSpaceAtPath only knows the one of its default folder,
+	which is then named"""
 	text = get_text("MOVER_FREE_UNKNOWN")
-	if TORRENT_CLIENT != "qbittorrent":
+	if TORRENT_CLIENT != "qbittorrent" or getattr(client, "free_space_anywhere", False):
 		# The others tell it of any folder that is there
 		return f"{text} {get_text('MOVER_FREE_UNKNOWN_MISSING', html.escape(auto_mover_rule()['source']))}"
 	try:
@@ -4567,11 +4603,16 @@ def deferred_auto_rename(torrent_id, original_name, chat_id=None, thread_id=None
 		time.sleep(AUTO_RENAME_WAIT_DELAY)
 		try:
 			torrent = client.get_torrent(torrent_id)
-		except TorrentClientError as e:
+		except PermanentTorrentError as e:
 			warning(f"Auto-rename failed for {original_name}: {e}")
+			notify(get_text("NOTIFY_AUTO_RENAME_FAILED", html.escape(original_name), html.escape(str(e))), chat_id, thread_id)
 			return
+		except TorrentClientError as e:
+			# A manager that does not answer once is asked again: the add promised this rename
+			debug(f"Auto-rename of {original_name} cannot read the torrent yet: {e}")
+			continue
 		if torrent is None:
-			return
+			return  # Removed meanwhile: nothing to rename nor to tell
 		if not torrent.files:
 			continue
 		try:
@@ -4579,6 +4620,7 @@ def deferred_auto_rename(torrent_id, original_name, chat_id=None, thread_id=None
 			renamed, duplicate = auto_rename_torrent(torrent)
 		except TorrentClientError as e:
 			warning(f"Auto-rename failed for {torrent.name}: {e}")
+			notify(get_text("NOTIFY_AUTO_RENAME_FAILED", html.escape(original_name), html.escape(str(e))), chat_id, thread_id)
 			return
 		if renamed:
 			notify(get_text("NOTIFY_AUTO_RENAMED", html.escape(original_name), html.escape(renamed)), chat_id, thread_id)
@@ -4590,6 +4632,7 @@ def deferred_auto_rename(torrent_id, original_name, chat_id=None, thread_id=None
 			notify(f"{get_text('NOTIFY_AUTO_RENAMED_FILES', html.escape(renamed or original_name))}\n{files_renamed}", chat_id, thread_id)
 		return
 	warning(f"Auto-rename gave up for {original_name}: the metadata never arrived")
+	notify(get_text("NOTIFY_AUTO_RENAME_GAVE_UP", html.escape(original_name)), chat_id, thread_id)
 
 
 def auto_rename_lines(torrent):
@@ -4881,17 +4924,60 @@ def add_torrent_from_bot(late_add=None, **kwargs):
 		except TorrentClientError:
 			if late_add is not None:
 				# Every id it can get: a v2 torrent is known by two
-				for info_hash in expected_torrent_ids(kwargs.get("magnet"), kwargs.get("torrent_data")):
-					_late_adds[info_hash] = dict(late_add, ts=now)
+				# One entry under every key, so that it is found by any and leaves with all
+				entry = dict(late_add, ts=now)
+				for key in add_keys(kwargs.get("magnet"), kwargs.get("torrent_data")):
+					_late_adds[key] = entry
 			raise
 		_bot_added_ids[str(torrent.id)] = now
+	# Whatever had this id before is gone: the limits of its tracker are for this one to get
+	tracker_limits.unmark([torrent.id])
 	return torrent
 
 
 def pop_late_add(torrent_id):
 	"""The context of a failed add that turned out to land as torrent_id, or
 	None. Must be called holding _bot_adds_lock"""
-	return _late_adds.pop(str(torrent_id).lower(), None)
+	found = _late_adds.pop(str(torrent_id).lower(), None)
+	if found is not None:
+		# The other keys of the same add: left behind, another torrent could be taken for it
+		for key in [key for key, entry in _late_adds.items() if entry is found]:
+			del _late_adds[key]
+	return found
+
+
+def add_keys(magnet, torrent_data):
+	"""What a torrent added from this magnet or .torrent is told by once in
+	the manager: its info hashes, and where the manager gives its torrents
+	ids of its own (Download Station), what it keeps of the link or the file.
+	Asked to the class: the manager may be down, which is when it matters"""
+	holder = getattr(client, "_instance", None)
+	if holder is None:
+		holder = getattr(client, "_class", None) or type(client)
+	keys = getattr(holder, "add_keys", None)
+	return list(keys(magnet, torrent_data)) if keys else expected_torrent_ids(magnet, torrent_data)
+
+
+def torrent_add_keys(torrent_id):
+	"""What the torrent goes by among the add_keys of the adds still waited
+	for. With none waited for, only its id: the manager is not asked"""
+	keys = [str(torrent_id).lower()]
+	asked = getattr(client, "torrent_keys", None)
+	if asked and (_late_adds or len(queued_adds)):
+		try:
+			keys += [key for key in asked(torrent_id) if key not in keys]
+		except TorrentClientError:
+			pass
+	return keys
+
+
+def find_queued_add(torrent_id):
+	"""The queued add whose torrent is torrent_id, or None"""
+	for key in torrent_add_keys(torrent_id):
+		queued = queued_adds.find(key)
+		if queued is not None:
+			return queued
+	return None
 
 
 def perform_add_torrent(pending, download_dir, chat_id=None, thread_id=None, category=None, automatic=False):
@@ -4947,8 +5033,8 @@ def add_with_context(pending, context):
 		warning(f"Cannot add {pending.get('name')} to the new series folder {folder}, adding it to {context['previous_dir']}: {e}")
 		with _bot_adds_lock:
 			# It failed for good: nothing of that add can land late
-			for info_hash in expected_torrent_ids(pending["magnet"], pending["data"]):
-				_late_adds.pop(info_hash, None)
+			for key in add_keys(pending["magnet"], pending["data"]):
+				_late_adds.pop(key, None)
 		context = dict(context, download_dir=context["previous_dir"], series_title=None, previous_dir=None, series_new=False)
 		torrent = add_torrent_from_bot(late_add=context, magnet=pending["magnet"], torrent_data=pending["data"],
 								download_dir=context["download_dir"], category=context["category"] or None)
@@ -5019,7 +5105,7 @@ def handle_late_add(torrent_id, late_add):
 		return
 	if torrent is None:
 		return
-	queued = queued_adds.find(torrent_id)
+	queued = find_queued_add(torrent_id)
 	if queued is not None:
 		# None: the queue worker got to it first and tells it itself
 		item = queued_adds.take(queued["id"])
@@ -5137,7 +5223,7 @@ def queue_add(pending, context, started, message_id, reason, failure=None, resol
 	"""Puts an add in the queue: (text, markup, item) for add_or_queue"""
 	try:
 		item = queued_adds.put(pending.get("name"), pending.get("magnet"), pending.get("data"),
-							expected_torrent_ids(pending.get("magnet"), pending.get("data")),
+							add_keys(pending.get("magnet"), pending.get("data")),
 							context, started=started, resolve=resolve)
 	except OSError as write_error:
 		error(f"Cannot queue {pending.get('name')}: {write_error}")
@@ -5567,6 +5653,9 @@ def render_mass_confirm(chat_id, message_id, action, filter_key, dir_page=0):
 	elif action == "pause":
 		text = get_text("MASS_CONFIRM_PAUSE", count)
 		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "pause", mass_ctx, "-")))
+	elif action == "verify" and client.supports_verify:
+		text = get_text("MASS_CONFIRM_VERIFY", count)
+		markup.add(InlineKeyboardButton(get_text("BUTTON_CONFIRM"), callback_data=build_call("confirmMass", "verify", mass_ctx, "-")))
 	elif action == "delete":
 		text = get_text("MASS_CONFIRM_DELETE", count)
 		markup.add(InlineKeyboardButton(get_text("BUTTON_DELETE_KEEP_DATA"), callback_data=build_call("confirmMass", "delete", mass_ctx, "0")))
@@ -5680,6 +5769,9 @@ def do_mass_action(chat_id, message_id, action, mass_ctx, extra=None):
 		elif action == "pause":
 			client.pause_torrents(ids)
 			text = get_text("MASS_DONE_PAUSE", count)
+		elif action == "verify":
+			client.verify_torrents(ids)
+			text = get_text("MASS_DONE_VERIFY", count)
 		elif action == "ratio":
 			limit = None if extra == "g" else (-1 if extra == "n" else parse_ratio(extra or ""))
 			if limit is None and extra != "g":
@@ -5728,16 +5820,29 @@ def pop_pending_input(chat_id, user_id, thread_id=None, any_thread=False):
 	INPUT_TTL (an answer that never came is not waited for forever: the next
 	text could be anything), or when it was asked in another topic (the
 	question stays for that one). any_thread takes it wherever it was asked"""
+	expire_pending_input(chat_id, user_id)
 	with _contexts_lock:
 		pending = pending_inputs.get((chat_id, user_id))
 		if pending is None:
 			return None
-		if time.time() - pending.get("ts", 0) > INPUT_TTL:
-			del pending_inputs[(chat_id, user_id)]
-			return None
 		if not any_thread and pending.get("thread") != normalize_thread(thread_id):
 			return None
 		return pending_inputs.pop((chat_id, user_id))
+
+
+def expire_pending_input(chat_id, user_id):
+	"""Takes out the question asked to this user when it is older than
+	INPUT_TTL, and returns it. Its prompt goes, and a torrent that was waiting
+	for a typed folder gets its folder choice back (see back_to_add_dir)"""
+	with _contexts_lock:
+		pending = pending_inputs.get((chat_id, user_id))
+		if pending is None or time.time() - pending.get("ts", 0) <= INPUT_TTL:
+			return None
+		del pending_inputs[(chat_id, user_id)]
+	if pending.get("prompt_message_id"):
+		delete_message(chat_id, pending["prompt_message_id"])
+	pending["restored"] = back_to_add_dir(chat_id, pending)
+	return pending
 
 
 def back_to_add_dir(chat_id, pending, message_id=None):
@@ -5850,8 +5955,21 @@ def handle_pending_input(message, pending):
 		try:
 			torrent = client.get_torrent(torrent_id)
 			plan = [(file_path, text)]
-			if torrent and is_video_file(file_path):
-				plan.extend(subtitle_renames(torrent, file_path, text))
+			if torrent:
+				# Two files of a torrent must never end up under one name: not
+				# every manager refuses it (Deluge takes it as it comes)
+				taken = {file_basename(p) for p in torrent_folders(torrent)[1:] + [p for p, _, _ in torrent.files]
+						if file_folder(p) == file_folder(file_path) and p != file_path}
+				if text in taken:
+					send_message(chat_id, get_text("FILE_RENAME_DUPLICATE", html.escape(text)), reply_markup=back_markup, thread_id=thread_id)
+					return
+				taken.add(text)
+				for path, companion in subtitle_renames(torrent, file_path, text) if is_video_file(file_path) else []:
+					# A subtitle whose new name is taken keeps the one it has
+					if companion not in taken - {file_basename(path)}:
+						taken.discard(file_basename(path))
+						taken.add(companion)
+						plan.append((path, companion))
 			done, errors = apply_rename_plan(torrent_id, plan)
 			if pending.get("file_nav"):
 				# Back to the file under its new name, wherever the rename put it in the list
@@ -6504,6 +6622,15 @@ def handle_text(message):
 		# torrent renamed to it, and the torrent was never added
 		drop_pending_input(message.chat.id, message.from_user.id)
 	else:
+		expired = expire_pending_input(message.chat.id, message.from_user.id)
+		# A text with a link in it is a torrent to add, not the late answer
+		if (expired and expired.get("thread") == normalize_thread(message_thread(message))
+				and not message_links(message)):
+			# The answer to a question no longer waited for: said, or it would
+			# look like the bot took it and did nothing
+			send_notice(message.chat.id, get_text("INPUT_EXPIRED_ADD" if expired["restored"] else "INPUT_EXPIRED", INPUT_TTL // 60),
+						thread_id=message_thread(message))
+			return
 		pending = pop_pending_input(message.chat.id, message.from_user.id, thread_id=message_thread(message))
 		if pending:
 			handle_pending_input(message, pending)
@@ -7701,6 +7828,38 @@ def torrent_error_text(torrent):
 	return torrent.error_message or ""
 
 
+# Polls a torrent that stopped is looked at again for, while the manager does
+# not answer whether one of its limits stopped it
+STOP_CHECK_TRIES = 10
+
+
+# The clock of a manager can be set right between two polls: only a torrent
+# added this much later than the one remembered under its id is another one
+ADDED_AGAIN_SECONDS = 5
+
+
+def was_added_again(prev, torrent):
+	"""Whether the torrent is not the one remembered under its id but one
+	added later: the same .torrent or magnet, removed and added again"""
+	before = (prev or {}).get("added") or 0
+	return before > 0 and added_timestamp(torrent.added_date) > before + ADDED_AGAIN_SECONDS
+
+
+def stopped_by_itself(prev, state):
+	"""Whether a finished torrent that was going is now stopped, which is what
+	a limit of the manager does (and someone pausing it: handle_seeding_stopped
+	tells them apart). Also one seen downloading on the last poll: it finished
+	and reached its limit at once, with a limit of 0 or a ratio it already had.
+	Never one started by force: the manager does not stop those at their
+	limits, so it was paused by hand, however far past its limit it is. And a
+	stop that could not be looked at on the last poll is looked at again"""
+	if not prev or state["status"] != TorrentStatus.PAUSED or state["finished"] is not True:
+		return False
+	if prev.get("stop_tries"):
+		return True
+	return prev.get("status") in (TorrentStatus.SEEDING, TorrentStatus.DOWNLOADING) and not prev.get("forced")
+
+
 def poll_torrents(states, had_before=None):
 	"""One pass of the monitor. states holds the last state of every torrent
 	seen since the bot started (None on the first poll, which only builds the
@@ -7714,6 +7873,13 @@ def poll_torrents(states, had_before=None):
 	baseline = states is None
 	states = {} if baseline else states
 	torrents = client.get_torrents()
+	# A torrent removed and added again keeps its id but not when it was added:
+	# it is a new torrent, with nothing of what the old one was told or given
+	added_again = [str(t.id) for t in torrents if was_added_again(states.get(str(t.id)), t)]
+	for torrent_id in added_again:
+		del states[torrent_id]
+	if added_again:
+		tracker_limits.unmark(added_again)
 	new_ids = [str(t.id) for t in torrents if str(t.id) not in states]
 	external = set()
 	late = {}
@@ -7722,13 +7888,18 @@ def poll_torrents(states, had_before=None):
 	if new_ids and not baseline:
 		watch = (bot_settings.get("notify_external_added") or (auto_rename_enabled() and bot_settings.get("auto_rename_external"))
 				or auto_move_series_enabled(external=True))
+		# Asked before taking the lock: where it means asking the manager
+		# (Download Station), an add must not wait behind a slow NAS
+		add_keys_of = {torrent_id: torrent_add_keys(torrent_id) for torrent_id in new_ids}
 		# Waits for any add in progress: the bot registers what it added
 		with _bot_adds_lock:
 			for torrent_id in new_ids:
 				if _bot_added_ids.pop(torrent_id, None) is not None:
 					continue
-				late_add = pop_late_add(torrent_id)
-				if late_add is None and queued_adds.find(torrent_id) is not None:
+				# Every key it goes by: the others of the same add must not stay behind
+				keys = add_keys_of[torrent_id]
+				late_add = next((found for found in [pop_late_add(key) for key in keys] if found is not None), None)
+				if late_add is None and any(queued_adds.find(key) is not None for key in keys):
 					late_add = {}  # Its queued add has what it was for
 				if late_add is not None:
 					late[torrent_id] = late_add
@@ -7739,7 +7910,8 @@ def poll_torrents(states, had_before=None):
 	for torrent in torrents:
 		torrent_id = str(torrent.id)
 		prev = states.get(torrent_id)
-		state = {"finished": torrent_finished(torrent, prev), "error": torrent_error_text(torrent), "status": torrent.status}
+		state = {"finished": torrent_finished(torrent, prev), "error": torrent_error_text(torrent), "status": torrent.status,
+				"forced": bool(torrent.forced), "added": added_timestamp(torrent.added_date)}
 		if not baseline and torrent_id not in absorbed:
 			if torrent_id in late:
 				try:
@@ -7762,11 +7934,15 @@ def poll_torrents(states, had_before=None):
 					handle_completed(torrent)
 				except Exception as e:
 					warning(f"Cannot handle the completion of {torrent.name}: {e}")
-			if (prev and prev.get("status") == TorrentStatus.SEEDING and state["status"] == TorrentStatus.PAUSED
-					and client.supports_ratio_limit and (bot_settings.get("notify_ratio_reached") or auto_remove_ratio_enabled())):
+			if (stopped_by_itself(prev, state) and client.supports_ratio_limit
+					and (bot_settings.get("notify_ratio_reached") or auto_remove_ratio_enabled())):
 				try:
 					handle_seeding_stopped(torrent.id)
 				except Exception as e:
+					# Looked at again on the next polls: the stop is seen only once
+					tries = prev.get("stop_tries", 0) + 1
+					if tries < STOP_CHECK_TRIES:
+						state["stop_tries"] = tries
 					warning(f"Cannot handle {torrent.name} stopping seeding: {e}")
 			if (state["error"] and (prev is None or state["error"] != prev["error"]) and bot_settings.get("notify_errors")
 					and not mover_tells(torrent_id)):

@@ -8,6 +8,9 @@ services:
         container_name: torrent-controller-bot-dev
         restart: unless-stopped
         tty: true
+        extra_hosts:
+            # Sin esto el nombre depende del DNS de Docker Desktop, y con un "dns" propio en daemon.json no resuelve
+            - "host.docker.internal:host-gateway"
         env_file:
             - .env
         volumes:

@@ -637,6 +637,12 @@ class DelugeClient(TorrentClient):
 		except TorrentClientError as e:
 			raise TorrentClientError(f"Error verifying torrent {torrent_id}: {e}")
 
+	def verify_torrents(self, torrent_ids):
+		try:
+			self._call("core.force_recheck", list(torrent_ids))
+		except TorrentClientError as e:
+			raise TorrentClientError(f"Error verifying torrents: {e}")
+
 	def set_file_priority(self, torrent_id, paths, priority):
 		try:
 			# Deluge only takes the priorities of every file at once, by index, so
